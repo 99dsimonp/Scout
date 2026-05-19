@@ -19,6 +19,41 @@ Scout provides:
 
 The detailed design is captured in [DESIGN.md](DESIGN.md).
 
+## Installation
+
+Scout is packaged for Rocky Linux 9 / Enterprise Linux 9 as an RPM. Build
+dependencies from Rocky's CodeReady Builder-compatible repository are required,
+so enable CRB before installing the RPM build toolchain:
+
+```bash
+sudo dnf install -y dnf-plugins-core
+sudo dnf config-manager --set-enabled crb
+sudo dnf install -y \
+  rpm-build python3-devel pyproject-rpm-macros python3-wheel \
+  python3-setuptools python3-tomli systemd-rpm-macros \
+  git tar gzip openssh-clients shadow-utils systemd
+```
+
+Build the RPM from a checkout:
+
+```bash
+mkdir -p ~/rpmbuild/SOURCES
+git archive --format=tar.gz --prefix=scout-0.1.0/ \
+  -o ~/rpmbuild/SOURCES/scout-0.1.0.tar.gz HEAD
+rpmbuild -ba packaging/scout.spec
+```
+
+Install the built package:
+
+```bash
+sudo dnf install -y ~/rpmbuild/RPMS/noarch/scout-0.1.0-1.el9.noarch.rpm
+scout --config /etc/scout/config.toml --check-config
+```
+
+The RPM installs `/usr/bin/scout`, `/usr/bin/scout-setup`,
+`/etc/scout/config.toml`, `/etc/scout/review.schema.json`, and the systemd unit
+at `/usr/lib/systemd/system/scout.service`.
+
 ## Development
 
 Run tests with the standard library test runner:
