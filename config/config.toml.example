@@ -1,0 +1,127 @@
+[service]
+worker_id = "reviewer-1"
+state_db = "/var/lib/scout/state.db"
+state_dir = "/var/lib/scout"
+log_level = "INFO"
+# Maximum retention for local review-log.jsonl entries and raw run dirs.
+retention_days = 7
+
+[bitbucket]
+workspace = "my-workspace"
+api_base_url = "https://api.bitbucket.org/2.0"
+api_auth = "basic"
+api_username_credential = "bitbucket_username"
+api_key_credential = "bitbucket_api_key"
+# Optional. If omitted, git uses normal SSH config/agent or a local clone URL.
+# ssh_key_credential = "bitbucket_ssh_key"
+
+[[bitbucket.repositories]]
+slug = "repo-a"
+clone_url = "git@bitbucket.org:my-workspace/repo-a.git"
+# Optional: limit live test runs to specific PR IDs.
+# pr_ids = [123]
+# Optional: skip PRs whose source branch matches any regex pattern.
+# ignored_source_branches = ["^release/"]
+# Optional: skip PRs marked as draft.
+# ignore_draft_pull_requests = true
+
+[[bitbucket.repositories]]
+slug = "repo-b"
+clone_url = "git@bitbucket.org:my-workspace/repo-b.git"
+# Leave pr_ids unset to review every changed open PR in this repository.
+# Optionally ignore source branches with regex patterns.
+# ignored_source_branches = ["^release/"]
+# Optionally skip draft PRs until they are ready for review.
+# ignore_draft_pull_requests = true
+
+[polling]
+enabled = true
+interval_seconds = 600
+pagelen = 50
+
+[queue]
+max_parallel_reviews = 2
+job_timeout_seconds = 1800
+max_attempts = 3
+retry_backoff_seconds = 300
+
+[comments]
+critical_enabled = true
+# Native PR comments are posted for annotations with these severities.
+# Empty list disables comment posting. Defaults to ["CRITICAL"].
+severities = ["CRITICAL"]
+
+[review]
+policy_version = "v1"
+schema_path = "/etc/scout/review.schema.json"
+max_findings = 100
+# Backward-compatible defaults for provider review sizing. Each provider can
+# override these keys in its own [agents.<provider>] table.
+subagent_small_loc_limit = 150
+subagent_medium_loc_limit = 600
+subagent_large_loc_limit = 1500
+subagent_high_risk_bonus = 1
+subagent_max_per_lens = 4
+
+[agents]
+# Legacy single-provider selector. Still valid by itself.
+strategy = "codex"
+# Optional multi-provider selector. When set, Scout queues one job per provider
+# for each PR. Supported values are "codex" and "claude".
+# providers = ["codex", "claude"]
+
+[agents.codex]
+enabled = true
+auth_mode = "logged_in"
+credential = "codex"
+home_dir = "/var/lib/scout/agents/codex/main"
+max_parallel = 2
+timeout_seconds = 1800
+# Set this to an absolute path if systemd cannot find the CLI on its PATH.
+command = "codex"
+model = "gpt-5.5"
+reasoning_effort = "xhigh"
+fast_mode = true
+max_subagents = 15
+# Optional provider review sizing overrides. Defaults come from [review].
+subagent_small_loc_limit = 150
+subagent_medium_loc_limit = 600
+subagent_large_loc_limit = 1500
+subagent_high_risk_bonus = 1
+subagent_max_per_lens = 3
+
+[agents.claude]
+enabled = true
+auth_mode = "logged_in"
+credential = "claude"
+home_dir = "/var/lib/scout/agents/claude/main"
+max_parallel = 2
+timeout_seconds = 1800
+# Set this to an absolute path if systemd cannot find the CLI on its PATH.
+command = "claude"
+# Optional. Leave empty to use the Claude CLI default.
+model = "claude-sonnet-4-6"
+# Optional. Allowed values: low, medium, high, xhigh, max. Leave empty to omit.
+effort = "max"
+max_subagents = 20
+# Optional provider review sizing overrides. Claude defaults to one reviewer
+# subagent per category to keep subscription token use predictable.
+subagent_small_loc_limit = 150
+subagent_medium_loc_limit = 600
+subagent_large_loc_limit = 1500
+subagent_high_risk_bonus = 1
+subagent_max_per_lens = 1
+
+[reports]
+# If omitted, these default per selected provider:
+# scout-codex-v1 / Codex PR Review
+# scout-claude-v1 / Claude PR Review
+# Single-provider configs may still set report_id/title here.
+
+[reports.codex]
+# report_id = "scout-codex-v1"
+# title = "Codex PR Review"
+
+[reports.claude]
+# report_id = "scout-claude-v1"
+# title = "Claude PR Review"

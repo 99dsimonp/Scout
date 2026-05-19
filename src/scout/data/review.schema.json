@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["recommendation", "report", "annotations"],
+  "properties": {
+    "recommendation": {
+      "type": "string",
+      "enum": ["approve", "request_changes"]
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["title", "details", "report_type", "reporter", "data"],
+      "properties": {
+        "title": { "type": "string", "minLength": 1 },
+        "details": { "type": "string", "minLength": 1 },
+        "report_type": { "type": "string", "enum": ["BUG", "SECURITY", "TEST", "COVERAGE"] },
+        "reporter": { "type": "string", "const": "scout" },
+        "data": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["title", "type", "value"],
+            "properties": {
+              "title": { "type": "string", "minLength": 1 },
+              "type": {
+                "type": "string",
+                "enum": ["BOOLEAN", "DATE", "DURATION", "LINK", "NUMBER", "PERCENTAGE", "TEXT"]
+              },
+              "value": { "type": ["string", "number", "boolean"] }
+            }
+          }
+        }
+      }
+    },
+    "annotations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "external_id",
+          "annotation_type",
+          "path",
+          "line",
+          "summary",
+          "details",
+          "severity",
+          "result",
+          "reviewer",
+          "confidence",
+          "smallest_fix"
+        ],
+        "properties": {
+          "external_id": { "type": "string", "minLength": 1 },
+          "annotation_type": { "type": "string", "enum": ["BUG", "VULNERABILITY", "CODE_SMELL"] },
+          "path": { "type": "string", "minLength": 1 },
+          "line": { "type": "integer", "minimum": 1 },
+          "summary": { "type": "string", "minLength": 1 },
+          "details": { "type": "string", "minLength": 1 },
+          "severity": { "type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"] },
+          "result": { "type": "string", "enum": ["FAILED"] },
+          "reviewer": {
+            "type": "string",
+            "enum": ["correctness", "security", "tests", "performance", "best-practices"]
+          },
+          "confidence": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+          "smallest_fix": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

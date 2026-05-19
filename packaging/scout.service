@@ -1,0 +1,39 @@
+[Unit]
+Description=Scout Bitbucket PR AI Review Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=scout
+Group=scout
+Environment=HOME=/var/lib/scout
+ExecStartPre=/usr/bin/scout --config /etc/scout/config.toml --check-startup
+ExecStart=/usr/bin/scout --config /etc/scout/config.toml
+ExecStopPost=-/usr/bin/scout --config /etc/scout/config.toml --recover-abandoned-jobs
+Restart=on-failure
+RestartSec=10
+
+StateDirectory=scout
+ConfigurationDirectory=scout
+LogsDirectory=scout
+
+LoadCredential=bitbucket_username:/etc/scout/secrets/bitbucket_username
+LoadCredential=bitbucket_api_key:/etc/scout/secrets/bitbucket_api_key
+# Optional SSH key credentials should be added with a systemd drop-in because
+# LoadCredential fails service startup when its source file is missing.
+# LoadCredential=bitbucket_ssh_key:/etc/scout/secrets/bitbucket_ssh_key
+# Provider API credentials are not loaded by default because Scout defaults to
+# logged-in CLI auth. Add a systemd drop-in for API-mode provider credentials,
+# for example:
+# [Service]
+# LoadCredential=claude:/etc/scout/secrets/claude
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/scout /var/log/scout
+
+[Install]
+WantedBy=multi-user.target
