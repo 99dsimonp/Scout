@@ -51,6 +51,68 @@ class CodexRunnerTests(unittest.TestCase):
         self.assertIn("--disable", cmd)
         self.assertIn("fast_mode", cmd)
 
+    def test_build_risk_command_uses_classifier_model_and_reasoning(self):
+        config = codex_config(model="gpt-5.5", reasoning_effort="xhigh")
+        runner = CodexRunner(config, CredentialStore("/tmp/unused"))
+        cmd = runner.build_risk_command(
+            "/repo",
+            "/risk.schema.json",
+            "/risk-output.json",
+            model="gpt-5.4",
+            reasoning_effort="low",
+        )
+        self.assertEqual(cmd[cmd.index("--model") + 1], "gpt-5.4")
+        self.assertIn('model_reasoning_effort="low"', cmd)
+        self.assertIn("/risk.schema.json", cmd)
+        self.assertIn("/risk-output.json", cmd)
+
+    def test_assess_risk_passes_description_on_stdin_and_parses_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command = Path(tmp) / "fake-codex"
+            run_dir = Path(tmp) / "risk"
+            stdin_capture = Path(tmp) / "stdin.txt"
+            argv_capture = Path(tmp) / "argv.txt"
+            command.write_text(
+                """#!/bin/sh
+output=""
+printf '%s\n' "$@" > '"""
+                + str(argv_capture)
+                + """'
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    output="$1"
+  fi
+  shift
+done
+cat > '"""
+                + str(stdin_capture)
+                + """'
+cat > "$output" <<'JSON'
+{"risk":"high"}
+JSON
+""",
+                encoding="utf-8",
+            )
+            command.chmod(0o755)
+            runner = CodexRunner(
+                codex_config(command=str(command), timeout_seconds=5),
+                CredentialStore("/tmp/unused"),
+            )
+
+            risk = runner.assess_risk(
+                description="Sensitive auth change",
+                model="gpt-5.4",
+                reasoning_effort="low",
+                timeout_seconds=5,
+                run_dir=str(run_dir),
+                is_superseded=lambda: False,
+            )
+
+            self.assertEqual(risk, "high")
+            self.assertIn("Sensitive auth change", stdin_capture.read_text(encoding="utf-8"))
+            self.assertNotIn("Sensitive auth change", argv_capture.read_text(encoding="utf-8"))
+
     def test_run_passes_prompt_on_stdin_without_argv_exposure(self):
         with tempfile.TemporaryDirectory() as tmp:
             command = Path(tmp) / "fake-codex"

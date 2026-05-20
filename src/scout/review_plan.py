@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import List
 
 
 REVIEW_LENSES = ["correctness", "security", "tests", "performance", "best-practices"]
-RISK_HIGH_RE = re.compile(r"(?im)^\s*(?:[-*]\s*)?(?:#+\s*)?(?:\*\*)?risk(?:\*\*)?\s*:\s*(?:\*\*)?high\b")
+RISK_LEVELS = ("low", "medium", "high")
+DEFAULT_RISK = "medium"
 
 
 @dataclass(frozen=True)
@@ -14,6 +14,7 @@ class ReviewPlan:
     changed_lines: int
     high_risk: bool
     subagents_per_lens: int
+    risk: str = DEFAULT_RISK
 
     @property
     def total_subagents(self) -> int:
@@ -39,21 +40,26 @@ def build_review_plan(
     large_loc_limit: int,
     high_risk_bonus: int,
     max_subagents_per_lens: int,
+    risk: str = DEFAULT_RISK,
 ) -> ReviewPlan:
-    high_risk = description_has_high_risk(description)
-    subagents_per_lens = _base_subagents_per_lens(
-        changed_lines,
-        small_loc_limit,
-        medium_loc_limit,
-        large_loc_limit,
-    )
-    if high_risk:
-        subagents_per_lens += high_risk_bonus
+    risk_mode = normalize_risk(risk)
+    if risk_mode == "low":
+        subagents_per_lens = 1
+    else:
+        subagents_per_lens = _base_subagents_per_lens(
+            changed_lines,
+            small_loc_limit,
+            medium_loc_limit,
+            large_loc_limit,
+        )
+        if risk_mode == "high":
+            subagents_per_lens += high_risk_bonus
     subagents_per_lens = min(subagents_per_lens, max_subagents_per_lens)
     return ReviewPlan(
         changed_lines=changed_lines,
-        high_risk=high_risk,
+        high_risk=risk_mode == "high",
         subagents_per_lens=subagents_per_lens,
+        risk=risk_mode,
     )
 
 
@@ -67,15 +73,18 @@ def count_changed_lines(diff: str) -> int:
     return changed
 
 
-def description_has_high_risk(description: str) -> bool:
-    return bool(RISK_HIGH_RE.search(description or ""))
+def normalize_risk(risk: str) -> str:
+    normalized = str(risk or "").strip().lower()
+    if normalized in RISK_LEVELS:
+        return normalized
+    return DEFAULT_RISK
 
 
 def format_review_plan(plan: ReviewPlan) -> str:
     lines = [
         "Review sizing:",
         "- Changed LOC: {}".format(plan.changed_lines),
-        "- PR description risk: {}".format("high" if plan.high_risk else "not high"),
+        "- PR description risk: {}".format(normalize_risk(plan.risk)),
         "- Subagents per review category: {}".format(plan.subagents_per_lens),
         "- Total reviewer subagents: {}".format(plan.total_subagents),
         "",

@@ -54,10 +54,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.review.subagent_large_loc_limit, 1500)
         self.assertEqual(config.review.subagent_high_risk_bonus, 1)
         self.assertEqual(config.review.subagent_max_per_lens, 4)
+        self.assertTrue(config.review.risk.enabled)
+        self.assertEqual(config.review.risk.provider, "codex")
+        self.assertEqual(config.review.risk.timeout_seconds, 120)
+        self.assertEqual(config.review.risk.model, "gpt-5.4")
+        self.assertEqual(config.review.risk.effort, "low")
         self.assertTrue(config.comments.critical_enabled)
         self.assertEqual(config.comments.severities, ["CRITICAL"])
         self.assertEqual(config.bitbucket.ssh_key_credential, "bitbucket_ssh_key")
         self.assertEqual(config.bitbucket.repositories[0].pr_ids, [])
+        self.assertEqual(config.bitbucket.repositories[0].ignored_target_branches, [])
         self.assertFalse(config.bitbucket.repositories[0].ignore_draft_pull_requests)
 
     def test_parse_can_disable_critical_comments(self):
@@ -134,6 +140,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.agents.claude.subagent_max_per_lens, 1)
         self.assertEqual(config.reports.report_id, "scout-claude-v1")
         self.assertEqual(config.reports.title, "Claude PR Review")
+        self.assertEqual(config.review.risk.provider, "codex")
+        self.assertEqual(config.review.risk.model, "gpt-5.4")
+        self.assertEqual(config.review.risk.effort, "low")
 
     def test_parse_multi_provider_selection_with_provider_report_defaults(self):
         config = parse_config(
@@ -285,6 +294,26 @@ class ConfigTests(unittest.TestCase):
             ["^release/", "hotfix/.*"],
         )
 
+    def test_parse_repo_target_branch_ignore_patterns(self):
+        config = parse_config(
+            {
+                "bitbucket": {
+                    "workspace": "ws",
+                    "repositories": [
+                        {
+                            "slug": "repo",
+                            "clone_url": "git@bitbucket.org:ws/repo.git",
+                            "ignored_target_branches": ["^release/", "^production$"],
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertEqual(
+            config.bitbucket.repositories[0].ignored_target_branches,
+            ["^release/", "^production$"],
+        )
+
     def test_parse_repo_draft_filter_flag(self):
         config = parse_config(
             {
@@ -336,6 +365,23 @@ class ConfigTests(unittest.TestCase):
                 }
             )
 
+    def test_rejects_invalid_ignored_target_branch_regex(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "repositories": [
+                            {
+                                "slug": "repo",
+                                "clone_url": "git@bitbucket.org:ws/repo.git",
+                                "ignored_target_branches": ["(unterminated"],
+                            }
+                        ],
+                    },
+                }
+            )
+
     def test_parse_optional_bitbucket_ssh_key_credential(self):
         config = parse_config(
             {
@@ -369,7 +415,7 @@ class ConfigTests(unittest.TestCase):
                         "workspace": "ws",
                         "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                     },
-                    "review": {"subagent_max_per_lens": 3},
+                    "review": {"subagent_max_per_lens": 3, "risk": {"provider": "claude"}},
                     "agents": {
                         "strategy": "claude",
                         "codex": {"max_subagents": 20},
@@ -385,7 +431,7 @@ class ConfigTests(unittest.TestCase):
                     "workspace": "ws",
                     "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                 },
-                "review": {"subagent_max_per_lens": 4},
+                "review": {"subagent_max_per_lens": 4, "risk": {"provider": "claude"}},
                 "agents": {
                     "strategy": "claude",
                     "claude": {"max_subagents": 20},
@@ -451,6 +497,7 @@ class ConfigTests(unittest.TestCase):
             large_loc_limit=config.agents.claude.subagent_large_loc_limit,
             high_risk_bonus=config.agents.claude.subagent_high_risk_bonus,
             max_subagents_per_lens=config.agents.claude.subagent_max_per_lens,
+            risk="high",
         )
         self.assertEqual(plan.subagents_per_lens, 5)
 
@@ -461,6 +508,7 @@ class ConfigTests(unittest.TestCase):
                     "workspace": "ws",
                     "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                 },
+                "review": {"risk": {"provider": "claude"}},
                 "agents": {
                     "strategy": "claude",
                     "codex": {"max_subagents": 1},
@@ -469,6 +517,72 @@ class ConfigTests(unittest.TestCase):
             }
         )
         self.assertEqual(config.agents.strategy, "claude")
+
+    def test_parse_risk_classifier_overrides(self):
+        config = parse_config(
+            {
+                "bitbucket": {
+                    "workspace": "ws",
+                    "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                },
+                "agents": {"providers": ["codex", "claude"]},
+                "review": {
+                    "risk": {
+                        "enabled": True,
+                        "provider": "claude",
+                        "model": "claude-sonnet-4-6",
+                        "effort": "high",
+                        "timeout_seconds": 45,
+                    }
+                },
+            }
+        )
+        self.assertTrue(config.review.risk.enabled)
+        self.assertEqual(config.review.risk.provider, "claude")
+        self.assertEqual(config.review.risk.timeout_seconds, 45)
+        self.assertEqual(config.review.risk.model, "claude-sonnet-4-6")
+        self.assertEqual(config.review.risk.effort, "high")
+
+    def test_allows_risk_provider_outside_review_providers(self):
+        config = parse_config(
+            {
+                "bitbucket": {
+                    "workspace": "ws",
+                    "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                },
+                "agents": {"providers": ["claude"]},
+                "review": {"risk": {"provider": "codex"}},
+            }
+        )
+        self.assertEqual(config.agents.providers, ["claude"])
+        self.assertEqual(config.review.risk.provider, "codex")
+
+    def test_rejects_disabled_risk_provider(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                    },
+                    "agents": {"providers": ["claude"], "codex": {"enabled": False}},
+                    "review": {"risk": {"provider": "codex"}},
+                }
+            )
+
+    def test_disabled_risk_allows_unselected_default_provider(self):
+        config = parse_config(
+            {
+                "bitbucket": {
+                    "workspace": "ws",
+                    "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                },
+                "agents": {"strategy": "claude"},
+                "review": {"risk": {"enabled": False}},
+            }
+        )
+        self.assertFalse(config.review.risk.enabled)
+        self.assertEqual(config.review.risk.provider, "codex")
 
     def test_rejects_unordered_subagent_loc_limits(self):
         with self.assertRaises(ConfigError):

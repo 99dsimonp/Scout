@@ -323,6 +323,13 @@ subagent_large_loc_limit = 1500
 subagent_high_risk_bonus = 1
 subagent_max_per_lens = 4
 
+[review.risk]
+enabled = true
+provider = "codex"
+model = "gpt-5.4"
+effort = "low"
+timeout_seconds = 120
+
 [agents]
 strategy = "codex"
 # providers = ["codex", "claude"]

@@ -172,7 +172,8 @@ workspace, repository, PR ID, policy, schema, and provider. For live testing, ad
 `pr_ids = [123]` to a repository block to limit reviews to specific PRs.
 You can also skip branch namespaces with regexes by adding
 `ignored_source_branches`, for example `["^release/"]` to ignore release
-branches.
+source branches, or `ignored_target_branches` to ignore PRs targeting matching
+destination branches.
 To process only non-draft PRs, set `ignore_draft_pull_requests = true` for the
 repository block.
 Workers claim the oldest eligible row from the global queue after filtering for
@@ -252,17 +253,35 @@ for example:
 LoadCredential=claude:/etc/scout/secrets/claude
 ```
 
-Scout calculates the reviewer subagent plan from changed LOC only.
-Defaults are 1 reviewer per category up to 150 changed lines, 2 up to 600, 3 up
-to 1500, and 4 above that. Codex caps this at 3 reviewers per category by
-default, so large PRs use at most 15 Codex subagents. If the PR description contains `Risk: high`, Scout
-adds one reviewer per category. The global `review.*` sizing values are
-backward-compatible defaults; Codex and Claude can each override the LOC
-thresholds, high-risk bonus, and `subagent_max_per_lens` under their
-`[agents.<provider>]` table. Claude
-defaults to one subagent per category to keep token use predictable unless you
-opt in to more fan-out. Each selected provider's `max_subagents` is the
-hard total limit validated at config load and before each review.
+Scout classifies PR description risk with a configured agent, then combines that
+with changed LOC. `low` risk always uses 1 reviewer per category. `medium` risk
+uses LOC sizing: 1 reviewer per category up to 150 changed lines, 2 up to 600,
+3 up to 1500, and 4 above that. `high` risk adds
+`subagent_high_risk_bonus` per category before caps. Disabled or failed risk
+classification defaults to `medium`. Codex caps this at 3 reviewers per
+category by default, so large PRs use at most 15 Codex subagents.
+
+Risk classification is enabled by default and uses Codex unless configured
+otherwise:
+
+```toml
+[review.risk]
+enabled = true
+provider = "codex" # must name an enabled configured agent
+model = "gpt-5.4"
+effort = "low" # Codex reasoning effort, or Claude --effort
+timeout_seconds = 120
+```
+
+When `provider = "claude"` and `model` is omitted, Scout defaults the risk
+classifier model to the normal Claude Sonnet default.
+
+The global `review.*` sizing values are backward-compatible defaults; Codex and
+Claude can each override the LOC thresholds, high-risk bonus, and
+`subagent_max_per_lens` under their `[agents.<provider>]` table. Claude defaults
+to one subagent per category to keep token use predictable unless you opt in to
+more fan-out. Each selected provider's `max_subagents` is the hard total limit
+validated at config load and before each review.
 
 ## Bitbucket Reports
 
@@ -318,7 +337,7 @@ state for PRs that are no longer open. It keeps closed PR rows while they still
 have an active `running` or `publishing` job, then removes their PR state,
 review jobs, and report-bootstrap rows on a later poll. During every poll, Scout
 also removes queued jobs and bootstrap rows for PRs currently ignored by
-repository `ignored_source_branches`, and draft PRs when
+repository `ignored_source_branches` or `ignored_target_branches`, and draft PRs when
 `ignore_draft_pull_requests` is enabled.
 
 ## License

@@ -27,6 +27,7 @@ class RepositoryConfig:
     clone_url: str
     pr_ids: List[int]
     ignored_source_branches: List[str]
+    ignored_target_branches: List[str]
     ignore_draft_pull_requests: bool
 
 
@@ -70,11 +71,21 @@ class ReviewConfig:
     policy_version: str
     schema_path: str
     max_findings: int
+    risk: "RiskConfig"
     subagent_small_loc_limit: int
     subagent_medium_loc_limit: int
     subagent_large_loc_limit: int
     subagent_high_risk_bonus: int
     subagent_max_per_lens: int
+
+
+@dataclass(frozen=True)
+class RiskConfig:
+    enabled: bool
+    provider: str
+    model: str
+    effort: str
+    timeout_seconds: int
 
 
 @dataclass(frozen=True)
@@ -189,6 +200,10 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
                 repo.get("ignored_source_branches", []),
                 "bitbucket.repositories.ignored_source_branches",
             ),
+            ignored_target_branches=_regex_list(
+                repo.get("ignored_target_branches", []),
+                "bitbucket.repositories.ignored_target_branches",
+            ),
             ignore_draft_pull_requests=_bool_value(
                 repo.get("ignore_draft_pull_requests", False),
                 "bitbucket.repositories.ignore_draft_pull_requests",
@@ -229,6 +244,8 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
         if strategy not in SUPPORTED_PROVIDERS:
             raise ConfigError("agents.strategy must be codex or claude")
         selected_providers = [strategy]
+
+    risk_config = _parse_risk_config(review, codex, claude)
 
     state_dir = str(service.get("state_dir", "/var/lib/scout"))
     retention_days = _positive_int(service.get("retention_days", 7), "service.retention_days")
@@ -352,6 +369,7 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
             policy_version=str(review.get("policy_version", "v1")),
             schema_path=str(review.get("schema_path", "/etc/scout/review.schema.json")),
             max_findings=_positive_int(review.get("max_findings", 100), "review.max_findings"),
+            risk=risk_config,
             subagent_small_loc_limit=review_subagent_small_loc_limit,
             subagent_medium_loc_limit=review_subagent_medium_loc_limit,
             subagent_large_loc_limit=review_subagent_large_loc_limit,
@@ -508,6 +526,43 @@ def _parse_provider_review_sizing(
         "subagent_large_loc_limit": large_loc_limit,
         "subagent_high_risk_bonus": high_risk_bonus,
     }
+
+
+def _parse_risk_config(
+    review: Dict[str, Any],
+    codex: Dict[str, Any],
+    claude: Dict[str, Any],
+) -> RiskConfig:
+    risk = review.get("risk", {})
+    if risk is None:
+        risk = {}
+    if not isinstance(risk, dict):
+        raise ConfigError("review.risk must be a table")
+
+    enabled = _bool_value(risk.get("enabled", True), "review.risk.enabled")
+    provider = str(risk.get("provider", "codex"))
+    if provider not in SUPPORTED_PROVIDERS:
+        raise ConfigError("review.risk.provider must be codex or claude")
+    provider_agent_config = {"codex": codex, "claude": claude}[provider]
+    if enabled and bool(provider_agent_config.get("enabled", True)) is False:
+        raise ConfigError("review.risk.provider must name an enabled agent provider")
+
+    if "codex" in risk or "claude" in risk:
+        raise ConfigError("review.risk uses provider-agnostic model and effort keys")
+    model = str(risk.get("model", "claude-sonnet-4-6" if provider == "claude" else "gpt-5.4"))
+    effort = str(risk.get("effort", "low"))
+    if provider == "codex" and effort not in {"low", "medium", "high", "xhigh"}:
+        raise ConfigError("review.risk.effort must be low, medium, high, or xhigh for codex")
+    if provider == "claude" and effort and effort not in {"low", "medium", "high", "xhigh", "max"}:
+        raise ConfigError("review.risk.effort must be empty or one of low, medium, high, xhigh, or max for claude")
+
+    return RiskConfig(
+        enabled=enabled,
+        provider=provider,
+        model=model,
+        effort=effort,
+        timeout_seconds=_positive_int(risk.get("timeout_seconds", 120), "review.risk.timeout_seconds"),
+    )
 
 
 def _int_list(value: Any, label: str) -> List[int]:

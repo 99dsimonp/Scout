@@ -20,7 +20,7 @@ from .models import PullRequest
 from .prompt import build_provider_prompt
 from .provider import PROVIDER_COOLDOWN_STATUS, ProviderError, ProviderSuperseded
 from .retention import cleanup_review_artifacts
-from .review_plan import build_review_plan
+from .review_plan import DEFAULT_RISK, build_review_plan, normalize_risk
 from .runtime_lock import RuntimeLock
 from .schema import (
     ReviewValidationError,
@@ -58,21 +58,32 @@ class ScoutDaemon:
             ssh_key_path = None
         self.git = GitManager(config.service.state_dir, ssh_key_path=ssh_key_path)
         self.provider_names = list(config.agents.providers)
+        runtime_provider_names = list(self.provider_names)
+        risk_config = getattr(config.review, "risk", None)
+        risk_provider = getattr(risk_config, "provider", None) if getattr(risk_config, "enabled", True) else None
+        if risk_provider and risk_provider not in runtime_provider_names:
+            runtime_provider_names.append(risk_provider)
         self.provider_configs = {
             provider: _provider_config(config, provider)
-            for provider in self.provider_names
+            for provider in runtime_provider_names
         }
         self.providers = {
             provider: _provider_runner(config, credentials, provider)
-            for provider in self.provider_names
+            for provider in runtime_provider_names
         }
         self.max_parallel_reviews = min(
             config.queue.max_parallel_reviews,
-            sum(provider.max_parallel for provider in self.provider_configs.values()),
+            sum(self.provider_configs[provider].max_parallel for provider in self.provider_names),
         )
         self.clone_urls: Dict[str, str] = {
             repo.slug: repo.clone_url for repo in config.bitbucket.repositories
         }
+        self._risk_cache: Dict[tuple, str] = {}
+        self._risk_cache_locks: Dict[tuple, threading.Lock] = {}
+        self._risk_cache_guard = threading.Lock()
+        self._provider_slots: Dict[str, threading.BoundedSemaphore] = {}
+        self._provider_slots_guard = threading.Lock()
+        self._ensure_provider_slots()
 
     def initialize(self) -> None:
         self.state.initialize()
@@ -154,6 +165,25 @@ class ScoutDaemon:
                         ignored_count,
                     )
                 prs = [pr for pr in prs if pr.pr_id not in ignored_set]
+            ignored_target_pr_ids = [
+                pr.pr_id for pr in prs if self._is_ignored_target_branch(repo, pr.destination_branch)
+            ]
+            if ignored_target_pr_ids:
+                ignored_set = set(ignored_target_pr_ids)
+                ignored_count = self.state.prune_ignored_pull_requests(
+                    self.config.bitbucket.workspace,
+                    repo.slug,
+                    ignored_target_pr_ids,
+                    "PR destination branch is ignored by repository configuration",
+                )
+                if ignored_count:
+                    LOG.info(
+                        "removed queued state for ignored target branch pull requests workspace=%s repo=%s count=%s",
+                        self.config.bitbucket.workspace,
+                        repo.slug,
+                        ignored_count,
+                    )
+                prs = [pr for pr in prs if pr.pr_id not in ignored_set]
             if getattr(repo, "ignore_draft_pull_requests", False):
                 ignored_draft_pr_ids = [pr.pr_id for pr in prs if pr.is_draft]
                 if ignored_draft_pr_ids:
@@ -222,6 +252,12 @@ class ScoutDaemon:
     def _is_ignored_source_branch(self, repo, source_branch: str) -> bool:
         for pattern in getattr(repo, "ignored_source_branches", ()):
             if re.search(pattern, source_branch):
+                return True
+        return False
+
+    def _is_ignored_target_branch(self, repo, target_branch: str) -> bool:
+        for pattern in getattr(repo, "ignored_target_branches", ()):
+            if re.search(pattern, target_branch):
                 return True
         return False
 
@@ -316,6 +352,7 @@ class ScoutDaemon:
             mirror = self.git.ensure_mirror(job.workspace, job.repo_slug, clone_url)
             worktree = self.git.create_worktree(mirror, pr, suffix="job-{}".format(job.id))
             context = self.git.prepare_context(mirror, worktree, pr)
+            risk = self._risk_for_job(job, source_commit)
             review_plan = build_review_plan(
                 changed_lines=int(context["changed_lines"]),
                 description=pr.description,
@@ -324,11 +361,13 @@ class ScoutDaemon:
                 large_loc_limit=provider_config.subagent_large_loc_limit,
                 high_risk_bonus=provider_config.subagent_high_risk_bonus,
                 max_subagents_per_lens=provider_config.subagent_max_per_lens,
+                risk=risk,
             )
             LOG.info(
-                "review plan job=%s changed_lines=%s high_risk=%s subagents_per_lens=%s total_subagents=%s",
+                "review plan job=%s changed_lines=%s risk=%s high_risk=%s subagents_per_lens=%s total_subagents=%s",
                 job.id,
                 review_plan.changed_lines,
+                review_plan.risk,
                 review_plan.high_risk,
                 review_plan.subagents_per_lens,
                 review_plan.total_subagents,
@@ -344,13 +383,17 @@ class ScoutDaemon:
                 )
             prompt = build_provider_prompt(job.provider, context, self.config.review.schema_path, review_plan)
             run_dir = str(Path(self.config.service.state_dir) / "runs" / str(job.id))
-            result = provider_runner.run(
-                worktree=str(worktree),
-                prompt=prompt,
-                schema_path=self.config.review.schema_path,
-                run_dir=run_dir,
-                is_superseded=lambda: self.state.is_job_superseded(job.id, job.lease_token),
-            )
+            self._acquire_provider_slot(job.provider, blocking=True)
+            try:
+                result = provider_runner.run(
+                    worktree=str(worktree),
+                    prompt=prompt,
+                    schema_path=self.config.review.schema_path,
+                    run_dir=run_dir,
+                    is_superseded=lambda: self.state.is_job_superseded(job.id, job.lease_token),
+                )
+            finally:
+                self._release_provider_slot(job.provider)
             _append_provider_usage_log_entry(
                 self.config.service.state_dir,
                 _provider_usage_log_entry(job, source_commit, run_dir, "provider_completed", result.usage),
@@ -516,11 +559,148 @@ class ScoutDaemon:
         if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
             raise ProviderSuperseded("review superseded during publish")
 
+    def _risk_for_job(self, job: ReviewJob, source_commit: str) -> str:
+        risk_config = getattr(self.config.review, "risk", None)
+        if risk_config is None or not getattr(risk_config, "enabled", True):
+            return DEFAULT_RISK
+        self._ensure_risk_cache()
+        key = _risk_cache_key(job, source_commit)
+        with self._risk_cache_guard:
+            cached = self._risk_cache.get(key)
+            if cached is not None:
+                return cached
+            lock = self._risk_cache_locks.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                self._risk_cache_locks[key] = lock
+        with lock:
+            with self._risk_cache_guard:
+                cached = self._risk_cache.get(key)
+                if cached is not None:
+                    return cached
+            try:
+                risk = self._assess_risk(job, source_commit, risk_config)
+            except Exception:
+                with self._risk_cache_guard:
+                    self._risk_cache_locks.pop(key, None)
+                raise
+            with self._risk_cache_guard:
+                self._risk_cache[key] = risk
+                self._risk_cache_locks.pop(key, None)
+            return risk
+
+    def _ensure_risk_cache(self) -> None:
+        if not hasattr(self, "_risk_cache"):
+            self._risk_cache = {}
+        if not hasattr(self, "_risk_cache_locks"):
+            self._risk_cache_locks = {}
+        if not hasattr(self, "_risk_cache_guard"):
+            self._risk_cache_guard = threading.Lock()
+
+    def _assess_risk(self, job: ReviewJob, source_commit: str, risk_config) -> str:
+        provider = getattr(risk_config, "provider", "codex")
+        runner = self.providers.get(provider)
+        if runner is None:
+            LOG.warning("risk provider is not available provider=%s job=%s", provider, job.id)
+            return DEFAULT_RISK
+        cooldown_until = self.state.get_active_provider_cooldown(provider)
+        if cooldown_until is not None:
+            LOG.info("risk provider cooldown active provider=%s until=%s job=%s", provider, cooldown_until, job.id)
+            return DEFAULT_RISK
+        if not self._acquire_provider_slot(provider, blocking=False):
+            LOG.info("risk provider capacity unavailable provider=%s job=%s", provider, job.id)
+            return DEFAULT_RISK
+        run_dir = str(Path(self.config.service.state_dir) / "runs" / str(job.id) / "risk")
+        try:
+            if provider == "codex":
+                risk = runner.assess_risk(
+                    description=job.description,
+                    model=risk_config.model,
+                    reasoning_effort=risk_config.effort,
+                    timeout_seconds=risk_config.timeout_seconds,
+                    run_dir=run_dir,
+                    is_superseded=lambda: self.state.is_job_superseded(job.id, job.lease_token),
+                )
+            elif provider == "claude":
+                risk = runner.assess_risk(
+                    description=job.description,
+                    model=risk_config.model,
+                    effort=risk_config.effort,
+                    timeout_seconds=risk_config.timeout_seconds,
+                    run_dir=run_dir,
+                    is_superseded=lambda: self.state.is_job_superseded(job.id, job.lease_token),
+                )
+            else:
+                LOG.warning("unsupported risk provider provider=%s job=%s", provider, job.id)
+                return DEFAULT_RISK
+        except ProviderSuperseded:
+            raise
+        except ProviderError as exc:
+            provider_cooldown_seconds = getattr(exc, "cooldown_seconds", None)
+            if provider_cooldown_seconds:
+                provider_status = exc.provider_status or PROVIDER_COOLDOWN_STATUS
+                cooldown_until = self.state.mark_provider_cooldown(
+                    provider,
+                    str(exc),
+                    provider_cooldown_seconds,
+                    provider_status,
+                )
+                LOG.warning(
+                    "provider cooldown set from risk classification provider=%s status=%s until=%s job=%s",
+                    provider,
+                    provider_status,
+                    cooldown_until,
+                    job.id,
+                )
+            LOG.warning("risk classification failed provider=%s job=%s error=%s", provider, job.id, exc)
+            return DEFAULT_RISK
+        except Exception as exc:
+            LOG.warning("risk classification failed provider=%s job=%s error=%s", provider, job.id, exc)
+            return DEFAULT_RISK
+        finally:
+            self._release_provider_slot(provider)
+        normalized = normalize_risk(risk)
+        LOG.info("risk classification job=%s provider=%s risk=%s", job.id, provider, normalized)
+        return normalized
+
     def _lease_seconds(self, provider: str) -> int:
         return _lease_seconds(
             self.config.queue.job_timeout_seconds,
             self.provider_configs[provider].timeout_seconds,
+            self._risk_timeout_seconds(),
         )
+
+    def _risk_timeout_seconds(self) -> int:
+        risk_config = getattr(getattr(self.config, "review", None), "risk", None)
+        if risk_config is None or not getattr(risk_config, "enabled", True):
+            return 0
+        return int(getattr(risk_config, "timeout_seconds", 0) or 0)
+
+    def _ensure_provider_slots(self) -> None:
+        if not hasattr(self, "_provider_slots"):
+            self._provider_slots = {}
+        if not hasattr(self, "_provider_slots_guard"):
+            self._provider_slots_guard = threading.Lock()
+        with self._provider_slots_guard:
+            for provider, provider_config in getattr(self, "provider_configs", {}).items():
+                if provider in self._provider_slots:
+                    continue
+                max_parallel = int(getattr(provider_config, "max_parallel", 1) or 1)
+                if max_parallel < 1:
+                    max_parallel = 1
+                self._provider_slots[provider] = threading.BoundedSemaphore(max_parallel)
+
+    def _acquire_provider_slot(self, provider: str, blocking: bool) -> bool:
+        self._ensure_provider_slots()
+        slot = self._provider_slots.get(provider)
+        if slot is None:
+            return True
+        return slot.acquire(blocking=blocking)
+
+    def _release_provider_slot(self, provider: str) -> None:
+        slot = getattr(self, "_provider_slots", {}).get(provider)
+        if slot is not None:
+            slot.release()
 
     def cleanup_old_artifacts(self) -> None:
         try:
@@ -556,12 +736,31 @@ def _selected_provider_runner(config: AppConfig, credentials: CredentialStore):
     return _provider_runner(config, credentials, config.agents.strategy)
 
 
-def _lease_seconds(queue_timeout_seconds: int, provider_timeout_seconds: int) -> int:
-    return max(queue_timeout_seconds, provider_timeout_seconds + 60)
+def _lease_seconds(
+    queue_timeout_seconds: int,
+    provider_timeout_seconds: int,
+    risk_timeout_seconds: int = 0,
+) -> int:
+    return max(queue_timeout_seconds, provider_timeout_seconds + risk_timeout_seconds + 60)
 
 
 def _retry_backoff_seconds(config: AppConfig) -> int:
     return getattr(config.queue, "retry_backoff_seconds", 300)
+
+
+def _risk_cache_key(job: ReviewJob, source_commit: str) -> tuple:
+    return (
+        job.workspace,
+        job.repo_slug,
+        job.pr_id,
+        source_commit,
+        job.destination_branch,
+        job.destination_commit_hash or "",
+        job.merge_base_hash or "",
+        job.reviewer_policy_version,
+        job.schema_version,
+        job.description or "",
+    )
 
 
 def _seconds_until_next_poll(next_poll_at: float, now: float) -> float:

@@ -16,6 +16,7 @@ from scout.daemon import (
     _reap_worker_futures,
     _seconds_until_next_poll,
 )
+from scout.config import CredentialStore, parse_config
 from scout.gitops import GitError
 from scout.models import PullRequest
 from scout.provider import ProviderResult
@@ -23,14 +24,14 @@ from scout.schema import validate_review_output
 from scout.state import ReviewJob, StateStore
 
 
-def review_job(provider="claude", job_id=7, pr_id=13, attempts=1):
+def review_job(provider="claude", job_id=7, pr_id=13, attempts=1, description=""):
     return ReviewJob(
         id=job_id,
         workspace="ws",
         repo_slug="repo",
         pr_id=pr_id,
         title="PR",
-        description="",
+        description=description,
         source_branch="feature",
         target_source_commit_hash="a" * 40,
         running_source_commit_hash="b" * 40,
@@ -85,6 +86,7 @@ class DaemonReviewLogTests(unittest.TestCase):
     def test_lease_seconds_covers_provider_timeout_with_grace(self):
         self.assertEqual(_lease_seconds(1200, 1800), 1860)
         self.assertEqual(_lease_seconds(2400, 1800), 2400)
+        self.assertEqual(_lease_seconds(1200, 1800, 120), 1980)
 
     def test_review_log_entry_records_metadata_counts_and_log_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -203,6 +205,32 @@ class DaemonReviewLogTests(unittest.TestCase):
             self.assertTrue(
                 any("recovered abandoned active review jobs count=2" in message for message in logs.output)
             )
+
+    def test_init_loads_risk_provider_without_adding_review_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "bitbucket_username").write_text("user\n", encoding="utf-8")
+            Path(tmp, "bitbucket_api_key").write_text("key\n", encoding="utf-8")
+            config = parse_config(
+                {
+                    "service": {
+                        "state_db": str(Path(tmp) / "state.db"),
+                        "state_dir": tmp,
+                    },
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                    },
+                    "agents": {"strategy": "claude"},
+                    "review": {"risk": {"provider": "codex"}},
+                }
+            )
+
+            daemon = ScoutDaemon(config, CredentialStore(tmp))
+
+            self.assertEqual(daemon.provider_names, ["claude"])
+            self.assertEqual(sorted(daemon.providers), ["claude", "codex"])
+            self.assertEqual(sorted(daemon.provider_configs), ["claude", "codex"])
+            self.assertEqual(daemon.max_parallel_reviews, 2)
 
     def test_schedule_claims_from_global_queue_with_provider_specific_leases(self):
         daemon = ScoutDaemon.__new__(ScoutDaemon)
@@ -430,6 +458,75 @@ class DaemonReviewLogTests(unittest.TestCase):
         )
         self.assertEqual(daemon.state.enqueued, [("repo", 13, "codex")])
 
+    def test_poll_once_skips_and_clears_state_for_ignored_target_branches(self):
+        ignored_pr = PullRequest(
+            workspace="ws",
+            repo_slug="repo",
+            pr_id=14,
+            title="Ignored PR",
+            description="",
+            source_branch="feature",
+            source_commit_hash="b" * 40,
+            destination_branch="release/1.0",
+        )
+        regular_pr = PullRequest(
+            workspace="ws",
+            repo_slug="repo",
+            pr_id=13,
+            title="Regular PR",
+            description="",
+            source_branch="feature",
+            source_commit_hash="a" * 40,
+            destination_branch="main",
+        )
+
+        daemon = _polling_daemon(report_exists=False)
+        daemon.config.bitbucket.repositories[0].ignored_target_branches = ["^release/"]
+        daemon.bitbucket.prs = [ignored_pr, regular_pr]
+
+        daemon.poll_once()
+
+        self.assertEqual(
+            daemon.state.pruned_ignored,
+            [("ws", "repo", [14])],
+        )
+        self.assertEqual(daemon.state.enqueued, [("repo", 13, "codex")])
+
+    def test_poll_once_clears_ignored_target_branches_before_pr_id_filter(self):
+        ignored_pr = PullRequest(
+            workspace="ws",
+            repo_slug="repo",
+            pr_id=14,
+            title="Ignored PR",
+            description="",
+            source_branch="feature",
+            source_commit_hash="b" * 40,
+            destination_branch="release/1.0",
+        )
+        regular_pr = PullRequest(
+            workspace="ws",
+            repo_slug="repo",
+            pr_id=13,
+            title="Regular PR",
+            description="",
+            source_branch="feature",
+            source_commit_hash="a" * 40,
+            destination_branch="main",
+        )
+
+        daemon = _polling_daemon(report_exists=False)
+        daemon.config.bitbucket.repositories[0].ignored_target_branches = ["^release/"]
+        daemon.config.bitbucket.repositories[0].pr_ids = [13]
+        daemon.bitbucket.prs = [ignored_pr, regular_pr]
+
+        daemon.poll_once()
+
+        self.assertEqual(
+            daemon.state.pruned_ignored,
+            [("ws", "repo", [14])],
+        )
+        self.assertEqual(daemon.state.enqueued, [("repo", 13, "codex")])
+
     def test_poll_once_skips_and_clears_state_for_draft_prs(self):
         ignored_pr = PullRequest(
             workspace="ws",
@@ -550,6 +647,256 @@ class DaemonReviewLogTests(unittest.TestCase):
             self.assertEqual(daemon.bitbucket.reports[0][2], "scout-claude-v1")
             self.assertEqual(daemon.bitbucket.reports[0][3]["title"], "Claude PR Review")
             self.assertEqual(daemon.bitbucket.annotations[0][2], "scout-claude-v1")
+
+    def test_run_job_reuses_risk_classification_across_provider_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                queue=SimpleNamespace(
+                    job_timeout_seconds=1200,
+                    max_attempts=3,
+                    retry_backoff_seconds=300,
+                ),
+                review=SimpleNamespace(
+                    policy_version="v1",
+                    schema_path="/tmp/schema.json",
+                    max_findings=100,
+                    risk=SimpleNamespace(
+                        enabled=True,
+                        provider="codex",
+                        model="gpt-5.4",
+                        effort="low",
+                        timeout_seconds=12,
+                    ),
+                ),
+                service=SimpleNamespace(state_dir=tmp),
+                reports=_FakeReports(),
+                comments=SimpleNamespace(critical_enabled=True),
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(
+                    max_parallel=2,
+                    timeout_seconds=1200,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=1,
+                    subagent_max_per_lens=4,
+                ),
+                "claude": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1800,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=1,
+                    subagent_max_per_lens=4,
+                ),
+            }
+            codex = _FakeProvider(risk="high")
+            claude = _FakeProvider()
+            daemon.providers = {"codex": codex, "claude": claude}
+            daemon.state = _FakeRunJobState()
+            daemon.git = _FakeGit()
+            daemon.bitbucket = _FakeBitbucket()
+            daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
+
+            daemon.run_job(review_job(provider="codex", job_id=21, description="Touches auth."))
+            daemon.run_job(review_job(provider="claude", job_id=22, description="Touches auth."))
+
+            self.assertEqual(
+                codex.risk_calls,
+                [
+                    {
+                        "description": "Touches auth.",
+                        "model": "gpt-5.4",
+                        "reasoning_effort": "low",
+                        "timeout_seconds": 12,
+                    }
+                ],
+            )
+            self.assertIn("- PR description risk: high", codex.runs[0]["prompt"])
+            self.assertIn("- Subagents per review category: 3", codex.runs[0]["prompt"])
+            self.assertIn("- PR description risk: high", claude.runs[0]["prompt"])
+            self.assertIn("- Subagents per review category: 3", claude.runs[0]["prompt"])
+
+    def test_run_job_defaults_to_medium_risk_when_classifier_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                queue=SimpleNamespace(
+                    job_timeout_seconds=1200,
+                    max_attempts=3,
+                    retry_backoff_seconds=300,
+                ),
+                review=SimpleNamespace(
+                    policy_version="v1",
+                    schema_path="/tmp/schema.json",
+                    max_findings=100,
+                    risk=SimpleNamespace(
+                        enabled=True,
+                        provider="codex",
+                        model="gpt-5.4",
+                        effort="low",
+                        timeout_seconds=12,
+                    ),
+                ),
+                service=SimpleNamespace(state_dir=tmp),
+                reports=_FakeReports(),
+                comments=SimpleNamespace(critical_enabled=True),
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1200,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=1,
+                    subagent_max_per_lens=4,
+                ),
+            }
+            provider = _FakeProvider(risk_error=RuntimeError("classification failed"))
+            daemon.providers = {"codex": provider}
+            daemon.state = _FakeRunJobState()
+            daemon.git = _FakeGit()
+            daemon.bitbucket = _FakeBitbucket()
+            daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
+
+            daemon.run_job(review_job(provider="codex", job_id=23, description="Touches auth."))
+
+            self.assertEqual(len(provider.risk_calls), 1)
+            self.assertIn("- PR description risk: medium", provider.runs[0]["prompt"])
+            self.assertIn("- Subagents per review category: 2", provider.runs[0]["prompt"])
+
+    def test_run_job_skips_risk_classification_when_risk_provider_is_cooling_down(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                queue=SimpleNamespace(
+                    job_timeout_seconds=1200,
+                    max_attempts=3,
+                    retry_backoff_seconds=300,
+                ),
+                review=SimpleNamespace(
+                    policy_version="v1",
+                    schema_path="/tmp/schema.json",
+                    max_findings=100,
+                    risk=SimpleNamespace(
+                        enabled=True,
+                        provider="codex",
+                        model="gpt-5.4",
+                        effort="low",
+                        timeout_seconds=12,
+                    ),
+                ),
+                service=SimpleNamespace(state_dir=tmp),
+                reports=_FakeReports(),
+                comments=SimpleNamespace(critical_enabled=True),
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1200,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=1,
+                    subagent_max_per_lens=4,
+                ),
+                "claude": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1800,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=1,
+                    subagent_max_per_lens=4,
+                ),
+            }
+            codex = _FakeProvider(risk="high")
+            claude = _FakeProvider()
+            daemon.providers = {"codex": codex, "claude": claude}
+            daemon.state = _FakeRunJobState(cooldowns={"codex": "2099-01-01T00:00:00+00:00"})
+            daemon.git = _FakeGit()
+            daemon.bitbucket = _FakeBitbucket()
+            daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
+
+            daemon.run_job(review_job(provider="claude", job_id=24, description="Touches auth."))
+
+            self.assertEqual(codex.risk_calls, [])
+            self.assertIn("- PR description risk: medium", claude.runs[0]["prompt"])
+            self.assertIn("- Subagents per review category: 2", claude.runs[0]["prompt"])
+
+    def test_run_job_skips_risk_classification_when_risk_provider_capacity_is_busy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                queue=SimpleNamespace(
+                    job_timeout_seconds=1200,
+                    max_attempts=3,
+                    retry_backoff_seconds=300,
+                ),
+                review=SimpleNamespace(
+                    policy_version="v1",
+                    schema_path="/tmp/schema.json",
+                    max_findings=100,
+                    risk=SimpleNamespace(
+                        enabled=True,
+                        provider="codex",
+                        model="gpt-5.4",
+                        effort="low",
+                        timeout_seconds=12,
+                    ),
+                ),
+                service=SimpleNamespace(state_dir=tmp),
+                reports=_FakeReports(),
+                comments=SimpleNamespace(critical_enabled=True),
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1200,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=1,
+                    subagent_max_per_lens=4,
+                ),
+                "claude": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1800,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=1,
+                    subagent_max_per_lens=4,
+                ),
+            }
+            codex = _FakeProvider(risk="high")
+            claude = _FakeProvider()
+            daemon.providers = {"codex": codex, "claude": claude}
+            daemon.state = _FakeRunJobState()
+            daemon.git = _FakeGit()
+            daemon.bitbucket = _FakeBitbucket()
+            daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
+
+            self.assertTrue(daemon._acquire_provider_slot("codex", blocking=False))
+            try:
+                daemon.run_job(review_job(provider="claude", job_id=25, description="Touches auth."))
+            finally:
+                daemon._release_provider_slot("codex")
+
+            self.assertEqual(codex.risk_calls, [])
+            self.assertIn("- PR description risk: medium", claude.runs[0]["prompt"])
+            self.assertIn("- Subagents per review category: 2", claude.runs[0]["prompt"])
 
     def test_run_job_comments_on_critical_findings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1014,9 +1361,12 @@ class _FakePollingBitbucket:
 
 
 class _FakeProvider:
-    def __init__(self, final_message=None):
+    def __init__(self, final_message=None, risk="medium", risk_error=None):
         self.runs = []
+        self.risk_calls = []
         self.final_message = final_message
+        self.risk = risk
+        self.risk_error = risk_error
 
     def run(self, worktree, prompt, schema_path, run_dir, is_superseded):
         self.runs.append(
@@ -1042,6 +1392,18 @@ class _FakeProvider:
             }
         return ProviderResult(stdout="{}", stderr="", final_message=json.dumps(payload))
 
+    def assess_risk(self, description, model, timeout_seconds, run_dir, is_superseded, **kwargs):
+        call = {
+            "description": description,
+            "model": model,
+            "timeout_seconds": timeout_seconds,
+        }
+        call.update(kwargs)
+        self.risk_calls.append(call)
+        if self.risk_error is not None:
+            raise self.risk_error
+        return self.risk
+
 
 class _FakeReports:
     def report_id_for(self, provider):
@@ -1058,14 +1420,22 @@ class _FakeReports:
 
 
 class _FakeRunJobState:
-    def __init__(self):
+    def __init__(self, cooldowns=None):
         self.publishing_leases = []
         self.renewals = []
         self.successes = []
         self.retryable_failures = []
+        self.cooldowns = dict(cooldowns or {})
+        self.marked_provider_cooldowns = []
 
     def get_active_provider_cooldown(self, provider):
-        return None
+        return self.cooldowns.get(provider)
+
+    def mark_provider_cooldown(self, provider, error, cooldown_seconds, status="quota_exhausted"):
+        self.marked_provider_cooldowns.append((provider, cooldown_seconds, status))
+        cooldown_until = "2099-01-01T00:00:00+00:00"
+        self.cooldowns[provider] = cooldown_until
+        return cooldown_until
 
     def is_job_superseded(self, job_id, lease_token=None):
         return False

@@ -22,6 +22,8 @@ clone_url = "git@bitbucket.org:my-workspace/repo-a.git"
 # pr_ids = [123]
 # Optional: skip PRs whose source branch matches any regex pattern.
 # ignored_source_branches = ["^release/"]
+# Optional: skip PRs whose target/destination branch matches any regex pattern.
+# ignored_target_branches = ["^release/"]
 # Optional: skip PRs marked as draft.
 # ignore_draft_pull_requests = true
 
@@ -31,6 +33,8 @@ clone_url = "git@bitbucket.org:my-workspace/repo-b.git"
 # Leave pr_ids unset to review every changed open PR in this repository.
 # Optionally ignore source branches with regex patterns.
 # ignored_source_branches = ["^release/"]
+# Optionally ignore target/destination branches with regex patterns.
+# ignored_target_branches = ["^release/"]
 # Optionally skip draft PRs until they are ready for review.
 # ignore_draft_pull_requests = true
 
@@ -62,6 +66,15 @@ subagent_medium_loc_limit = 600
 subagent_large_loc_limit = 1500
 subagent_high_risk_bonus = 1
 subagent_max_per_lens = 4
+
+[review.risk]
+enabled = true
+# Must name an enabled configured agent provider when enabled.
+provider = "codex"
+model = "gpt-5.4"
+# For Codex this maps to model_reasoning_effort; for Claude this maps to --effort.
+effort = "low"
+timeout_seconds = 120
 
 [agents]
 # Legacy single-provider selector. Still valid by itself.

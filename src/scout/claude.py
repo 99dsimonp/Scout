@@ -21,6 +21,7 @@ from .provider import (
     redacted_cmd as _redacted_cmd,
     terminate_process_group as _terminate_process_group,
 )
+from .risk import build_risk_prompt, extract_risk, risk_schema_json
 from .usage import parse_claude_usage
 
 LOG = logging.getLogger(__name__)
@@ -125,6 +126,83 @@ class ClaudeRunner:
             usage=parse_claude_usage(stdout_text),
         )
 
+    def assess_risk(
+        self,
+        description: str,
+        model: str,
+        effort: str,
+        timeout_seconds: int,
+        run_dir: str,
+        is_superseded: Callable[[], bool],
+    ) -> str:
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        stdout_file = Path(run_dir) / "claude-risk-stdout.log"
+        stderr_file = Path(run_dir) / "claude-risk-stderr.log"
+        prompt_file = Path(run_dir) / "claude-risk-prompt.txt"
+        prompt_file.write_text(build_risk_prompt(description), encoding="utf-8")
+
+        cmd = self.build_risk_command(risk_schema_json(), model, effort)
+        LOG.info("starting Claude risk command=%s prompt_file=%s", _redacted_cmd(cmd), prompt_file)
+        with prompt_file.open("r", encoding="utf-8") as prompt_input, \
+            stdout_file.open("w", encoding="utf-8") as stdout, \
+            stderr_file.open("w", encoding="utf-8") as stderr:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=prompt_input,
+                stdout=stdout,
+                stderr=stderr,
+                cwd=run_dir,
+                text=True,
+                env=self._env(),
+                start_new_session=True,
+            )
+            started = time.monotonic()
+            while True:
+                if proc.poll() is not None:
+                    break
+                if is_superseded():
+                    _terminate_process_group(proc)
+                    raise ProviderSuperseded("review superseded by a newer PR commit")
+                if time.monotonic() - started > timeout_seconds:
+                    _terminate_process_group(proc)
+                    stdout.flush()
+                    stderr.flush()
+                    cooldown_seconds = provider_quota_cooldown_seconds(
+                        "claude",
+                        _read_text(stdout_file),
+                        _read_text(stderr_file),
+                    )
+                    raise ProviderError(
+                        "Claude risk classification timed out after {} seconds".format(timeout_seconds),
+                        cooldown_seconds=cooldown_seconds,
+                        provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
+                    )
+                time.sleep(1)
+
+        stdout_text = _read_text(stdout_file)
+        stderr_text = _read_text(stderr_file)
+        cooldown_seconds = provider_quota_cooldown_seconds("claude", stdout_text, stderr_text)
+        LOG.info(
+            "Claude risk completed returncode=%s stdout_file=%s stderr_file=%s stdout_present=%s",
+            proc.returncode,
+            stdout_file,
+            stderr_file,
+            bool(stdout_text.strip()),
+        )
+        if proc.returncode != 0:
+            raise ProviderError(
+                "Claude risk classification exited with status {}: {}".format(proc.returncode, stderr_text[:1000]),
+                cooldown_seconds=cooldown_seconds,
+                provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
+            )
+        if not stdout_text.strip():
+            raise ProviderError(
+                "Claude risk classification did not write final JSON to stdout",
+                cooldown_seconds=cooldown_seconds,
+                provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
+            )
+        return extract_risk(stdout_text)
+
     def build_command(self, prompt: str, schema_content: str) -> list:
         cmd = [
             self.config.command,
@@ -150,6 +228,33 @@ class ClaudeRunner:
             cmd.extend(["--model", self.config.model.strip()])
         if self.config.effort.strip():
             cmd.extend(["--effort", self.config.effort.strip()])
+        return cmd
+
+    def build_risk_command(self, schema_content: str, model: str, effort: str) -> list:
+        cmd = [
+            self.config.command,
+            "-p",
+            "--output-format",
+            "json",
+            "--json-schema",
+            schema_content,
+            "--tools",
+            CLAUDE_READONLY_TOOLS,
+            "--allowedTools",
+            CLAUDE_READONLY_TOOLS,
+            "--disallowedTools",
+            CLAUDE_DENIED_TOOLS,
+            "--permission-mode",
+            "dontAsk",
+            "--no-session-persistence",
+            "--strict-mcp-config",
+        ]
+        if self.config.auth_mode == "api":
+            cmd.append("--bare")
+        if model.strip():
+            cmd.extend(["--model", model.strip()])
+        if effort.strip():
+            cmd.extend(["--effort", effort.strip()])
         return cmd
 
     def _env(self) -> dict:
