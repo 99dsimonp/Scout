@@ -62,6 +62,7 @@ class CodexRunnerTests(unittest.TestCase):
             reasoning_effort="low",
         )
         self.assertEqual(cmd[cmd.index("--model") + 1], "gpt-5.4")
+        self.assertIn("--skip-git-repo-check", cmd)
         self.assertIn('model_reasoning_effort="low"', cmd)
         self.assertIn("/risk.schema.json", cmd)
         self.assertIn("/risk-output.json", cmd)

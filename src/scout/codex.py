@@ -284,6 +284,7 @@ class CodexRunner:
             [
                 "--model",
                 model,
+                "--skip-git-repo-check",
                 "--config",
                 'model_reasoning_effort="{}"'.format(reasoning_effort),
                 "--cd",
