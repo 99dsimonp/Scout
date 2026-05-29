@@ -10,6 +10,7 @@ from scout.daemon import (
     ScoutDaemon,
     _append_provider_usage_log_entry,
     _append_review_log_entry,
+    _format_provider_model_metadata,
     _lease_seconds,
     _provider_usage_log_entry,
     _review_log_entry,
@@ -83,6 +84,10 @@ def valid_review():
 
 
 class DaemonReviewLogTests(unittest.TestCase):
+    def test_model_metadata_uses_cli_default_when_model_is_empty(self):
+        self.assertEqual(_format_provider_model_metadata("", "max"), "CLI default / max")
+        self.assertEqual(_format_provider_model_metadata("claude-opus-4-8", ""), "claude-opus-4-8 / CLI default")
+
     def test_lease_seconds_covers_provider_timeout_with_grace(self):
         self.assertEqual(_lease_seconds(1200, 1800), 1860)
         self.assertEqual(_lease_seconds(2400, 1800), 2400)
@@ -604,6 +609,8 @@ class DaemonReviewLogTests(unittest.TestCase):
                 "codex": SimpleNamespace(
                     max_parallel=2,
                     timeout_seconds=1200,
+                    model="gpt-5.5",
+                    reasoning_effort="high",
                     max_subagents=20,
                     subagent_small_loc_limit=150,
                     subagent_medium_loc_limit=600,
@@ -614,6 +621,8 @@ class DaemonReviewLogTests(unittest.TestCase):
                 "claude": SimpleNamespace(
                     max_parallel=1,
                     timeout_seconds=1800,
+                    model="claude-opus-4-8",
+                    effort="max",
                     max_subagents=5,
                     subagent_small_loc_limit=150,
                     subagent_medium_loc_limit=600,
@@ -646,6 +655,10 @@ class DaemonReviewLogTests(unittest.TestCase):
             )
             self.assertEqual(daemon.bitbucket.reports[0][2], "scout-claude-v1")
             self.assertEqual(daemon.bitbucket.reports[0][3]["title"], "Claude PR Review")
+            self.assertIn(
+                {"title": "Model", "type": "TEXT", "value": "claude-opus-4-8 / max"},
+                daemon.bitbucket.reports[0][3]["data"],
+            )
             self.assertEqual(daemon.bitbucket.annotations[0][2], "scout-claude-v1")
 
     def test_run_job_reuses_risk_classification_across_provider_jobs(self):
@@ -923,6 +936,8 @@ class DaemonReviewLogTests(unittest.TestCase):
                 "codex": SimpleNamespace(
                     max_parallel=1,
                     timeout_seconds=1200,
+                    model="gpt-5.5",
+                    reasoning_effort="high",
                     max_subagents=20,
                     subagent_small_loc_limit=150,
                     subagent_medium_loc_limit=600,
@@ -967,6 +982,10 @@ class DaemonReviewLogTests(unittest.TestCase):
             daemon.run_job(review_job(provider="codex", job_id=11))
 
             self.assertEqual(len(daemon.bitbucket.comments), 1)
+            self.assertIn(
+                {"title": "Model", "type": "TEXT", "value": "gpt-5.5 / high"},
+                daemon.bitbucket.reports[0][3]["data"],
+            )
             repo_slug, pr_id, content = daemon.bitbucket.comments[0]
             self.assertEqual((repo_slug, pr_id), ("repo", 13))
             self.assertEqual(daemon.bitbucket.operations, ["report", "annotations", "comment"])

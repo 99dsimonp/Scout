@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 
 class ReviewValidationError(ValueError):
@@ -64,7 +64,12 @@ def report_result_for_recommendation(recommendation: str) -> str:
     raise ReviewValidationError("unknown recommendation: {}".format(recommendation))
 
 
-def to_bitbucket_report(review: ValidatedReview, title: str, provider: str = "codex") -> Dict[str, Any]:
+def to_bitbucket_report(
+    review: ValidatedReview,
+    title: str,
+    provider: str = "codex",
+    model_metadata: Optional[str] = None,
+) -> Dict[str, Any]:
     provider_label = _provider_label(provider)
     return {
         "title": _format_report_title(title, provider_label),
@@ -72,7 +77,7 @@ def to_bitbucket_report(review: ValidatedReview, title: str, provider: str = "co
         "report_type": _report_type(review),
         "reporter": "scout",
         "result": report_result_for_recommendation(review.recommendation),
-        "data": _report_data(review, provider_label),
+        "data": _report_data(review, provider_label, model_metadata),
     }
 
 
@@ -304,7 +309,11 @@ def _report_type(review: ValidatedReview) -> str:
     return review.report["report_type"]
 
 
-def _report_data(review: ValidatedReview, provider_label: str) -> List[Dict[str, Any]]:
+def _report_data(
+    review: ValidatedReview,
+    provider_label: str,
+    model_metadata: Optional[str],
+) -> List[Dict[str, Any]]:
     data = [
         {"title": "Provider", "type": "TEXT", "value": provider_label},
         {"title": "Findings", "type": "NUMBER", "value": len(review.annotations)},
@@ -318,6 +327,8 @@ def _report_data(review: ValidatedReview, provider_label: str) -> List[Dict[str,
         count = sum(1 for annotation in review.annotations if annotation["severity"] == severity)
         if count:
             data.append({"title": _sentence_case(severity), "type": "NUMBER", "value": count})
+    if model_metadata:
+        data.append({"title": "Model", "type": "TEXT", "value": model_metadata})
     return data
 
 

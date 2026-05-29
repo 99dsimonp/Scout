@@ -69,6 +69,23 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("Reviewer: Codex / correctness / HIGH confidence", annotations[0]["details"])
         self.assertNotIn("smallest_fix", annotations[0])
 
+    def test_report_data_can_include_model_metadata(self):
+        review = validate_review_output(valid_review())
+
+        report = to_bitbucket_report(
+            review,
+            "Codex PR Review",
+            provider="codex",
+            model_metadata="gpt-5.5 / high",
+        )
+
+        self.assertEqual(
+            [item["title"] for item in report["data"][:3]],
+            ["Provider", "Findings", "Recommendation"],
+        )
+        self.assertIn({"title": "High", "type": "NUMBER", "value": 1}, report["data"])
+        self.assertEqual(report["data"][-1], {"title": "Model", "type": "TEXT", "value": "gpt-5.5 / high"})
+
     def test_approve_report_is_readable(self):
         payload = valid_review()
         payload["recommendation"] = "approve"

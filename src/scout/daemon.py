@@ -418,7 +418,12 @@ class ScoutDaemon:
             )
             report_id = self.config.reports.report_id_for(job.provider)
             report_title = self.config.reports.title_for(job.provider)
-            report = to_bitbucket_report(validated, report_title, provider=job.provider)
+            report = to_bitbucket_report(
+                validated,
+                report_title,
+                provider=job.provider,
+                model_metadata=_provider_model_metadata(job.provider, provider_config),
+            )
             annotations = to_bitbucket_annotations(validated, provider=job.provider)
             if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
                 raise ProviderSuperseded("review superseded before report publish")
@@ -726,6 +731,25 @@ def _provider_runner(config: AppConfig, credentials: CredentialStore, provider: 
     if provider == "claude":
         return ClaudeRunner(config.agents.claude, credentials)
     raise ConfigError("unsupported provider: {}".format(provider))
+
+
+def _provider_model_metadata(provider: str, provider_config) -> str:
+    model = getattr(provider_config, "model", "")
+    if provider == "codex":
+        effort = getattr(provider_config, "reasoning_effort", "")
+    elif provider == "claude":
+        effort = getattr(provider_config, "effort", "")
+    else:
+        raise ConfigError("unsupported provider: {}".format(provider))
+    return _format_provider_model_metadata(model, effort)
+
+
+def _format_provider_model_metadata(model: str, effort: str) -> str:
+    model = str(model).strip()
+    effort = str(effort).strip()
+    model_label = model or "CLI default"
+    effort_label = effort or "CLI default"
+    return "{} / {}".format(model_label, effort_label)
 
 
 def _selected_provider_config(config: AppConfig):
