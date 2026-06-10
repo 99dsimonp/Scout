@@ -663,7 +663,7 @@ claude -p \
   --json-schema "$(cat /etc/scout/review.schema.json)" \
   --tools Task,Read,Grep,Glob \
   --allowedTools Task,Read,Grep,Glob \
-  --disallowedTools Bash,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch \
+  --disallowedTools Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch \
   --effort max \
   --permission-mode dontAsk \
   --no-session-persistence \

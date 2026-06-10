@@ -26,7 +26,7 @@ from .usage import parse_claude_usage
 
 LOG = logging.getLogger(__name__)
 CLAUDE_READONLY_TOOLS = "Task,Read,Grep,Glob"
-CLAUDE_DENIED_TOOLS = "Bash,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch"
+CLAUDE_DENIED_TOOLS = "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch"
 
 
 class ClaudeRunner:

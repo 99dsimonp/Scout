@@ -43,6 +43,7 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--tools") + 1], CLAUDE_READONLY_TOOLS)
         self.assertEqual(cmd[cmd.index("--allowedTools") + 1], CLAUDE_READONLY_TOOLS)
         self.assertEqual(cmd[cmd.index("--disallowedTools") + 1], CLAUDE_DENIED_TOOLS)
+        self.assertNotIn("MultiEdit", CLAUDE_DENIED_TOOLS)
         self.assertEqual(cmd[cmd.index("--permission-mode") + 1], "dontAsk")
         self.assertIn("--no-session-persistence", cmd)
         self.assertIn("--strict-mcp-config", cmd)
@@ -72,6 +73,8 @@ class ClaudeRunnerTests(unittest.TestCase):
     def test_build_risk_command_uses_classifier_model_and_effort(self):
         runner = ClaudeRunner(claude_config(model="claude-sonnet-4-6", effort="max"), CredentialStore("/tmp/unused"))
         cmd = runner.build_risk_command('{"type":"object"}', model="claude-sonnet-4-6", effort="low")
+        self.assertEqual(cmd[cmd.index("--disallowedTools") + 1], CLAUDE_DENIED_TOOLS)
+        self.assertNotIn("MultiEdit", cmd[cmd.index("--disallowedTools") + 1])
         self.assertEqual(cmd[cmd.index("--model") + 1], "claude-sonnet-4-6")
         self.assertEqual(cmd[cmd.index("--effort") + 1], "low")
 
