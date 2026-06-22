@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from copy import deepcopy
 from dataclasses import dataclass
@@ -372,47 +373,57 @@ def _format_inline_comment(
     source_commit: str,
     review_run_id: str,
 ) -> str:
-    lines = [
-        "**Scout: {} issue found by {}**".format(
-            _sentence_case(annotation["severity"]),
-            provider_label,
-        ),
-        "",
-    ]
-    if source_commit:
-        lines.extend(["Commit: `{}`".format(source_commit[:12]), ""])
-    lines.extend(
+    marker_lines = [_hidden_inline_marker("scout-finding", annotation["external_id"])]
+    if review_run_id:
+        marker_lines.append(_hidden_inline_marker("scout-review-run", review_run_id))
+    body = "\n".join(
         [
             "**{}**".format(annotation["summary"]),
             "",
-            "Reviewer: {} / {} confidence".format(
-                _reviewer_label(annotation["reviewer"]),
-                annotation["confidence"],
-            ),
-            "",
-            "Scout finding: `{}`".format(annotation["external_id"]),
-        ]
-    )
-    if review_run_id:
-        lines.extend(["Scout review run: `{}`".format(review_run_id)])
-    lines.extend(
-        [
-            "",
-            "Why it matters:",
+            "What I found:",
             annotation["details"],
             "",
             "Smallest fix:",
             annotation["smallest_fix"],
         ]
     )
-    content = "\n".join(lines).rstrip()
+    footer = "Scout: {} issue found by {}. Reviewer: {} / {} confidence".format(
+        _sentence_case(annotation["severity"]),
+        provider_label,
+        _reviewer_label(annotation["reviewer"]),
+        annotation["confidence"],
+    )
     suggested_change = annotation.get("suggested_change")
     if isinstance(suggested_change, dict) and isinstance(suggested_change.get("replacement"), str):
         replacement = suggested_change["replacement"]
         suggestion = "\n\nSuggested change:\n\n```suggestion\n{}\n```".format(replacement)
-        if len(content) + len(suggestion) <= BITBUCKET_COMMENT_MAX_LENGTH:
-            return content + suggestion
-    return _truncate(content, BITBUCKET_COMMENT_MAX_LENGTH)
+        content_with_suggestion = _format_inline_comment_parts(marker_lines, body + suggestion, footer)
+        if len(content_with_suggestion) <= BITBUCKET_COMMENT_MAX_LENGTH:
+            return content_with_suggestion
+    return _format_inline_comment_parts(marker_lines, body, footer, limit=BITBUCKET_COMMENT_MAX_LENGTH)
+
+
+def _hidden_inline_marker(label: str, value: str) -> str:
+    encoded = base64.b64encode(str(value).encode("utf-8")).decode("ascii")
+    return "<!-- {}: {} -->".format(label, encoded)
+
+
+def _format_inline_comment_parts(
+    marker_lines: List[str],
+    body: str,
+    footer: str,
+    limit: Optional[int] = None,
+) -> str:
+    prefix = ""
+    if marker_lines:
+        prefix = "\n".join(marker_lines) + "\n\n"
+    suffix = "\n\n" + footer
+    if limit is None or len(prefix) + len(body) + len(suffix) <= limit:
+        return prefix + body + suffix
+    body_limit = limit - len(prefix) - len(suffix)
+    if body_limit <= 0:
+        return _truncate(prefix + footer, limit)
+    return prefix + _truncate(body, body_limit) + suffix
 
 
 def _provider_label(provider: str) -> str:

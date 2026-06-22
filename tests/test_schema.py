@@ -209,16 +209,35 @@ class SchemaTests(unittest.TestCase):
         payload["annotations"].append(low)
         review = validate_review_output(payload)
 
-        comments = to_inline_pr_comments(review, provider="codex", source_commit="a" * 40)
+        comments = to_inline_pr_comments(
+            review,
+            provider="codex",
+            source_commit="a" * 40,
+            review_run_id="run",
+        )
 
         self.assertEqual(
             [(comment["path"], comment["line"]) for comment in comments],
             [("src/app.py", 12), ("src/app.py", 14)],
         )
-        self.assertIn("Scout: High issue found by Codex", comments[0]["content"])
-        self.assertIn("Scout: Low issue found by Codex", comments[1]["content"])
+        self.assertEqual(
+            "Scout: High issue found by Codex. Reviewer: Correctness / HIGH confidence",
+            comments[0]["content"].splitlines()[-1],
+        )
+        self.assertEqual(
+            "Scout: Low issue found by Codex. Reviewer: Correctness / HIGH confidence",
+            comments[1]["content"].splitlines()[-1],
+        )
+        self.assertIn("What I found:\n", comments[0]["content"])
+        self.assertNotIn("Why it matters:", comments[0]["content"])
         self.assertIn("Smallest fix:", comments[0]["content"])
-        self.assertIn("`aaaaaaaaaaaa`", comments[0]["content"])
+        self.assertNotIn("`aaaaaaaaaaaa`", comments[0]["content"])
+        self.assertNotIn("Commit:", comments[0]["content"])
+        self.assertNotIn("Scout finding:", comments[0]["content"])
+        self.assertNotIn("Scout review run:", comments[0]["content"])
+        self.assertIn("<!-- scout-finding: ", comments[0]["content"])
+        self.assertIn("<!-- scout-review-run: ", comments[0]["content"])
+        self.assertNotIn("finding-001", comments[0]["content"])
 
     def test_suggested_change_renders_only_in_inline_pr_comments(self):
         payload = valid_review()

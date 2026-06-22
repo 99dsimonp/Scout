@@ -11,6 +11,7 @@ from scout.daemon import (
     _append_provider_usage_log_entry,
     _append_review_log_entry,
     _format_provider_model_metadata,
+    _inline_comment_markers_from_comments,
     _lease_seconds,
     _provider_usage_log_entry,
     _review_log_entry,
@@ -177,6 +178,25 @@ class DaemonReviewLogTests(unittest.TestCase):
 
         self.assertEqual(futures, {})
         self.assertTrue(any("review worker failed unexpectedly job=7" in message for message in logs.output))
+
+    def test_inline_comment_markers_extract_hidden_metadata(self):
+        comments = [
+            {
+                "content": {
+                    "raw": (
+                        "<!-- scout-finding: ZmluZGluZy0wMDE= -->\n"
+                        "<!-- scout-review-run: cnVu -->\n\n"
+                        "**High issue**\n\n"
+                        "Scout: High issue found by Codex. Reviewer: Correctness / HIGH confidence"
+                    ),
+                },
+                "user": {"nickname": "scout-bot"},
+            }
+        ]
+
+        markers = _inline_comment_markers_from_comments(comments, "scout-bot")
+
+        self.assertEqual(markers, {("finding-001", "run")})
 
     def test_seconds_until_next_poll_uses_remaining_interval_after_worker_completion(self):
         self.assertEqual(_seconds_until_next_poll(1600.0, 1000.0), 600.0)

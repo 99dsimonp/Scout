@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -1061,8 +1062,14 @@ def _inline_comment_markers_from_comments(comments, trusted_author: Optional[str
         if not _comment_author_matches(comment, trusted_author):
             continue
         raw = _comment_raw_content(comment)
-        finding = _extract_backticked_marker(raw, "Scout finding:")
-        review_run = _extract_backticked_marker(raw, "Scout review run:")
+        finding = (
+            _extract_hidden_inline_marker(raw, "scout-finding")
+            or _extract_backticked_marker(raw, "Scout finding:")
+        )
+        review_run = (
+            _extract_hidden_inline_marker(raw, "scout-review-run")
+            or _extract_backticked_marker(raw, "Scout review run:")
+        )
         if finding and review_run:
             markers.add(_inline_comment_marker(finding, review_run))
     return markers
@@ -1090,6 +1097,17 @@ def _extract_backticked_marker(text: str, label: str) -> Optional[str]:
     pattern = re.escape(label) + r"\s*`([^`]+)`"
     match = re.search(pattern, text or "")
     return match.group(1) if match else None
+
+
+def _extract_hidden_inline_marker(text: str, label: str) -> Optional[str]:
+    pattern = r"<!--\s*" + re.escape(label) + r"\s*:\s*([A-Za-z0-9+/=]+)\s*-->"
+    match = re.search(pattern, text or "")
+    if not match:
+        return None
+    try:
+        return base64.b64decode(match.group(1).encode("ascii"), validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
 
 
 def _reap_worker_futures(done, futures: dict) -> None:
