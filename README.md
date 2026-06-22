@@ -195,10 +195,14 @@ To run multiple providers for every PR, add `providers`:
 [agents]
 strategy = "codex" # optional legacy primary; must be included in providers
 providers = ["codex", "claude"]
+
+[agents.claude]
+enabled = true
 ```
 
 There is no provider fallback. The daemon queues, validates, and runs one job
-per selected provider.
+per selected provider. Claude is disabled by default; selecting it as a review
+provider or risk provider requires `agents.claude.enabled = true`.
 
 Codex behavior is configured under `[agents.codex]`:
 
@@ -215,6 +219,7 @@ feature flag when invoking `codex exec`.
 Claude behavior is configured under `[agents.claude]`:
 
 ```toml
+enabled = false
 auth_mode = "logged_in" # or "api"
 command = "claude"
 model = "claude-sonnet-4-6" # optional; leave empty for the CLI default
@@ -274,7 +279,8 @@ timeout_seconds = 120
 ```
 
 When `provider = "claude"` and `model` is omitted, Scout defaults the risk
-classifier model to the normal Claude Sonnet default.
+classifier model to the normal Claude Sonnet default. Because Claude is disabled
+by default, this also requires `agents.claude.enabled = true`.
 
 The global `review.*` sizing values are backward-compatible defaults; Codex and
 Claude can each override the LOC thresholds, high-risk bonus, and

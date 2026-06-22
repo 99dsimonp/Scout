@@ -225,7 +225,7 @@ class DaemonReviewLogTests(unittest.TestCase):
                         "workspace": "ws",
                         "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                     },
-                    "agents": {"strategy": "claude"},
+                    "agents": {"strategy": "claude", "claude": {"enabled": True}},
                     "review": {"risk": {"provider": "codex"}},
                 }
             )

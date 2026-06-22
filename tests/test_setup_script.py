@@ -283,6 +283,7 @@ class SetupScriptTests(unittest.TestCase):
             self.assertIn("job_timeout_seconds = 1800", config)
             self.assertIn('command = "{}"'.format(bin_dir / "codex"), config)
             self.assertIn('command = "{}"'.format(bin_dir / "claude"), config)
+            self.assertRegex(config, r"(?s)\[agents\.claude\].*enabled = false")
             self.assertIn("max_subagents = 8", config)
             self.assertRegex(
                 config,

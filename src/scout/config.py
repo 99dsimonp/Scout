@@ -244,6 +244,10 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
         if strategy not in SUPPORTED_PROVIDERS:
             raise ConfigError("agents.strategy must be codex or claude")
         selected_providers = [strategy]
+    provider_configs = {"codex": codex, "claude": claude}
+    for provider in selected_providers:
+        if not _provider_enabled(provider, provider_configs[provider]):
+            raise ConfigError("agents.providers must only include enabled agent providers")
 
     risk_config = _parse_risk_config(review, codex, claude)
 
@@ -398,7 +402,7 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
                 subagent_high_risk_bonus=codex_review_sizing["subagent_high_risk_bonus"],
             ),
             claude=ClaudeConfig(
-                enabled=bool(claude.get("enabled", True)),
+                enabled=_provider_enabled("claude", claude),
                 auth_mode=claude_auth_mode,
                 credential=str(claude.get("credential", "claude")),
                 home_dir=str(claude.get("home_dir", "/var/lib/scout/agents/claude/main")),
@@ -544,7 +548,7 @@ def _parse_risk_config(
     if provider not in SUPPORTED_PROVIDERS:
         raise ConfigError("review.risk.provider must be codex or claude")
     provider_agent_config = {"codex": codex, "claude": claude}[provider]
-    if enabled and bool(provider_agent_config.get("enabled", True)) is False:
+    if enabled and not _provider_enabled(provider, provider_agent_config):
         raise ConfigError("review.risk.provider must name an enabled agent provider")
 
     if "codex" in risk or "claude" in risk:
@@ -563,6 +567,11 @@ def _parse_risk_config(
         effort=effort,
         timeout_seconds=_positive_int(risk.get("timeout_seconds", 120), "review.risk.timeout_seconds"),
     )
+
+
+def _provider_enabled(provider: str, provider_config: Dict[str, Any]) -> bool:
+    default_enabled = provider != "claude"
+    return _bool_value(provider_config.get("enabled", default_enabled), "agents.{}.enabled".format(provider))
 
 
 def _int_list(value: Any, label: str) -> List[int]:

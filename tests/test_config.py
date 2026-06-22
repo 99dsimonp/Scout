@@ -35,6 +35,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.agents.codex.subagent_medium_loc_limit, 600)
         self.assertEqual(config.agents.codex.subagent_large_loc_limit, 1500)
         self.assertEqual(config.agents.codex.subagent_high_risk_bonus, 1)
+        self.assertFalse(config.agents.claude.enabled)
         self.assertEqual(config.agents.claude.command, "claude")
         self.assertEqual(config.agents.claude.timeout_seconds, 1800)
         self.assertEqual(config.agents.claude.model, "claude-sonnet-4-6")
@@ -115,14 +116,26 @@ class ConfigTests(unittest.TestCase):
                 }
             )
 
-    def test_parse_claude_strategy_defaults_report_identity(self):
+    def test_rejects_claude_strategy_unless_explicitly_enabled(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                    },
+                    "agents": {"strategy": "claude"},
+                }
+            )
+
+    def test_parse_claude_strategy_defaults_report_identity_when_enabled(self):
         config = parse_config(
             {
                 "bitbucket": {
                     "workspace": "ws",
                     "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                 },
-                "agents": {"strategy": "claude"},
+                "agents": {"strategy": "claude", "claude": {"enabled": True}},
             }
         )
         self.assertEqual(config.agents.strategy, "claude")
@@ -151,7 +164,7 @@ class ConfigTests(unittest.TestCase):
                     "workspace": "ws",
                     "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                 },
-                "agents": {"providers": ["codex", "claude"]},
+                "agents": {"providers": ["codex", "claude"], "claude": {"enabled": True}},
             }
         )
         self.assertEqual(config.agents.strategy, "codex")
@@ -168,7 +181,7 @@ class ConfigTests(unittest.TestCase):
                     "workspace": "ws",
                     "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                 },
-                "agents": {"providers": ["codex", "claude"]},
+                "agents": {"providers": ["codex", "claude"], "claude": {"enabled": True}},
                 "reports": {
                     "codex": {"report_id": "custom-codex", "title": "Custom Codex Review"},
                     "claude": {"report_id": "custom-claude", "title": "Custom Claude Review"},
@@ -188,7 +201,7 @@ class ConfigTests(unittest.TestCase):
                         "workspace": "ws",
                         "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                     },
-                    "agents": {"providers": ["codex", "claude"]},
+                    "agents": {"providers": ["codex", "claude"], "claude": {"enabled": True}},
                     "reports": {"report_id": "shared-report"},
                 }
             )
@@ -201,7 +214,7 @@ class ConfigTests(unittest.TestCase):
                         "workspace": "ws",
                         "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                     },
-                    "agents": {"providers": ["codex", "claude"]},
+                    "agents": {"providers": ["codex", "claude"], "claude": {"enabled": True}},
                     "reports": {
                         "codex": {"report_id": "shared-report"},
                         "claude": {"report_id": "shared-report"},
@@ -254,6 +267,30 @@ class ConfigTests(unittest.TestCase):
                         "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                     },
                     "agents": {"providers": ["codex", "gemini"]},
+                }
+            )
+
+    def test_rejects_non_boolean_agent_enabled_flag(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                    },
+                    "agents": {"claude": {"enabled": "false"}},
+                }
+            )
+
+    def test_rejects_multi_provider_selection_with_default_disabled_claude(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                    },
+                    "agents": {"providers": ["codex", "claude"]},
                 }
             )
 
@@ -419,7 +456,7 @@ class ConfigTests(unittest.TestCase):
                     "agents": {
                         "strategy": "claude",
                         "codex": {"max_subagents": 20},
-                        "claude": {"max_subagents": 10, "subagent_max_per_lens": 3},
+                        "claude": {"enabled": True, "max_subagents": 10, "subagent_max_per_lens": 3},
                     },
                 }
             )
@@ -434,7 +471,7 @@ class ConfigTests(unittest.TestCase):
                 "review": {"subagent_max_per_lens": 4, "risk": {"provider": "claude"}},
                 "agents": {
                     "strategy": "claude",
-                    "claude": {"max_subagents": 20},
+                    "claude": {"enabled": True, "max_subagents": 20},
                 },
             }
         )
@@ -512,7 +549,7 @@ class ConfigTests(unittest.TestCase):
                 "agents": {
                     "strategy": "claude",
                     "codex": {"max_subagents": 1},
-                    "claude": {"max_subagents": 20},
+                    "claude": {"enabled": True, "max_subagents": 20},
                 },
             }
         )
@@ -525,7 +562,7 @@ class ConfigTests(unittest.TestCase):
                     "workspace": "ws",
                     "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                 },
-                "agents": {"providers": ["codex", "claude"]},
+                "agents": {"providers": ["codex", "claude"], "claude": {"enabled": True}},
                 "review": {
                     "risk": {
                         "enabled": True,
@@ -550,7 +587,7 @@ class ConfigTests(unittest.TestCase):
                     "workspace": "ws",
                     "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                 },
-                "agents": {"providers": ["claude"]},
+                "agents": {"providers": ["claude"], "claude": {"enabled": True}},
                 "review": {"risk": {"provider": "codex"}},
             }
         )
@@ -570,6 +607,18 @@ class ConfigTests(unittest.TestCase):
                 }
             )
 
+    def test_rejects_default_disabled_claude_risk_provider(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                    },
+                    "review": {"risk": {"provider": "claude"}},
+                }
+            )
+
     def test_disabled_risk_allows_unselected_default_provider(self):
         config = parse_config(
             {
@@ -577,7 +626,7 @@ class ConfigTests(unittest.TestCase):
                     "workspace": "ws",
                     "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                 },
-                "agents": {"strategy": "claude"},
+                "agents": {"strategy": "claude", "claude": {"enabled": True}},
                 "review": {"risk": {"enabled": False}},
             }
         )

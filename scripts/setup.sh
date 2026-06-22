@@ -353,7 +353,9 @@ subagent_high_risk_bonus = 1
 subagent_max_per_lens = 3
 
 [agents.claude]
-enabled = true
+# Claude is disabled by default; set this to true only when the host has
+# a usable Claude subscription or API credential.
+enabled = false
 auth_mode = "logged_in"
 credential = "claude"
 home_dir = "${STATE_DIR}/agents/claude/main"

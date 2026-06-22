@@ -346,7 +346,7 @@ subagent_high_risk_bonus = 1
 subagent_max_per_lens = 3
 
 [agents.claude]
-enabled = true
+enabled = false
 auth_mode = "logged_in"
 credential = "claude"
 home_dir = "/var/lib/scout/agents/claude/main"
@@ -708,6 +708,7 @@ invalid JSON regardless of provider.
 
 At startup, Scout should check each selected provider:
 
+- Provider is enabled.
 - Command exists.
 - Credential is available when `auth_mode = "api"`.
 - Configured home directory can be created when `auth_mode = "api"`.
