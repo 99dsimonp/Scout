@@ -51,7 +51,8 @@
           "result",
           "reviewer",
           "confidence",
-          "smallest_fix"
+          "smallest_fix",
+          "suggested_change"
         ],
         "properties": {
           "external_id": { "type": "string", "minLength": 1 },
@@ -69,7 +70,7 @@
           "confidence": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
           "smallest_fix": { "type": "string", "minLength": 1 },
           "suggested_change": {
-            "type": "object",
+            "type": ["object", "null"],
             "additionalProperties": false,
             "required": ["replacement"],
             "properties": {

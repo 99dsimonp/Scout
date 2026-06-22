@@ -254,6 +254,16 @@ class SchemaTests(unittest.TestCase):
                 with self.assertRaises(ReviewValidationError):
                     validate_review_output(payload)
 
+    def test_suggested_change_null_is_no_suggestion(self):
+        payload = valid_review()
+        payload["annotations"][0]["suggested_change"] = None
+
+        review = validate_review_output(payload)
+        comments = to_inline_pr_comments(review, provider="codex", source_commit="a" * 40)
+
+        self.assertNotIn("Suggested change:", comments[0]["content"])
+        self.assertNotIn("```suggestion", comments[0]["content"])
+
     def test_inline_suggested_change_is_omitted_when_it_would_exceed_comment_limit(self):
         payload = valid_review()
         payload["annotations"][0]["details"] = "x" * (BITBUCKET_COMMENT_MAX_LENGTH - 400)
@@ -267,7 +277,26 @@ class SchemaTests(unittest.TestCase):
         self.assertNotIn("Suggested change:", comments[0]["content"])
         self.assertNotIn("```suggestion", comments[0]["content"])
 
-    def test_review_schema_files_declare_optional_suggested_change(self):
+    def test_provider_schema_requires_all_object_properties(self):
+        root = Path(__file__).resolve().parents[1]
+        config_schema = json.loads((root / "config/review.schema.json").read_text(encoding="utf-8"))
+
+        def check_object_schemas(schema, path):
+            if isinstance(schema, dict):
+                properties = schema.get("properties")
+                if properties is not None:
+                    required = schema.get("required")
+                    self.assertIsInstance(required, list, path)
+                    self.assertEqual(set(properties), set(required), path)
+                for key, value in schema.items():
+                    check_object_schemas(value, "{}.{}".format(path, key))
+            elif isinstance(schema, list):
+                for index, value in enumerate(schema):
+                    check_object_schemas(value, "{}[{}]".format(path, index))
+
+        check_object_schemas(config_schema, "$")
+
+    def test_review_schema_files_declare_required_nullable_suggested_change(self):
         root = Path(__file__).resolve().parents[1]
         config_schema = json.loads((root / "config/review.schema.json").read_text(encoding="utf-8"))
         data_schema = json.loads((root / "src/scout/data/review.schema.json").read_text(encoding="utf-8"))
@@ -275,11 +304,11 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(config_schema, data_schema)
         annotation_schema = config_schema["properties"]["annotations"]["items"]
 
-        self.assertNotIn("suggested_change", annotation_schema["required"])
+        self.assertIn("suggested_change", annotation_schema["required"])
         self.assertEqual(
             annotation_schema["properties"]["suggested_change"],
             {
-                "type": "object",
+                "type": ["object", "null"],
                 "additionalProperties": False,
                 "required": ["replacement"],
                 "properties": {

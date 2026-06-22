@@ -407,7 +407,7 @@ def _format_inline_comment(
     )
     content = "\n".join(lines).rstrip()
     suggested_change = annotation.get("suggested_change")
-    if suggested_change:
+    if isinstance(suggested_change, dict) and isinstance(suggested_change.get("replacement"), str):
         replacement = suggested_change["replacement"]
         suggestion = "\n\nSuggested change:\n\n```suggestion\n{}\n```".format(replacement)
         if len(content) + len(suggestion) <= BITBUCKET_COMMENT_MAX_LENGTH:
@@ -459,6 +459,8 @@ def _truncate(value: str, limit: int) -> str:
 
 
 def _validate_suggested_change(value: Any, label: str) -> None:
+    if value is None:
+        return
     if not isinstance(value, dict):
         raise ReviewValidationError("{} must be an object".format(label))
     _require_keys(value, {"replacement"}, label)
