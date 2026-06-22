@@ -41,6 +41,9 @@ class PromptTests(unittest.TestCase):
         self.assertIn("all actionable findings it", prompt)
         self.assertIn("can support, not only the first", prompt)
         self.assertIn("until every listed subagent has completed", prompt)
+        self.assertIn("smallest_fix must remain prose", prompt)
+        self.assertIn("suggested_change.replacement only when it is the exact single-line replacement", prompt)
+        self.assertIn("Omit suggested_change for multi-line fixes", prompt)
         self.assertIn("Return exactly one schema-shaped JSON object", prompt)
         self.assertIn("Do not emit progress, status, or placeholder JSON", prompt)
 

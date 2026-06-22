@@ -85,6 +85,11 @@ correctness, security, test, performance, or maintainability risk. Do not stop
 after finding one issue; continue until every changed file has been considered
 by the relevant reviewer lenses.
 
+smallest_fix must remain prose that explains the smallest safe correction. Add
+suggested_change.replacement only when it is the exact single-line replacement
+for the annotated line. Omit suggested_change for multi-line fixes, uncertain
+fixes, conceptual guidance, or fixes that require surrounding edits.
+
 Return exactly one schema-shaped JSON object, and only as the final answer.
 Do not emit progress, status, or placeholder JSON. recommendation must be
 approve when there are no material findings, or request_changes when there are

@@ -258,7 +258,7 @@ def _validate_annotations(value: Any, max_findings: int) -> List[Dict[str, Any]]
         label = "annotations[{}]".format(idx)
         if not isinstance(item, dict):
             raise ReviewValidationError("{} must be an object".format(label))
-        allowed = {
+        required = {
             "external_id",
             "annotation_type",
             "path",
@@ -271,7 +271,8 @@ def _validate_annotations(value: Any, max_findings: int) -> List[Dict[str, Any]]
             "confidence",
             "smallest_fix",
         }
-        _require_keys(item, allowed, label)
+        allowed = required | {"suggested_change"}
+        _require_keys(item, required, label)
         _reject_extra_keys(item, allowed, label)
         external_id = _nonempty_string(item["external_id"], "{}.external_id".format(label))
         if external_id in seen_external_ids:
@@ -291,6 +292,8 @@ def _validate_annotations(value: Any, max_findings: int) -> List[Dict[str, Any]]
         _enum(item["reviewer"], REVIEWERS, "{}.reviewer".format(label))
         _enum(item["confidence"], CONFIDENCE, "{}.confidence".format(label))
         _nonempty_string(item["smallest_fix"], "{}.smallest_fix".format(label))
+        if "suggested_change" in item:
+            _validate_suggested_change(item["suggested_change"], "{}.suggested_change".format(label))
         converted.append(deepcopy(item))
     return converted
 
@@ -402,7 +405,14 @@ def _format_inline_comment(
             annotation["smallest_fix"],
         ]
     )
-    return _truncate("\n".join(lines).rstrip(), BITBUCKET_COMMENT_MAX_LENGTH)
+    content = "\n".join(lines).rstrip()
+    suggested_change = annotation.get("suggested_change")
+    if suggested_change:
+        replacement = suggested_change["replacement"]
+        suggestion = "\n\nSuggested change:\n\n```suggestion\n{}\n```".format(replacement)
+        if len(content) + len(suggestion) <= BITBUCKET_COMMENT_MAX_LENGTH:
+            return content + suggestion
+    return _truncate(content, BITBUCKET_COMMENT_MAX_LENGTH)
 
 
 def _provider_label(provider: str) -> str:
@@ -446,6 +456,22 @@ def _truncate(value: str, limit: int) -> str:
     if limit <= 3:
         return value[:limit]
     return value[: limit - 3].rstrip() + "..."
+
+
+def _validate_suggested_change(value: Any, label: str) -> None:
+    if not isinstance(value, dict):
+        raise ReviewValidationError("{} must be an object".format(label))
+    _require_keys(value, {"replacement"}, label)
+    _reject_extra_keys(value, {"replacement"}, label)
+    replacement = value["replacement"]
+    if not isinstance(replacement, str):
+        raise ReviewValidationError("{}.replacement must be string".format(label))
+    if not replacement.strip():
+        raise ReviewValidationError("{}.replacement must not be empty".format(label))
+    if "\n" in replacement or "\r" in replacement:
+        raise ReviewValidationError("{}.replacement must be a single line".format(label))
+    if "```" in replacement:
+        raise ReviewValidationError("{}.replacement must not contain triple backticks".format(label))
 
 
 def _require_keys(value: Dict[str, Any], required: Iterable[str], label: str) -> None:

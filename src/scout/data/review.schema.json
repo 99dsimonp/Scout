@@ -67,7 +67,18 @@
             "enum": ["correctness", "security", "tests", "performance", "best-practices"]
           },
           "confidence": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
-          "smallest_fix": { "type": "string", "minLength": 1 }
+          "smallest_fix": { "type": "string", "minLength": 1 },
+          "suggested_change": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["replacement"],
+            "properties": {
+              "replacement": {
+                "type": "string",
+                "pattern": "^(?!.*```)(?!.*[\\r\\n]).*\\S.*$"
+              }
+            }
+          }
         }
       }
     }

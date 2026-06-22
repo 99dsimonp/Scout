@@ -1,6 +1,9 @@
+import json
 import unittest
+from pathlib import Path
 
 from scout.schema import (
+    BITBUCKET_COMMENT_MAX_LENGTH,
     ReviewValidationError,
     summarize_findings,
     parse_review_json,
@@ -215,6 +218,78 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("Scout: Low issue found by Codex", comments[1]["content"])
         self.assertIn("Smallest fix:", comments[0]["content"])
         self.assertIn("`aaaaaaaaaaaa`", comments[0]["content"])
+
+    def test_suggested_change_renders_only_in_inline_pr_comments(self):
+        payload = valid_review()
+        payload["annotations"][0]["suggested_change"] = {"replacement": "return fallback"}
+        review = validate_review_output(payload)
+
+        comments = to_inline_pr_comments(review, provider="codex", source_commit="a" * 40)
+        report_annotations = to_bitbucket_annotations(review, provider="codex")
+        pr_comment = to_pr_comment(review, provider="codex", severities=("HIGH",))
+
+        self.assertIn(
+            "Suggested change:\n\n```suggestion\nreturn fallback\n```",
+            comments[0]["content"],
+        )
+        self.assertIn("Smallest fix:", comments[0]["content"])
+        self.assertNotIn("Suggested change:", report_annotations[0]["details"])
+        self.assertNotIn("```suggestion", pr_comment)
+
+    def test_suggested_change_replacement_validation(self):
+        invalid_values = [
+            {"replacement": ""},
+            {"replacement": "   "},
+            {"replacement": "line one\nline two"},
+            {"replacement": "line one\rline two"},
+            {"replacement": "value ``` suffix"},
+            {"replacement": 42},
+            {"replacement": "return fallback", "extra": "unsupported"},
+            "return fallback",
+        ]
+        for value in invalid_values:
+            with self.subTest(value=value):
+                payload = valid_review()
+                payload["annotations"][0]["suggested_change"] = value
+                with self.assertRaises(ReviewValidationError):
+                    validate_review_output(payload)
+
+    def test_inline_suggested_change_is_omitted_when_it_would_exceed_comment_limit(self):
+        payload = valid_review()
+        payload["annotations"][0]["details"] = "x" * (BITBUCKET_COMMENT_MAX_LENGTH - 400)
+        payload["annotations"][0]["suggested_change"] = {"replacement": "y" * 500}
+        review = validate_review_output(payload)
+
+        comments = to_inline_pr_comments(review, provider="codex", source_commit="a" * 40)
+
+        self.assertLessEqual(len(comments[0]["content"]), BITBUCKET_COMMENT_MAX_LENGTH)
+        self.assertIn("Smallest fix:", comments[0]["content"])
+        self.assertNotIn("Suggested change:", comments[0]["content"])
+        self.assertNotIn("```suggestion", comments[0]["content"])
+
+    def test_review_schema_files_declare_optional_suggested_change(self):
+        root = Path(__file__).resolve().parents[1]
+        config_schema = json.loads((root / "config/review.schema.json").read_text(encoding="utf-8"))
+        data_schema = json.loads((root / "src/scout/data/review.schema.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(config_schema, data_schema)
+        annotation_schema = config_schema["properties"]["annotations"]["items"]
+
+        self.assertNotIn("suggested_change", annotation_schema["required"])
+        self.assertEqual(
+            annotation_schema["properties"]["suggested_change"],
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["replacement"],
+                "properties": {
+                    "replacement": {
+                        "type": "string",
+                        "pattern": "^(?!.*```)(?!.*[\\r\\n]).*\\S.*$",
+                    }
+                },
+            },
+        )
 
     def test_approve_cannot_have_annotations(self):
         payload = valid_review()
