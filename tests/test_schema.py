@@ -1,4 +1,5 @@
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -314,11 +315,56 @@ class SchemaTests(unittest.TestCase):
                 "properties": {
                     "replacement": {
                         "type": "string",
-                        "pattern": "^(?!.*```)(?!.*[\\r\\n]).*\\S.*$",
+                        "minLength": 1,
+                        "pattern": "^[^\\S\\r\\n`]*(`{1,2}[^\\S\\r\\n`]+)*`{0,2}[^\\s\\r\\n`][^\\r\\n`]*(`{1,2}[^\\r\\n`]+)*`{0,2}$",
                     }
                 },
             },
         )
+
+    def test_provider_schema_suggested_change_replacement_pattern(self):
+        root = Path(__file__).resolve().parents[1]
+        config_schema = json.loads((root / "config/review.schema.json").read_text(encoding="utf-8"))
+        data_schema = json.loads((root / "src/scout/data/review.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(config_schema, data_schema)
+
+        pattern = config_schema["properties"]["annotations"]["items"]["properties"]["suggested_change"][
+            "properties"
+        ]["replacement"]["pattern"]
+        regex = re.compile(pattern)
+
+        for value in ("return fallback", "  `  fallback", "value ` suffix", "value `` suffix"):
+            with self.subTest(value=value):
+                self.assertIsNotNone(regex.fullmatch(value))
+
+        for value in ("", "   ", "line one\nline two", "line one\rline two", "value ``` suffix"):
+            with self.subTest(value=value):
+                self.assertIsNone(regex.fullmatch(value))
+
+    def test_provider_schema_patterns_do_not_use_lookaround(self):
+        root = Path(__file__).resolve().parents[1]
+        schema_paths = [
+            root / "config/review.schema.json",
+            root / "src/scout/data/review.schema.json",
+        ]
+        lookaround_constructs = ("(?=", "(?!", "(?<=", "(?<!")
+
+        def check_patterns(schema, path):
+            if isinstance(schema, dict):
+                pattern = schema.get("pattern")
+                if pattern is not None:
+                    for construct in lookaround_constructs:
+                        self.assertNotIn(construct, pattern, "{}.pattern".format(path))
+                for key, value in schema.items():
+                    check_patterns(value, "{}.{}".format(path, key))
+            elif isinstance(schema, list):
+                for index, value in enumerate(schema):
+                    check_patterns(value, "{}[{}]".format(path, index))
+
+        for schema_path in schema_paths:
+            with self.subTest(schema=str(schema_path.relative_to(root))):
+                schema = json.loads(schema_path.read_text(encoding="utf-8"))
+                check_patterns(schema, "$")
 
     def test_approve_cannot_have_annotations(self):
         payload = valid_review()

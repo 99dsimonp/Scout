@@ -76,7 +76,8 @@
             "properties": {
               "replacement": {
                 "type": "string",
-                "pattern": "^(?!.*```)(?!.*[\\r\\n]).*\\S.*$"
+                "minLength": 1,
+                "pattern": "^[^\\S\\r\\n`]*(`{1,2}[^\\S\\r\\n`]+)*`{0,2}[^\\s\\r\\n`][^\\r\\n`]*(`{1,2}[^\\r\\n`]+)*`{0,2}$"
               }
             }
           }
