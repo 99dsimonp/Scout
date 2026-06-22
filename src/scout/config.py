@@ -19,6 +19,7 @@ class ConfigError(ValueError):
 REVIEW_LENS_COUNT = 5
 SUPPORTED_PROVIDERS = ("codex", "claude")
 COMMENT_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
+REVIEW_OUTPUT_MODES = ("reports", "inline_comments")
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,6 @@ class BitbucketConfig:
 class PollingConfig:
     enabled: bool
     interval_seconds: int
-    pagelen: int
 
 
 @dataclass(frozen=True)
@@ -71,7 +71,9 @@ class ReviewConfig:
     policy_version: str
     schema_path: str
     max_findings: int
+    output_mode: str
     risk: "RiskConfig"
+    request_comments: "RequestCommentsConfig"
     subagent_small_loc_limit: int
     subagent_medium_loc_limit: int
     subagent_large_loc_limit: int
@@ -82,6 +84,14 @@ class ReviewConfig:
 @dataclass(frozen=True)
 class RiskConfig:
     enabled: bool
+    provider: str
+    model: str
+    effort: str
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
+class RequestCommentsConfig:
     provider: str
     model: str
     effort: str
@@ -249,7 +259,11 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
         if not _provider_enabled(provider, provider_configs[provider]):
             raise ConfigError("agents.providers must only include enabled agent providers")
 
+    output_mode = str(review.get("output_mode", "reports"))
+    if output_mode not in REVIEW_OUTPUT_MODES:
+        raise ConfigError("review.output_mode must be reports or inline_comments")
     risk_config = _parse_risk_config(review, codex, claude)
+    request_comments_config = _parse_request_comments_config(review, codex, claude, output_mode)
 
     state_dir = str(service.get("state_dir", "/var/lib/scout"))
     retention_days = _positive_int(service.get("retention_days", 7), "service.retention_days")
@@ -336,7 +350,7 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
                 )
             )
     report_ids, report_titles = _parse_report_overrides(reports, selected_providers)
-    comment_severities = _comment_severity_list(comments)
+    comment_severities = [] if output_mode == "inline_comments" else _comment_severity_list(comments)
 
     return AppConfig(
         service=ServiceConfig(
@@ -358,7 +372,6 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
         polling=PollingConfig(
             enabled=bool(polling.get("enabled", True)),
             interval_seconds=_positive_int(polling.get("interval_seconds", 600), "polling.interval_seconds"),
-            pagelen=_positive_int(polling.get("pagelen", 50), "polling.pagelen"),
         ),
         queue=QueueConfig(
             max_parallel_reviews=_positive_int(queue.get("max_parallel_reviews", 2), "queue.max_parallel_reviews"),
@@ -373,7 +386,9 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
             policy_version=str(review.get("policy_version", "v1")),
             schema_path=str(review.get("schema_path", "/etc/scout/review.schema.json")),
             max_findings=_positive_int(review.get("max_findings", 100), "review.max_findings"),
+            output_mode=output_mode,
             risk=risk_config,
+            request_comments=request_comments_config,
             subagent_small_loc_limit=review_subagent_small_loc_limit,
             subagent_medium_loc_limit=review_subagent_medium_loc_limit,
             subagent_large_loc_limit=review_subagent_large_loc_limit,
@@ -566,6 +581,47 @@ def _parse_risk_config(
         model=model,
         effort=effort,
         timeout_seconds=_positive_int(risk.get("timeout_seconds", 120), "review.risk.timeout_seconds"),
+    )
+
+
+def _parse_request_comments_config(
+    review: Dict[str, Any],
+    codex: Dict[str, Any],
+    claude: Dict[str, Any],
+    output_mode: str,
+) -> RequestCommentsConfig:
+    request_comments = review.get("request_comments", {})
+    if request_comments is None:
+        request_comments = {}
+    if not isinstance(request_comments, dict):
+        raise ConfigError("review.request_comments must be a table")
+
+    provider = str(request_comments.get("provider", "codex"))
+    if provider not in SUPPORTED_PROVIDERS:
+        raise ConfigError("review.request_comments.provider must be codex or claude")
+    provider_agent_config = {"codex": codex, "claude": claude}[provider]
+    if output_mode == "inline_comments" and not _provider_enabled(provider, provider_agent_config):
+        raise ConfigError("review.request_comments.provider must name an enabled agent provider")
+
+    if "codex" in request_comments or "claude" in request_comments:
+        raise ConfigError("review.request_comments uses provider-agnostic model and effort keys")
+    model = str(request_comments.get("model", "claude-sonnet-4-6" if provider == "claude" else "gpt-5.4"))
+    effort = str(request_comments.get("effort", "low"))
+    if provider == "codex" and effort not in {"low", "medium", "high", "xhigh"}:
+        raise ConfigError("review.request_comments.effort must be low, medium, high, or xhigh for codex")
+    if provider == "claude" and effort and effort not in {"low", "medium", "high", "xhigh", "max"}:
+        raise ConfigError(
+            "review.request_comments.effort must be empty or one of low, medium, high, xhigh, or max for claude"
+        )
+
+    return RequestCommentsConfig(
+        provider=provider,
+        model=model,
+        effort=effort,
+        timeout_seconds=_positive_int(
+            request_comments.get("timeout_seconds", 120),
+            "review.request_comments.timeout_seconds",
+        ),
     )
 
 

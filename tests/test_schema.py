@@ -7,6 +7,7 @@ from scout.schema import (
     report_result_for_recommendation,
     to_bitbucket_annotations,
     to_critical_pr_comment,
+    to_inline_pr_comments,
     to_pr_comment,
     to_bitbucket_report,
     validate_review_output,
@@ -193,6 +194,27 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("Medium issue", comment)
         self.assertIn("Severity: Medium", comment)
         self.assertNotIn("Low issue", comment)
+
+    def test_inline_pr_comments_include_every_annotation_without_severity_filter(self):
+        payload = valid_review()
+        low = dict(valid_review()["annotations"][0])
+        low["external_id"] = "finding-002"
+        low["summary"] = "Low issue"
+        low["severity"] = "LOW"
+        low["line"] = 14
+        payload["annotations"].append(low)
+        review = validate_review_output(payload)
+
+        comments = to_inline_pr_comments(review, provider="codex", source_commit="a" * 40)
+
+        self.assertEqual(
+            [(comment["path"], comment["line"]) for comment in comments],
+            [("src/app.py", 12), ("src/app.py", 14)],
+        )
+        self.assertIn("Scout: High issue found by Codex", comments[0]["content"])
+        self.assertIn("Scout: Low issue found by Codex", comments[1]["content"])
+        self.assertIn("Smallest fix:", comments[0]["content"])
+        self.assertIn("`aaaaaaaaaaaa`", comments[0]["content"])
 
     def test_approve_cannot_have_annotations(self):
         payload = valid_review()

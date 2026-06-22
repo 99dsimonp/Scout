@@ -67,6 +67,22 @@ class CodexRunnerTests(unittest.TestCase):
         self.assertIn("/risk.schema.json", cmd)
         self.assertIn("/risk-output.json", cmd)
 
+    def test_build_comment_request_command_uses_classifier_model_and_reasoning(self):
+        config = codex_config(model="gpt-5.5", reasoning_effort="xhigh")
+        runner = CodexRunner(config, CredentialStore("/tmp/unused"))
+        cmd = runner.build_comment_request_command(
+            "/repo",
+            "/comment-request.schema.json",
+            "/comment-request-output.json",
+            model="gpt-5.4",
+            reasoning_effort="low",
+        )
+        self.assertEqual(cmd[cmd.index("--model") + 1], "gpt-5.4")
+        self.assertIn("--skip-git-repo-check", cmd)
+        self.assertIn('model_reasoning_effort="low"', cmd)
+        self.assertIn("/comment-request.schema.json", cmd)
+        self.assertIn("/comment-request-output.json", cmd)
+
     def test_assess_risk_passes_description_on_stdin_and_parses_result(self):
         with tempfile.TemporaryDirectory() as tmp:
             command = Path(tmp) / "fake-codex"
@@ -113,6 +129,54 @@ JSON
             self.assertEqual(risk, "high")
             self.assertIn("Sensitive auth change", stdin_capture.read_text(encoding="utf-8"))
             self.assertNotIn("Sensitive auth change", argv_capture.read_text(encoding="utf-8"))
+
+    def test_classify_review_request_passes_comment_on_stdin_and_parses_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command = Path(tmp) / "fake-codex"
+            run_dir = Path(tmp) / "comment-request"
+            stdin_capture = Path(tmp) / "stdin.txt"
+            argv_capture = Path(tmp) / "argv.txt"
+            command.write_text(
+                """#!/bin/sh
+output=""
+printf '%s\n' "$@" > '"""
+                + str(argv_capture)
+                + """'
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    output="$1"
+  fi
+  shift
+done
+cat > '"""
+                + str(stdin_capture)
+                + """'
+cat > "$output" <<'JSON'
+{"review_requested":true,"reason":"explicit request"}
+JSON
+""",
+                encoding="utf-8",
+            )
+            command.chmod(0o755)
+            runner = CodexRunner(
+                codex_config(command=str(command), timeout_seconds=5),
+                CredentialStore("/tmp/unused"),
+            )
+
+            result = runner.classify_review_request(
+                comment="@scout review this PR",
+                model="gpt-5.4",
+                reasoning_effort="low",
+                timeout_seconds=5,
+                run_dir=str(run_dir),
+                is_superseded=lambda: False,
+            )
+
+            self.assertTrue(result.review_requested)
+            self.assertEqual(result.reason, "explicit request")
+            self.assertIn("@scout review this PR", stdin_capture.read_text(encoding="utf-8"))
+            self.assertNotIn("@scout review this PR", argv_capture.read_text(encoding="utf-8"))
 
     def test_run_passes_prompt_on_stdin_without_argv_exposure(self):
         with tempfile.TemporaryDirectory() as tmp:

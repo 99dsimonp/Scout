@@ -26,18 +26,37 @@ def review_key(
     policy_version: str,
     schema_version: str,
     provider: str,
+    output_mode: str = "reports",
 ) -> str:
+    payload = _review_identity_payload(pr, policy_version, schema_version, provider, output_mode)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _review_identity_payload(
+    pr: PullRequest,
+    policy_version: str,
+    schema_version: str,
+    provider: str,
+    output_mode: str,
+) -> dict:
     payload = {
         "workspace": pr.workspace,
         "repo_slug": pr.repo_slug,
         "pr_id": pr.pr_id,
-        "source_commit_hash": pr.source_commit_hash,
-        "destination_branch": pr.destination_branch,
-        "destination_commit_hash": pr.destination_commit_hash or "",
-        "merge_base_hash": pr.merge_base_hash or "",
         "policy_version": policy_version,
         "schema_version": schema_version,
         "provider": provider,
+        "output_mode": output_mode,
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    if output_mode == "inline_comments":
+        return payload
+    payload.update(
+        {
+            "source_commit_hash": pr.source_commit_hash,
+            "destination_branch": pr.destination_branch,
+            "destination_commit_hash": pr.destination_commit_hash or "",
+            "merge_base_hash": pr.merge_base_hash or "",
+        }
+    )
+    return payload

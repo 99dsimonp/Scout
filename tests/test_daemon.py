@@ -25,7 +25,7 @@ from scout.schema import validate_review_output
 from scout.state import ReviewJob, StateStore
 
 
-def review_job(provider="claude", job_id=7, pr_id=13, attempts=1, description=""):
+def review_job(provider="claude", job_id=7, pr_id=13, attempts=1, description="", output_mode="reports"):
     return ReviewJob(
         id=job_id,
         workspace="ws",
@@ -49,7 +49,10 @@ def review_job(provider="claude", job_id=7, pr_id=13, attempts=1, description=""
         lease_token="lease",
         target_review_key="key",
         running_review_key="key",
+        target_review_run_id="run",
+        running_review_run_id="run",
         error_message=None,
+        output_mode=output_mode,
     )
 
 
@@ -582,6 +585,114 @@ class DaemonReviewLogTests(unittest.TestCase):
         daemon.poll_once()
 
         self.assertEqual(daemon.state.pruned, [])
+
+    def test_inline_poll_once_skips_drafts_even_without_repo_draft_filter(self):
+        draft_pr = PullRequest(
+            workspace="ws",
+            repo_slug="repo",
+            pr_id=14,
+            title="Draft PR",
+            description="",
+            source_branch="feature",
+            source_commit_hash="b" * 40,
+            destination_branch="main",
+            is_draft=True,
+        )
+        regular_pr = PullRequest(
+            workspace="ws",
+            repo_slug="repo",
+            pr_id=13,
+            title="Regular PR",
+            description="",
+            source_branch="feature",
+            source_commit_hash="a" * 40,
+            destination_branch="main",
+        )
+        daemon = _polling_daemon(report_exists=False, output_mode="inline_comments")
+        daemon.bitbucket.prs = [draft_pr, regular_pr]
+
+        daemon.poll_once()
+
+        self.assertEqual(daemon.state.pruned_ignored, [("ws", "repo", [14])])
+        self.assertEqual(daemon.bitbucket.report_checks, [])
+        self.assertEqual(daemon.state.enqueued, [("repo", 13, "codex", "inline_comments")])
+
+    def test_inline_poll_once_force_enqueues_when_scout_comment_requests_review(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = _polling_daemon(report_exists=False, providers=["codex", "claude"], output_mode="inline_comments")
+            daemon.config.service = SimpleNamespace(state_dir=tmp)
+            daemon.config.review.request_comments = SimpleNamespace(
+                provider="codex",
+                model="gpt-5.4",
+                effort="low",
+                timeout_seconds=30,
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(max_parallel=1),
+                "claude": SimpleNamespace(max_parallel=1),
+            }
+            classifier = _FakeProvider(review_requested=True)
+            daemon.providers = {"codex": classifier, "claude": _FakeProvider()}
+            daemon.bitbucket.comments_by_pr = {
+                ("repo", 13): [
+                    {
+                        "id": 1001,
+                        "updated_on": "2026-01-01T00:00:00+00:00",
+                        "content": {"raw": "@Scout please review this again"},
+                    }
+                ]
+            }
+            for provider in ("codex", "claude"):
+                daemon.state.known.add(("repo", 13, "a" * 40, provider, "inline_comments"))
+
+            daemon.poll_once()
+            daemon.poll_once()
+
+            self.assertEqual(classifier.review_request_calls, ["@Scout please review this again"])
+            self.assertEqual(
+                daemon.state.force_enqueued,
+                [
+                    ("repo", 13, "codex", "inline_comments"),
+                    ("repo", 13, "claude", "inline_comments"),
+                ],
+            )
+            self.assertEqual(
+                daemon.state.processed_comments,
+                {("ws", "repo", 13, "1001", "2026-01-01T00:00:00+00:00"): True},
+            )
+
+    def test_inline_poll_once_marks_non_request_scout_mention_without_enqueue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = _polling_daemon(report_exists=False, output_mode="inline_comments")
+            daemon.config.service = SimpleNamespace(state_dir=tmp)
+            daemon.config.review.request_comments = SimpleNamespace(
+                provider="codex",
+                model="gpt-5.4",
+                effort="low",
+                timeout_seconds=30,
+            )
+            daemon.provider_configs = {"codex": SimpleNamespace(max_parallel=1)}
+            classifier = _FakeProvider(review_requested=False)
+            daemon.providers = {"codex": classifier}
+            daemon.bitbucket.comments_by_pr = {
+                ("repo", 13): [
+                    {
+                        "id": 1002,
+                        "updated_on": "2026-01-02T00:00:00+00:00",
+                        "content": {"raw": "Thanks @scout, that explains it."},
+                    }
+                ]
+            }
+            daemon.state.known.add(("repo", 13, "a" * 40, "codex", "inline_comments"))
+
+            daemon.poll_once()
+
+            self.assertEqual(classifier.review_request_calls, ["Thanks @scout, that explains it."])
+            self.assertEqual(daemon.state.force_enqueued, [])
+            self.assertEqual(
+                daemon.state.processed_comments,
+                {("ws", "repo", 13, "1002", "2026-01-02T00:00:00+00:00"): False},
+            )
 
     def test_run_job_uses_job_provider_runner_config_and_report_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1210,6 +1321,266 @@ class DaemonReviewLogTests(unittest.TestCase):
             self.assertEqual(daemon.bitbucket.comments, [])
             self.assertEqual(daemon.bitbucket.operations, ["report", "annotations"])
 
+    def test_run_job_inline_mode_comments_on_every_annotation_without_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                queue=SimpleNamespace(
+                    job_timeout_seconds=1200,
+                    max_attempts=3,
+                    retry_backoff_seconds=300,
+                ),
+                review=SimpleNamespace(
+                    policy_version="v1",
+                    schema_path="/tmp/schema.json",
+                    max_findings=100,
+                    output_mode="inline_comments",
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                ),
+                service=SimpleNamespace(state_dir=tmp),
+                reports=_FakeReports(),
+                comments=SimpleNamespace(critical_enabled=True, severities=["CRITICAL"]),
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1200,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                    subagent_max_per_lens=2,
+                ),
+            }
+            provider = _FakeProvider(
+                {
+                    "recommendation": "request_changes",
+                    "report": {
+                        "title": "Codex PR Review",
+                        "details": "Found two issues.",
+                        "report_type": "BUG",
+                        "reporter": "scout",
+                        "data": [],
+                    },
+                    "annotations": [
+                        {
+                            "external_id": "finding-001",
+                            "annotation_type": "BUG",
+                            "path": "src/app.py",
+                            "line": 12,
+                            "summary": "High issue",
+                            "details": "The changed call can fail.",
+                            "severity": "HIGH",
+                            "result": "FAILED",
+                            "reviewer": "correctness",
+                            "confidence": "HIGH",
+                            "smallest_fix": "Handle the failure.",
+                        },
+                        {
+                            "external_id": "finding-002",
+                            "annotation_type": "CODE_SMELL",
+                            "path": "src/app.py",
+                            "line": 20,
+                            "summary": "Low issue",
+                            "details": "The changed branch is confusing.",
+                            "severity": "LOW",
+                            "result": "FAILED",
+                            "reviewer": "best-practices",
+                            "confidence": "MEDIUM",
+                            "smallest_fix": "Rename the branch.",
+                        },
+                    ],
+                }
+            )
+            daemon.providers = {"codex": provider}
+            daemon.state = _FakeRunJobState()
+            daemon.git = _FakeGit()
+            daemon.bitbucket = _FakeBitbucket()
+            daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
+
+            daemon.run_job(review_job(provider="codex", job_id=15, output_mode="inline_comments"))
+
+            self.assertEqual(daemon.bitbucket.reports, [])
+            self.assertEqual(daemon.bitbucket.annotations, [])
+            self.assertEqual(daemon.bitbucket.comments, [])
+            self.assertEqual(
+                [(item[2], item[3]) for item in daemon.bitbucket.inline_comments],
+                [("src/app.py", 12), ("src/app.py", 20)],
+            )
+            self.assertIn("High issue", daemon.bitbucket.inline_comments[0][4])
+            self.assertIn("Low issue", daemon.bitbucket.inline_comments[1][4])
+            self.assertEqual(daemon.bitbucket.operations, ["inline_comment", "inline_comment"])
+            self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
+
+    def test_run_job_inline_mode_deduplicates_existing_retry_comment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                queue=SimpleNamespace(
+                    job_timeout_seconds=1200,
+                    max_attempts=3,
+                    retry_backoff_seconds=300,
+                ),
+                review=SimpleNamespace(
+                    policy_version="v1",
+                    schema_path="/tmp/schema.json",
+                    max_findings=100,
+                    output_mode="inline_comments",
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                ),
+                service=SimpleNamespace(state_dir=tmp),
+                reports=_FakeReports(),
+                comments=SimpleNamespace(severities=[]),
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1200,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                    subagent_max_per_lens=2,
+                ),
+            }
+            provider = _FakeProvider(
+                {
+                    "recommendation": "request_changes",
+                    "report": {
+                        "title": "Codex PR Review",
+                        "details": "Found one issue.",
+                        "report_type": "BUG",
+                        "reporter": "scout",
+                        "data": [],
+                    },
+                    "annotations": [
+                        {
+                            "external_id": "finding-001",
+                            "annotation_type": "BUG",
+                            "path": "src/app.py",
+                            "line": 12,
+                            "summary": "High issue",
+                            "details": "The changed call can fail.",
+                            "severity": "HIGH",
+                            "result": "FAILED",
+                            "reviewer": "correctness",
+                            "confidence": "HIGH",
+                            "smallest_fix": "Handle the failure.",
+                        }
+                    ],
+                }
+            )
+            daemon.providers = {"codex": provider}
+            daemon.state = _FakeRunJobState()
+            daemon.git = _FakeGit()
+            daemon.bitbucket = _FakeBitbucket()
+            daemon.bitbucket.inline_comments.append(
+                (
+                    "repo",
+                    13,
+                    "src/app.py",
+                    12,
+                    "Scout finding: `finding-001`\nScout review run: `run`",
+                )
+            )
+            daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
+
+            daemon.run_job(review_job(provider="codex", job_id=16, output_mode="inline_comments"))
+
+            self.assertEqual(len(daemon.bitbucket.inline_comments), 1)
+            self.assertEqual(daemon.bitbucket.operations, [])
+            self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
+
+    def test_run_job_inline_mode_does_not_deduplicate_user_forged_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                queue=SimpleNamespace(
+                    job_timeout_seconds=1200,
+                    max_attempts=3,
+                    retry_backoff_seconds=300,
+                ),
+                review=SimpleNamespace(
+                    policy_version="v1",
+                    schema_path="/tmp/schema.json",
+                    max_findings=100,
+                    output_mode="inline_comments",
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                ),
+                service=SimpleNamespace(state_dir=tmp),
+                reports=_FakeReports(),
+                comments=SimpleNamespace(severities=[]),
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1200,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                    subagent_max_per_lens=2,
+                ),
+            }
+            provider = _FakeProvider(
+                {
+                    "recommendation": "request_changes",
+                    "report": {
+                        "title": "Codex PR Review",
+                        "details": "Found one issue.",
+                        "report_type": "BUG",
+                        "reporter": "scout",
+                        "data": [],
+                    },
+                    "annotations": [
+                        {
+                            "external_id": "finding-001",
+                            "annotation_type": "BUG",
+                            "path": "src/app.py",
+                            "line": 12,
+                            "summary": "High issue",
+                            "details": "The changed call can fail.",
+                            "severity": "HIGH",
+                            "result": "FAILED",
+                            "reviewer": "correctness",
+                            "confidence": "HIGH",
+                            "smallest_fix": "Handle the failure.",
+                        }
+                    ],
+                }
+            )
+            daemon.providers = {"codex": provider}
+            daemon.state = _FakeRunJobState()
+            daemon.git = _FakeGit()
+            daemon.bitbucket = _FakeBitbucket()
+            daemon.bitbucket.existing_comments.append(
+                {
+                    "content": {
+                        "raw": "Scout finding: `finding-001`\nScout review run: `run`",
+                    },
+                    "user": {"nickname": "alice"},
+                }
+            )
+            daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
+
+            daemon.run_job(review_job(provider="codex", job_id=17, output_mode="inline_comments"))
+
+            self.assertEqual(len(daemon.bitbucket.inline_comments), 1)
+            self.assertEqual(daemon.bitbucket.operations, ["inline_comment"])
+            self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
+
     def test_git_failure_stays_retryable_after_max_attempts(self):
         with tempfile.TemporaryDirectory() as tmp:
             daemon = ScoutDaemon.__new__(ScoutDaemon)
@@ -1236,7 +1607,7 @@ class DaemonReviewLogTests(unittest.TestCase):
             self.assertEqual(daemon.state.retryable_failures, [(7, 3, 300)])
 
 
-def _polling_daemon(report_exists, providers=None):
+def _polling_daemon(report_exists, providers=None, output_mode="reports"):
     pr = PullRequest(
         workspace="ws",
         repo_slug="repo",
@@ -1255,8 +1626,10 @@ def _polling_daemon(report_exists, providers=None):
             repositories=[SimpleNamespace(slug="repo", pr_ids=[], ignored_source_branches=[])],
         ),
         review=SimpleNamespace(policy_version="v1"),
+        service=SimpleNamespace(state_dir="/tmp/scout-test"),
         reports=_FakeReports(),
     )
+    daemon.config.review.output_mode = output_mode
     daemon.provider_names = list(providers or ["codex"])
     daemon.bitbucket = _FakePollingBitbucket([pr], report_exists)
     daemon.state = _FakeBootstrapState()
@@ -1331,28 +1704,60 @@ class _FakeBootstrapState:
         self.bootstrap_attempts = set()
         self.seeded = []
         self.enqueued = []
+        self.force_enqueued = []
+        self.processed_comments = {}
         self.pruned = []
         self.pruned_ignored = []
 
-    def has_review_for_key(self, pr, policy_version, schema_version, provider):
-        return (pr.repo_slug, pr.pr_id, pr.source_commit_hash, provider) in self.known
+    def has_review_for_key(self, pr, policy_version, schema_version, provider, output_mode="reports"):
+        return (pr.repo_slug, pr.pr_id, pr.source_commit_hash, provider, output_mode) in self.known
 
-    def seed_successful_review(self, pr, policy_version, schema_version, provider, report_id):
+    def seed_successful_review(self, pr, policy_version, schema_version, provider, report_id, output_mode="reports"):
         self.seeded.append((pr.repo_slug, pr.pr_id, provider, report_id))
-        self.known.add((pr.repo_slug, pr.pr_id, pr.source_commit_hash, provider))
+        self.known.add((pr.repo_slug, pr.pr_id, pr.source_commit_hash, provider, output_mode))
 
-    def should_bootstrap_report(self, pr, policy_version, schema_version, provider):
-        return (pr.repo_slug, pr.pr_id, pr.source_commit_hash, provider) not in self.bootstrap_attempts
+    def should_bootstrap_report(self, pr, policy_version, schema_version, provider, output_mode="reports"):
+        return (pr.repo_slug, pr.pr_id, pr.source_commit_hash, provider, output_mode) not in self.bootstrap_attempts
 
-    def mark_report_bootstrap_attempted(self, pr, policy_version, schema_version, provider, error_message=None):
-        self.bootstrap_attempts.add((pr.repo_slug, pr.pr_id, pr.source_commit_hash, provider))
+    def mark_report_bootstrap_attempted(
+        self, pr, policy_version, schema_version, provider, error_message=None, output_mode="reports"
+    ):
+        self.bootstrap_attempts.add((pr.repo_slug, pr.pr_id, pr.source_commit_hash, provider, output_mode))
 
-    def enqueue_or_update_pr(self, pr, policy_version, schema_version, provider):
-        if self.has_review_for_key(pr, policy_version, schema_version, provider):
+    def enqueue_or_update_pr(self, pr, policy_version, schema_version, provider, output_mode="reports"):
+        if self.has_review_for_key(pr, policy_version, schema_version, provider, output_mode=output_mode):
             return False
-        self.enqueued.append((pr.repo_slug, pr.pr_id, provider))
-        self.known.add((pr.repo_slug, pr.pr_id, pr.source_commit_hash, provider))
+        if output_mode == "reports":
+            self.enqueued.append((pr.repo_slug, pr.pr_id, provider))
+        else:
+            self.enqueued.append((pr.repo_slug, pr.pr_id, provider, output_mode))
+        self.known.add((pr.repo_slug, pr.pr_id, pr.source_commit_hash, provider, output_mode))
         return True
+
+    def force_enqueue_pr_review(self, pr, policy_version, schema_version, provider, output_mode="reports"):
+        self.force_enqueued.append((pr.repo_slug, pr.pr_id, provider, output_mode))
+        self.known.add((pr.repo_slug, pr.pr_id, pr.source_commit_hash, provider, output_mode))
+        return True
+
+    def processed_pull_request_comment_review_requested(self, workspace, repo_slug, pr_id, comment_id, updated_on):
+        return self.processed_comments.get((workspace, repo_slug, pr_id, str(comment_id), updated_on))
+
+    def mark_pull_request_comment_processed(
+        self,
+        workspace,
+        repo_slug,
+        pr_id,
+        comment_id,
+        updated_on,
+        review_requested,
+    ):
+        self.processed_comments[(workspace, repo_slug, pr_id, str(comment_id), updated_on)] = review_requested
+
+    def get_active_provider_cooldown(self, provider):
+        return None
+
+    def mark_provider_cooldown(self, provider, error, cooldown_seconds, status="quota_exhausted"):
+        return "2099-01-01T00:00:00+00:00"
 
     def prune_closed_pull_requests(self, workspace, repo_slug, open_pr_ids):
         self.pruned.append((workspace, repo_slug, list(open_pr_ids)))
@@ -1368,8 +1773,9 @@ class _FakePollingBitbucket:
         self.prs = prs
         self.report_exists_result = report_exists
         self.report_checks = []
+        self.comments_by_pr = {}
 
-    def list_open_pull_requests(self, repo_slug, pagelen):
+    def list_open_pull_requests(self, repo_slug, pagelen=50):
         return list(self.prs)
 
     def report_exists(self, repo_slug, commit_hash, report_id):
@@ -1378,14 +1784,19 @@ class _FakePollingBitbucket:
             raise self.report_exists_result
         return self.report_exists_result
 
+    def list_pull_request_comments(self, repo_slug, pr_id):
+        return list(self.comments_by_pr.get((repo_slug, pr_id), []))
+
 
 class _FakeProvider:
-    def __init__(self, final_message=None, risk="medium", risk_error=None):
+    def __init__(self, final_message=None, risk="medium", risk_error=None, review_requested=True):
         self.runs = []
         self.risk_calls = []
+        self.review_request_calls = []
         self.final_message = final_message
         self.risk = risk
         self.risk_error = risk_error
+        self.review_requested = review_requested
 
     def run(self, worktree, prompt, schema_path, run_dir, is_superseded):
         self.runs.append(
@@ -1422,6 +1833,13 @@ class _FakeProvider:
         if self.risk_error is not None:
             raise self.risk_error
         return self.risk
+
+    def classify_review_request(self, comment, model, timeout_seconds, run_dir, is_superseded, **kwargs):
+        self.review_request_calls.append(comment)
+        return SimpleNamespace(
+            review_requested=self.review_requested,
+            reason="request" if self.review_requested else "not a request",
+        )
 
 
 class _FakeReports:
@@ -1488,6 +1906,12 @@ class _FakeRunJobState:
     def return_superseded_to_pending(self, job_id, lease_token=None):
         pass
 
+    def inline_comment_published(self, job, external_id):
+        return False
+
+    def mark_inline_comment_published(self, job, external_id):
+        pass
+
 
 class _FakeGit:
     def ensure_mirror(self, workspace, repo_slug, clone_url):
@@ -1529,9 +1953,12 @@ class _FailingGit:
 
 class _FakeBitbucket:
     def __init__(self):
+        self.credentials = SimpleNamespace(username="scout-bot")
         self.reports = []
         self.annotations = []
         self.comments = []
+        self.inline_comments = []
+        self.existing_comments = []
         self.operations = []
 
     def publish_report(self, repo_slug, commit_hash, report_id, report):
@@ -1547,6 +1974,20 @@ class _FakeBitbucket:
             before_request()
         self.comments.append((repo_slug, pr_id, content))
         self.operations.append("comment")
+
+    def list_pull_request_comments(self, repo_slug, pr_id, before_request=None):
+        if before_request is not None:
+            before_request()
+        return list(self.existing_comments) + [
+            {"content": {"raw": content}, "user": {"nickname": "scout-bot"}}
+            for _, _, _, _, content in self.inline_comments
+        ]
+
+    def publish_inline_pull_request_comment(self, repo_slug, pr_id, path, line, content, before_request=None):
+        if before_request is not None:
+            before_request()
+        self.inline_comments.append((repo_slug, pr_id, path, line, content))
+        self.operations.append("inline_comment")
 
 
 if __name__ == "__main__":

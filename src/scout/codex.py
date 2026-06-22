@@ -9,6 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .comment_request import (
+    CommentRequestClassification,
+    build_comment_request_prompt,
+    comment_request_schema_json,
+    extract_comment_request,
+)
 from .config import CodexConfig, CredentialStore
 from .provider import (
     PROVIDER_COOLDOWN_STATUS,
@@ -237,6 +243,100 @@ class CodexRunner:
             )
         return extract_risk(final_message)
 
+    def classify_review_request(
+        self,
+        comment: str,
+        model: str,
+        reasoning_effort: str,
+        timeout_seconds: int,
+        run_dir: str,
+        is_superseded: Callable[[], bool],
+    ) -> CommentRequestClassification:
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        output_file = Path(run_dir) / "codex-comment-request-final-message.json"
+        stdout_file = Path(run_dir) / "codex-comment-request-stdout.log"
+        stderr_file = Path(run_dir) / "codex-comment-request-stderr.log"
+        prompt_file = Path(run_dir) / "codex-comment-request-prompt.txt"
+        schema_file = Path(run_dir) / "comment-request.schema.json"
+        prompt_file.write_text(build_comment_request_prompt(comment), encoding="utf-8")
+        schema_file.write_text(comment_request_schema_json(), encoding="utf-8")
+
+        cmd = self.build_comment_request_command(
+            worktree=run_dir,
+            schema_path=str(schema_file),
+            output_file=str(output_file),
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        LOG.info("starting Codex comment request command=%s prompt_file=%s", _redacted_cmd(cmd), prompt_file)
+        with prompt_file.open("r", encoding="utf-8") as prompt_input, \
+            stdout_file.open("w", encoding="utf-8") as stdout, \
+            stderr_file.open("w", encoding="utf-8") as stderr:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=prompt_input,
+                stdout=stdout,
+                stderr=stderr,
+                text=True,
+                env=self._env(),
+                start_new_session=True,
+            )
+            started = time.monotonic()
+            while True:
+                if proc.poll() is not None:
+                    break
+                if is_superseded():
+                    _terminate_process_group(proc)
+                    raise ProviderSuperseded("review request classification superseded by a newer PR comment")
+                if time.monotonic() - started > timeout_seconds:
+                    _terminate_process_group(proc)
+                    stdout.flush()
+                    stderr.flush()
+                    cooldown_seconds = provider_quota_cooldown_seconds(
+                        "codex",
+                        _read_text(stdout_file),
+                        _read_text(stderr_file),
+                        _read_text(output_file),
+                    )
+                    raise ProviderError(
+                        "Codex review request classification timed out after {} seconds".format(timeout_seconds),
+                        cooldown_seconds=cooldown_seconds,
+                        provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
+                    )
+                time.sleep(1)
+
+        stdout_text = _read_text(stdout_file)
+        stderr_text = _read_text(stderr_file)
+        final_message = _read_text(output_file)
+        diagnostics = _build_diagnostics(stdout_text, stderr_text, final_message)
+        cooldown_seconds = provider_quota_cooldown_seconds("codex", stdout_text, stderr_text, final_message)
+        LOG.info(
+            "Codex comment request completed returncode=%s stdout_file=%s stderr_file=%s output_file=%s %s",
+            proc.returncode,
+            stdout_file,
+            stderr_file,
+            output_file,
+            diagnostics.summary(),
+        )
+        if proc.returncode != 0:
+            raise ProviderError(
+                "Codex review request classification exited with status {}: {}".format(
+                    proc.returncode,
+                    stderr_text[:1000],
+                ),
+                diagnostics=diagnostics,
+                cooldown_seconds=cooldown_seconds,
+                provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
+            )
+        if not final_message.strip():
+            raise ProviderError(
+                "Codex review request classification did not write a final message",
+                diagnostics=diagnostics,
+                cooldown_seconds=cooldown_seconds,
+                provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
+            )
+        return extract_comment_request(final_message)
+
     def build_command(self, worktree: str, schema_path: str, output_file: str, prompt: str) -> list:
         cmd = [
             self.config.command,
@@ -298,6 +398,22 @@ class CodexRunner:
             ]
         )
         return cmd
+
+    def build_comment_request_command(
+        self,
+        worktree: str,
+        schema_path: str,
+        output_file: str,
+        model: str,
+        reasoning_effort: str,
+    ) -> list:
+        return self.build_risk_command(
+            worktree=worktree,
+            schema_path=schema_path,
+            output_file=output_file,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
 
     def _env(self) -> dict:
         env = {

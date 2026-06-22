@@ -55,11 +55,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.review.subagent_large_loc_limit, 1500)
         self.assertEqual(config.review.subagent_high_risk_bonus, 1)
         self.assertEqual(config.review.subagent_max_per_lens, 4)
+        self.assertEqual(config.review.output_mode, "reports")
         self.assertTrue(config.review.risk.enabled)
         self.assertEqual(config.review.risk.provider, "codex")
         self.assertEqual(config.review.risk.timeout_seconds, 120)
         self.assertEqual(config.review.risk.model, "gpt-5.4")
         self.assertEqual(config.review.risk.effort, "low")
+        self.assertEqual(config.review.request_comments.provider, "codex")
+        self.assertEqual(config.review.request_comments.timeout_seconds, 120)
+        self.assertEqual(config.review.request_comments.model, "gpt-5.4")
+        self.assertEqual(config.review.request_comments.effort, "low")
         self.assertTrue(config.comments.critical_enabled)
         self.assertEqual(config.comments.severities, ["CRITICAL"])
         self.assertEqual(config.bitbucket.ssh_key_credential, "bitbucket_ssh_key")
@@ -579,6 +584,114 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.review.risk.timeout_seconds, 45)
         self.assertEqual(config.review.risk.model, "claude-sonnet-4-6")
         self.assertEqual(config.review.risk.effort, "high")
+
+    def test_parse_inline_output_mode_and_request_comments_classifier(self):
+        config = parse_config(
+            {
+                "bitbucket": {
+                    "workspace": "ws",
+                    "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                },
+                "agents": {"providers": ["codex", "claude"], "claude": {"enabled": True}},
+                "review": {
+                    "output_mode": "inline_comments",
+                    "request_comments": {
+                        "provider": "claude",
+                        "model": "claude-sonnet-4-6",
+                        "effort": "max",
+                        "timeout_seconds": 30,
+                    },
+                },
+                "comments": {"severities": ["critical", "high"]},
+            }
+        )
+        self.assertEqual(config.review.output_mode, "inline_comments")
+        self.assertEqual(config.review.request_comments.provider, "claude")
+        self.assertEqual(config.review.request_comments.timeout_seconds, 30)
+        self.assertEqual(config.review.request_comments.model, "claude-sonnet-4-6")
+        self.assertEqual(config.review.request_comments.effort, "max")
+        self.assertEqual(config.comments.severities, [])
+
+    def test_rejects_unknown_output_mode(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                    },
+                    "review": {"output_mode": "comments"},
+                }
+            )
+
+    def test_rejects_invalid_request_comments_classifier(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                    },
+                    "review": {"request_comments": {"effort": "max"}},
+                }
+            )
+
+    def test_reports_mode_does_not_require_enabled_request_comment_provider(self):
+        config = parse_config(
+            {
+                "bitbucket": {
+                    "workspace": "ws",
+                    "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                },
+                "agents": {
+                    "strategy": "claude",
+                    "codex": {"enabled": False},
+                    "claude": {"enabled": True},
+                },
+                "review": {
+                    "output_mode": "reports",
+                    "risk": {"provider": "claude"},
+                },
+            }
+        )
+
+        self.assertEqual(config.review.output_mode, "reports")
+        self.assertEqual(config.review.request_comments.provider, "codex")
+
+    def test_inline_mode_requires_enabled_request_comment_provider(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                    },
+                    "agents": {
+                        "strategy": "claude",
+                        "codex": {"enabled": False},
+                        "claude": {"enabled": True},
+                    },
+                    "review": {
+                        "output_mode": "inline_comments",
+                        "request_comments": {"provider": "codex"},
+                        "risk": {"provider": "claude"},
+                    },
+                }
+            )
+
+    def test_inline_mode_ignores_invalid_comment_severities(self):
+        config = parse_config(
+            {
+                "bitbucket": {
+                    "workspace": "ws",
+                    "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                },
+                "review": {"output_mode": "inline_comments"},
+                "comments": {"severities": ["urgent"]},
+            }
+        )
+
+        self.assertEqual(config.comments.severities, [])
 
     def test_allows_risk_provider_outside_review_providers(self):
         config = parse_config(

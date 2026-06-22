@@ -39,7 +39,10 @@ class ReviewJob:
     lease_token: Optional[str]
     target_review_key: str
     running_review_key: Optional[str]
+    target_review_run_id: str
+    running_review_run_id: Optional[str]
     error_message: Optional[str]
+    output_mode: str = "reports"
 
 
 class StateStore:
@@ -99,6 +102,7 @@ class StateStore:
                   reviewer_policy_version text not null,
                   schema_version text not null,
                   provider text not null,
+                  output_mode text not null default 'reports',
                   status text not null,
                   superseded integer not null default 0,
                   attempts integer not null default 0,
@@ -106,10 +110,12 @@ class StateStore:
                   lease_token text,
                   target_review_key text not null,
                   running_review_key text,
+                  target_review_run_id text not null,
+                  running_review_run_id text,
                   error_message text,
                   created_at text not null,
                   updated_at text not null,
-                  unique(workspace, repo_slug, pr_id, reviewer_policy_version, schema_version, provider)
+                  unique(workspace, repo_slug, pr_id, reviewer_policy_version, schema_version, provider, output_mode)
                 );
 
                 create table if not exists provider_state (
@@ -130,9 +136,37 @@ class StateStore:
                   error_message text,
                   primary key(workspace, repo_slug, pr_id, provider, review_key)
                 );
+
+                create table if not exists processed_pr_comments (
+                  workspace text not null,
+                  repo_slug text not null,
+                  pr_id integer not null,
+                  comment_id text not null,
+                  updated_on text not null,
+                  review_requested integer not null,
+                  processed_at text not null,
+                  primary key(workspace, repo_slug, pr_id, comment_id, updated_on)
+                );
+
+                create table if not exists inline_comment_publications (
+                  workspace text not null,
+                  repo_slug text not null,
+                  pr_id integer not null,
+                  provider text not null,
+                  output_mode text not null,
+                  review_run_id text not null,
+                  external_id text not null,
+                  published_at text not null,
+                  primary key(workspace, repo_slug, pr_id, provider, output_mode, review_run_id, external_id)
+                );
                 """
             )
             self._ensure_column(conn, "review_jobs", "lease_token", "text")
+            self._ensure_column(conn, "review_jobs", "output_mode", "text not null default 'reports'")
+            self._ensure_column(conn, "review_jobs", "target_review_run_id", "text")
+            self._ensure_column(conn, "review_jobs", "running_review_run_id", "text")
+            self._backfill_review_job_run_ids(conn)
+            self._migrate_review_jobs_output_mode_unique(conn)
             self._migrate_failed_permanent_jobs(conn)
 
     @contextmanager
@@ -168,8 +202,9 @@ class StateStore:
         schema_version: str,
         provider: str,
         last_seen_updated_on: Optional[str] = None,
+        output_mode: str = "reports",
     ) -> bool:
-        key = review_key(pr, policy_version, schema_version, provider)
+        key = review_key(pr, policy_version, schema_version, provider, output_mode)
         now = utcnow()
         with self.connect() as conn:
             conn.execute("begin immediate")
@@ -215,27 +250,28 @@ class StateStore:
                 """,
                 (pr.workspace, pr.repo_slug, pr.pr_id),
             ).fetchone()
-            if state and state["last_review_key"] == key:
-                return False
 
             existing = conn.execute(
                 """
                 select id, status, target_review_key from review_jobs
                 where workspace=? and repo_slug=? and pr_id=?
-                  and reviewer_policy_version=? and schema_version=? and provider=?
+                  and reviewer_policy_version=? and schema_version=? and provider=? and output_mode=?
                 """,
-                (pr.workspace, pr.repo_slug, pr.pr_id, policy_version, schema_version, provider),
+                (pr.workspace, pr.repo_slug, pr.pr_id, policy_version, schema_version, provider, output_mode),
             ).fetchone()
+            if existing is None and state and state["last_review_key"] == key:
+                return False
             if existing is None:
+                run_id = uuid.uuid4().hex
                 conn.execute(
                     """
                     insert into review_jobs(
                       workspace, repo_slug, pr_id, title, description,
                       source_branch, target_source_commit_hash, destination_branch, destination_commit_hash,
                       merge_base_hash, reviewer_policy_version, schema_version, provider,
-                      status, target_review_key, created_at, updated_at
+                      output_mode, status, target_review_key, target_review_run_id, created_at, updated_at
                     )
-                    values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                    values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
                     """,
                     (
                         pr.workspace,
@@ -251,7 +287,9 @@ class StateStore:
                         policy_version,
                         schema_version,
                         provider,
+                        output_mode,
                         key,
+                        run_id,
                         now,
                         now,
                     ),
@@ -287,6 +325,7 @@ class StateStore:
             if existing["status"] == "publishing":
                 return True
 
+            run_id = uuid.uuid4().hex
             supersede = 1 if existing["status"] == "running" else 0
             next_status = existing["status"] if supersede else "pending"
             conn.execute(
@@ -300,6 +339,7 @@ class StateStore:
                   destination_commit_hash=?,
                   merge_base_hash=?,
                   target_review_key=?,
+                  target_review_run_id=?,
                   status=?,
                   superseded=?,
                   attempts=0,
@@ -316,8 +356,172 @@ class StateStore:
                     pr.destination_commit_hash,
                     pr.merge_base_hash,
                     key,
+                    run_id,
                     next_status,
                     supersede,
+                    now,
+                    existing["id"],
+                ),
+            )
+            return True
+
+    def force_enqueue_pr_review(
+        self,
+        pr: PullRequest,
+        policy_version: str,
+        schema_version: str,
+        provider: str,
+        output_mode: str = "reports",
+    ) -> bool:
+        key = review_key(pr, policy_version, schema_version, provider, output_mode)
+        run_id = uuid.uuid4().hex
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute("begin immediate")
+            conn.execute(
+                """
+                insert into pull_request_state(
+                  workspace, repo_slug, pr_id, title, description, source_branch,
+                  destination_branch, source_commit_hash, destination_commit_hash,
+                  merge_base_hash, last_seen_updated_on, review_status, updated_at
+                )
+                values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?, ?)
+                on conflict(workspace, repo_slug, pr_id) do update set
+                  title=excluded.title,
+                  description=excluded.description,
+                  source_branch=excluded.source_branch,
+                  destination_branch=excluded.destination_branch,
+                  source_commit_hash=excluded.source_commit_hash,
+                  destination_commit_hash=excluded.destination_commit_hash,
+                  merge_base_hash=excluded.merge_base_hash,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    pr.workspace,
+                    pr.repo_slug,
+                    pr.pr_id,
+                    pr.title,
+                    pr.description,
+                    pr.source_branch,
+                    pr.destination_branch,
+                    pr.source_commit_hash,
+                    pr.destination_commit_hash,
+                    pr.merge_base_hash,
+                    "seen",
+                    now,
+                ),
+            )
+            existing = conn.execute(
+                """
+                select id, status from review_jobs
+                where workspace=? and repo_slug=? and pr_id=?
+                  and reviewer_policy_version=? and schema_version=? and provider=? and output_mode=?
+                """,
+                (pr.workspace, pr.repo_slug, pr.pr_id, policy_version, schema_version, provider, output_mode),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    insert into review_jobs(
+                      workspace, repo_slug, pr_id, title, description,
+                      source_branch, target_source_commit_hash, destination_branch, destination_commit_hash,
+                      merge_base_hash, reviewer_policy_version, schema_version, provider,
+                      output_mode, status, target_review_key, target_review_run_id, created_at, updated_at
+                    )
+                    values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                    """,
+                    (
+                        pr.workspace,
+                        pr.repo_slug,
+                        pr.pr_id,
+                        pr.title,
+                        pr.description,
+                        pr.source_branch,
+                        pr.source_commit_hash,
+                        pr.destination_branch,
+                        pr.destination_commit_hash,
+                        pr.merge_base_hash,
+                        policy_version,
+                        schema_version,
+                        provider,
+                        output_mode,
+                        key,
+                        run_id,
+                        now,
+                        now,
+                    ),
+                )
+                return True
+
+            if existing["status"] in ("running", "publishing"):
+                conn.execute(
+                    """
+                    update review_jobs set
+                      title=?,
+                      description=?,
+                      source_branch=?,
+                      target_source_commit_hash=?,
+                      destination_branch=?,
+                      destination_commit_hash=?,
+                      merge_base_hash=?,
+                      target_review_key=?,
+                      target_review_run_id=?,
+                      superseded=1,
+                      attempts=0,
+                      error_message=null,
+                      updated_at=?
+                    where id=?
+                    """,
+                    (
+                        pr.title,
+                        pr.description,
+                        pr.source_branch,
+                        pr.source_commit_hash,
+                        pr.destination_branch,
+                        pr.destination_commit_hash,
+                        pr.merge_base_hash,
+                        key,
+                        run_id,
+                        now,
+                        existing["id"],
+                    ),
+                )
+                return True
+
+            conn.execute(
+                """
+                update review_jobs set
+                  title=?,
+                  description=?,
+                  source_branch=?,
+                  target_source_commit_hash=?,
+                  running_source_commit_hash=null,
+                  destination_branch=?,
+                  destination_commit_hash=?,
+                  merge_base_hash=?,
+                  target_review_key=?,
+                  target_review_run_id=?,
+                  running_review_key=null,
+                  running_review_run_id=null,
+                  status='pending',
+                  superseded=0,
+                  attempts=0,
+                  leased_until=null,
+                  lease_token=null,
+                  error_message=null,
+                  updated_at=?
+                where id=?
+                """,
+                (
+                    pr.title,
+                    pr.description,
+                    pr.source_branch,
+                    pr.source_commit_hash,
+                    pr.destination_branch,
+                    pr.destination_commit_hash,
+                    pr.merge_base_hash,
+                    key,
+                    run_id,
                     now,
                     existing["id"],
                 ),
@@ -330,17 +534,18 @@ class StateStore:
         policy_version: str,
         schema_version: str,
         provider: str,
+        output_mode: str = "reports",
     ) -> bool:
-        key = review_key(pr, policy_version, schema_version, provider)
+        key = review_key(pr, policy_version, schema_version, provider, output_mode)
         with self.connect() as conn:
             job = conn.execute(
                 """
                 select 1 from review_jobs
                 where workspace=? and repo_slug=? and pr_id=?
-                  and reviewer_policy_version=? and schema_version=? and provider=?
+                  and reviewer_policy_version=? and schema_version=? and provider=? and output_mode=?
                   and target_review_key=?
                 """,
-                (pr.workspace, pr.repo_slug, pr.pr_id, policy_version, schema_version, provider, key),
+                (pr.workspace, pr.repo_slug, pr.pr_id, policy_version, schema_version, provider, output_mode, key),
             ).fetchone()
             if job is not None:
                 return True
@@ -359,8 +564,9 @@ class StateStore:
         policy_version: str,
         schema_version: str,
         provider: str,
+        output_mode: str = "reports",
     ) -> bool:
-        key = review_key(pr, policy_version, schema_version, provider)
+        key = review_key(pr, policy_version, schema_version, provider, output_mode)
         with self.connect() as conn:
             row = conn.execute(
                 """
@@ -378,8 +584,9 @@ class StateStore:
         schema_version: str,
         provider: str,
         error_message: Optional[str] = None,
+        output_mode: str = "reports",
     ) -> None:
-        key = review_key(pr, policy_version, schema_version, provider)
+        key = review_key(pr, policy_version, schema_version, provider, output_mode)
         now = utcnow()
         with self.connect() as conn:
             conn.execute(
@@ -403,11 +610,150 @@ class StateStore:
                 ),
             )
 
+    def processed_pull_request_comment_review_requested(
+        self,
+        workspace: str,
+        repo_slug: str,
+        pr_id: int,
+        comment_id: str,
+        updated_on: str,
+    ) -> Optional[bool]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                select review_requested from processed_pr_comments
+                where workspace=? and repo_slug=? and pr_id=? and comment_id=? and updated_on=?
+                """,
+                (workspace, repo_slug, pr_id, str(comment_id), updated_on),
+            ).fetchone()
+            if row is None:
+                return None
+            return bool(row["review_requested"])
+
+    def mark_pull_request_comment_processed(
+        self,
+        workspace: str,
+        repo_slug: str,
+        pr_id: int,
+        comment_id: str,
+        updated_on: str,
+        review_requested: bool,
+    ) -> None:
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                insert into processed_pr_comments(
+                  workspace, repo_slug, pr_id, comment_id, updated_on, review_requested, processed_at
+                )
+                values(?, ?, ?, ?, ?, ?, ?)
+                on conflict(workspace, repo_slug, pr_id, comment_id, updated_on) do update set
+                  review_requested=excluded.review_requested,
+                  processed_at=excluded.processed_at
+                """,
+                (
+                    workspace,
+                    repo_slug,
+                    pr_id,
+                    str(comment_id),
+                    updated_on,
+                    1 if review_requested else 0,
+                    now,
+                ),
+            )
+
+    def inline_comment_published(
+        self,
+        job: ReviewJob,
+        external_id: str,
+    ) -> bool:
+        review_run_id = job.running_review_run_id or job.target_review_run_id
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                select 1 from inline_comment_publications
+                where workspace=? and repo_slug=? and pr_id=? and provider=?
+                  and output_mode=? and review_run_id=? and external_id=?
+                """,
+                (
+                    job.workspace,
+                    job.repo_slug,
+                    job.pr_id,
+                    job.provider,
+                    job.output_mode,
+                    review_run_id,
+                    external_id,
+                ),
+            ).fetchone()
+            return row is not None
+
+    def mark_inline_comment_published(
+        self,
+        job: ReviewJob,
+        external_id: str,
+    ) -> None:
+        review_run_id = job.running_review_run_id or job.target_review_run_id
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                insert into inline_comment_publications(
+                  workspace, repo_slug, pr_id, provider, output_mode,
+                  review_run_id, external_id, published_at
+                )
+                values(?, ?, ?, ?, ?, ?, ?, ?)
+                on conflict(workspace, repo_slug, pr_id, provider, output_mode, review_run_id, external_id)
+                do update set published_at=excluded.published_at
+                """,
+                (
+                    job.workspace,
+                    job.repo_slug,
+                    job.pr_id,
+                    job.provider,
+                    job.output_mode,
+                    review_run_id,
+                    external_id,
+                    now,
+                ),
+            )
+
     def prune_closed_pull_requests(self, workspace: str, repo_slug: str, open_pr_ids: Sequence[int]) -> int:
         open_ids = [int(pr_id) for pr_id in open_pr_ids]
         open_filter, params = _not_open_filter(open_ids)
         with self.connect() as conn:
             conn.execute("begin immediate")
+            conn.execute(
+                """
+                delete from processed_pr_comments
+                where workspace=?
+                  and repo_slug=?
+                  and {open_filter}
+                  and not exists (
+                    select 1 from review_jobs
+                    where review_jobs.workspace=processed_pr_comments.workspace
+                      and review_jobs.repo_slug=processed_pr_comments.repo_slug
+                      and review_jobs.pr_id=processed_pr_comments.pr_id
+                      and review_jobs.status in ('running', 'publishing')
+                  )
+                """.format(open_filter=open_filter),
+                (workspace, repo_slug, *params),
+            )
+            conn.execute(
+                """
+                delete from inline_comment_publications
+                where workspace=?
+                  and repo_slug=?
+                  and {open_filter}
+                  and not exists (
+                    select 1 from review_jobs
+                    where review_jobs.workspace=inline_comment_publications.workspace
+                      and review_jobs.repo_slug=inline_comment_publications.repo_slug
+                      and review_jobs.pr_id=inline_comment_publications.pr_id
+                      and review_jobs.status in ('running', 'publishing')
+                  )
+                """.format(open_filter=open_filter),
+                (workspace, repo_slug, *params),
+            )
             conn.execute(
                 """
                 delete from report_bootstrap_attempts
@@ -474,6 +820,24 @@ class StateStore:
             conn.execute("begin immediate")
             conn.execute(
                 """
+                delete from processed_pr_comments
+                where workspace=?
+                  and repo_slug=?
+                  and {}
+                """.format(ignored_filter),
+                (workspace, repo_slug, *params),
+            )
+            conn.execute(
+                """
+                delete from inline_comment_publications
+                where workspace=?
+                  and repo_slug=?
+                  and {}
+                """.format(ignored_filter),
+                (workspace, repo_slug, *params),
+            )
+            conn.execute(
+                """
                 delete from report_bootstrap_attempts
                 where workspace=?
                   and repo_slug=?
@@ -531,8 +895,10 @@ class StateStore:
         provider: str,
         report_id: str,
         last_seen_updated_on: Optional[str] = None,
+        output_mode: str = "reports",
     ) -> None:
-        key = review_key(pr, policy_version, schema_version, provider)
+        key = review_key(pr, policy_version, schema_version, provider, output_mode)
+        run_id = uuid.uuid4().hex
         now = utcnow()
         with self.connect() as conn:
             conn.execute("begin immediate")
@@ -582,9 +948,9 @@ class StateStore:
                 """
                 select id from review_jobs
                 where workspace=? and repo_slug=? and pr_id=?
-                  and reviewer_policy_version=? and schema_version=? and provider=?
+                  and reviewer_policy_version=? and schema_version=? and provider=? and output_mode=?
                 """,
-                (pr.workspace, pr.repo_slug, pr.pr_id, policy_version, schema_version, provider),
+                (pr.workspace, pr.repo_slug, pr.pr_id, policy_version, schema_version, provider, output_mode),
             ).fetchone()
             if existing is None:
                 conn.execute(
@@ -593,10 +959,11 @@ class StateStore:
                       workspace, repo_slug, pr_id, title, description,
                       source_branch, target_source_commit_hash, running_source_commit_hash,
                       destination_branch, destination_commit_hash, merge_base_hash,
-                      reviewer_policy_version, schema_version, provider, status,
-                      target_review_key, running_review_key, created_at, updated_at
+                      reviewer_policy_version, schema_version, provider, output_mode, status,
+                      target_review_key, running_review_key, target_review_run_id,
+                      running_review_run_id, created_at, updated_at
                     )
-                    values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, ?, ?)
+                    values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'succeeded', ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         pr.workspace,
@@ -613,8 +980,11 @@ class StateStore:
                         policy_version,
                         schema_version,
                         provider,
+                        output_mode,
                         key,
                         key,
+                        run_id,
+                        run_id,
                         now,
                         now,
                     ),
@@ -634,6 +1004,8 @@ class StateStore:
                   merge_base_hash=?,
                   target_review_key=?,
                   running_review_key=?,
+                  target_review_run_id=?,
+                  running_review_run_id=?,
                   status='succeeded',
                   superseded=0,
                   attempts=0,
@@ -654,6 +1026,8 @@ class StateStore:
                     pr.merge_base_hash,
                     key,
                     key,
+                    run_id,
+                    run_id,
                     now,
                     existing["id"],
                 ),
@@ -695,6 +1069,7 @@ class StateStore:
                   superseded=0,
                   running_source_commit_hash=null,
                   running_review_key=null,
+                  running_review_run_id=null,
                   leased_until=null,
                   lease_token=null,
                   error_message=?,
@@ -778,6 +1153,7 @@ class StateStore:
                       status='running',
                       running_source_commit_hash=target_source_commit_hash,
                       running_review_key=target_review_key,
+                      running_review_run_id=target_review_run_id,
                       superseded=0,
                       attempts=attempts + 1,
                       leased_until=?,
@@ -868,6 +1244,7 @@ class StateStore:
                   status='running',
                   running_source_commit_hash=target_source_commit_hash,
                   running_review_key=target_review_key,
+                  running_review_run_id=target_review_run_id,
                   superseded=0,
                   attempts=attempts + 1,
                   leased_until=?,
@@ -912,7 +1289,11 @@ class StateStore:
             return True
         if lease_token is not None and job.lease_token != lease_token:
             return True
-        return bool(job.superseded or job.running_review_key != job.target_review_key)
+        return bool(
+            job.superseded
+            or job.running_review_key != job.target_review_key
+            or job.running_review_run_id != job.target_review_run_id
+        )
 
     def mark_publishing(self, job: ReviewJob, lease_seconds: int) -> bool:
         now = utcnow()
@@ -932,6 +1313,8 @@ class StateStore:
                   and lease_token=?
                   and running_review_key=?
                   and target_review_key=?
+                  and running_review_run_id=?
+                  and target_review_run_id=?
                 """,
                 (
                     leased_until,
@@ -940,6 +1323,8 @@ class StateStore:
                     job.lease_token,
                     job.running_review_key,
                     job.running_review_key,
+                    job.running_review_run_id,
+                    job.running_review_run_id,
                 ),
             )
             return result.rowcount == 1
@@ -961,6 +1346,8 @@ class StateStore:
                   and lease_token=?
                   and running_review_key=?
                   and target_review_key=?
+                  and running_review_run_id=?
+                  and target_review_run_id=?
                 """,
                 (
                     leased_until,
@@ -969,6 +1356,8 @@ class StateStore:
                     job.lease_token,
                     job.running_review_key,
                     job.running_review_key,
+                    job.running_review_run_id,
+                    job.running_review_run_id,
                 ),
             )
             return result.rowcount == 1
@@ -991,8 +1380,18 @@ class StateStore:
                   and lease_token=?
                   and running_review_key=?
                   and target_review_key=?
+                  and running_review_run_id=?
+                  and target_review_run_id=?
                 """,
-                (now, job.id, job.lease_token, job.running_review_key, job.running_review_key),
+                (
+                    now,
+                    job.id,
+                    job.lease_token,
+                    job.running_review_key,
+                    job.running_review_key,
+                    job.running_review_run_id,
+                    job.running_review_run_id,
+                ),
             )
             if result.rowcount != 1:
                 return False
@@ -1089,6 +1488,7 @@ class StateStore:
                   superseded=0,
                   running_source_commit_hash=null,
                   running_review_key=null,
+                  running_review_run_id=null,
                   leased_until=null,
                   lease_token=null,
                   error_message=null,
@@ -1104,6 +1504,112 @@ class StateStore:
         existing = {row["name"] for row in conn.execute("pragma table_info({})".format(table)).fetchall()}
         if column not in existing:
             conn.execute("alter table {} add column {} {}".format(table, column, definition))
+
+    def _backfill_review_job_run_ids(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute(
+            """
+            select id, target_review_run_id, running_review_run_id
+            from review_jobs
+            where target_review_run_id is null
+               or target_review_run_id=''
+               or (running_review_key is not null and (running_review_run_id is null or running_review_run_id=''))
+            """
+        ).fetchall()
+        for row in rows:
+            target_run_id = row["target_review_run_id"] or uuid.uuid4().hex
+            running_run_id = row["running_review_run_id"]
+            if row["running_review_run_id"] in (None, ""):
+                running_run_id = target_run_id
+            conn.execute(
+                """
+                update review_jobs set
+                  target_review_run_id=?,
+                  running_review_run_id=case
+                    when running_review_key is not null then ?
+                    else running_review_run_id
+                  end
+                where id=?
+                """,
+                (target_run_id, running_run_id, row["id"]),
+            )
+
+    def _migrate_review_jobs_output_mode_unique(self, conn: sqlite3.Connection) -> None:
+        expected = [
+            "workspace",
+            "repo_slug",
+            "pr_id",
+            "reviewer_policy_version",
+            "schema_version",
+            "provider",
+            "output_mode",
+        ]
+        for index in conn.execute("pragma index_list(review_jobs)").fetchall():
+            if not bool(index["unique"]):
+                continue
+            columns = [
+                row["name"]
+                for row in conn.execute("pragma index_info({})".format(index["name"])).fetchall()
+            ]
+            if columns == expected:
+                return
+
+        conn.executescript(
+            """
+            create table review_jobs_new (
+              id integer primary key,
+              workspace text not null,
+              repo_slug text not null,
+              pr_id integer not null,
+              title text,
+              description text,
+              source_branch text,
+              target_source_commit_hash text not null,
+              running_source_commit_hash text,
+              destination_branch text,
+              destination_commit_hash text,
+              merge_base_hash text,
+              reviewer_policy_version text not null,
+              schema_version text not null,
+              provider text not null,
+              output_mode text not null default 'reports',
+              status text not null,
+              superseded integer not null default 0,
+              attempts integer not null default 0,
+              leased_until text,
+              lease_token text,
+              target_review_key text not null,
+              running_review_key text,
+              target_review_run_id text not null,
+              running_review_run_id text,
+              error_message text,
+              created_at text not null,
+              updated_at text not null,
+              unique(workspace, repo_slug, pr_id, reviewer_policy_version, schema_version, provider, output_mode)
+            );
+
+            insert into review_jobs_new(
+              id, workspace, repo_slug, pr_id, title, description, source_branch,
+              target_source_commit_hash, running_source_commit_hash, destination_branch,
+              destination_commit_hash, merge_base_hash, reviewer_policy_version,
+              schema_version, provider, output_mode, status, superseded, attempts,
+              leased_until, lease_token, target_review_key, running_review_key,
+              target_review_run_id, running_review_run_id, error_message,
+              created_at, updated_at
+            )
+            select
+              id, workspace, repo_slug, pr_id, title, description, source_branch,
+              target_source_commit_hash, running_source_commit_hash, destination_branch,
+              destination_commit_hash, merge_base_hash, reviewer_policy_version,
+              schema_version, provider, coalesce(output_mode, 'reports'), status,
+              superseded, attempts, leased_until, lease_token, target_review_key,
+              running_review_key, target_review_run_id, running_review_run_id,
+              error_message, created_at, updated_at
+            from review_jobs;
+
+            drop table review_jobs;
+            alter table review_jobs_new rename to review_jobs;
+            """
+        )
 
     def _migrate_failed_permanent_jobs(self, conn: sqlite3.Connection) -> None:
         now = utcnow()
@@ -1137,6 +1643,7 @@ def _job_from_row(row: sqlite3.Row) -> ReviewJob:
         reviewer_policy_version=row["reviewer_policy_version"],
         schema_version=row["schema_version"],
         provider=row["provider"],
+        output_mode=row["output_mode"],
         status=row["status"],
         superseded=bool(row["superseded"]),
         attempts=int(row["attempts"]),
@@ -1144,6 +1651,8 @@ def _job_from_row(row: sqlite3.Row) -> ReviewJob:
         lease_token=row["lease_token"],
         target_review_key=row["target_review_key"],
         running_review_key=row["running_review_key"],
+        target_review_run_id=row["target_review_run_id"],
+        running_review_run_id=row["running_review_run_id"],
         error_message=row["error_message"],
     )
 

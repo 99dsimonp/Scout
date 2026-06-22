@@ -13,7 +13,8 @@ worktrees, and can run multiple providers independently on the same PR.
 Scout provides:
 
 - Code Insights reports and inline annotations for each reviewed commit.
-- Optional native PR comments for selected severities.
+- An alternate inline-comment mode that posts one native code comment per finding.
+- Optional native PR comments for selected severities in report mode.
 - Retry and cooldown handling for provider failures and usage-limit lockouts.
 - Local audit logs and provider usage summaries with short retention.
 
@@ -309,6 +310,27 @@ Native PR comments are controlled by `[comments].severities`. The default is
 or an empty list to disable comments. The legacy
 `[comments].critical_enabled = false` setting is still accepted when
 `severities` is omitted.
+
+To use native inline comments instead of Code Insights reports, set:
+
+```toml
+[review]
+output_mode = "inline_comments"
+
+[review.request_comments]
+provider = "codex"
+model = "gpt-5.4"
+effort = "low"
+timeout_seconds = 120
+```
+
+Inline comment mode reviews each non-draft PR once per configured provider. New
+commits do not automatically trigger another review; a developer can request one
+by mentioning `@scout` or `@Scout` in a PR comment. Scout classifies tagged
+comments with `review.request_comments` before queueing a rerun. In this mode,
+`[comments].severities` and `[comments].critical_enabled` are ignored: every
+validated annotation is posted as its own inline code comment, and no PR-level
+fallback comment is posted.
 
 ## Local Review Log
 

@@ -41,7 +41,6 @@ clone_url = "git@bitbucket.org:my-workspace/repo-b.git"
 [polling]
 enabled = true
 interval_seconds = 600
-pagelen = 50
 
 [queue]
 max_parallel_reviews = 2
@@ -59,6 +58,9 @@ severities = ["CRITICAL"]
 policy_version = "v1"
 schema_path = "/etc/scout/review.schema.json"
 max_findings = 100
+# reports posts Bitbucket Code Insights reports. inline_comments posts one
+# native inline code comment per annotation and ignores [comments].severities.
+output_mode = "reports"
 # Backward-compatible defaults for provider review sizing. Each provider can
 # override these keys in its own [agents.<provider>] table.
 subagent_small_loc_limit = 150
@@ -73,6 +75,13 @@ enabled = true
 provider = "codex"
 model = "gpt-5.4"
 # For Codex this maps to model_reasoning_effort; for Claude this maps to --effort.
+effort = "low"
+timeout_seconds = 120
+
+[review.request_comments]
+# Classifier used to detect @scout review requests in PR comments.
+provider = "codex"
+model = "gpt-5.4"
 effort = "low"
 timeout_seconds = 120
 

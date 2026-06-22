@@ -14,6 +14,7 @@ from typing import Dict, Optional
 from .bitbucket import BitbucketClient, BitbucketCredentials, BitbucketError
 from .claude import ClaudeRunner
 from .codex import CodexRunner
+from .comment_request import CommentRequestValidationError, has_scout_mention
 from .config import AppConfig, ConfigError, CredentialStore
 from .gitops import GitError, GitManager
 from .models import PullRequest
@@ -30,6 +31,7 @@ from .schema import (
     to_bitbucket_annotations,
     to_pr_comment,
     to_bitbucket_report,
+    to_inline_pr_comments,
     validate_review_output,
 )
 from .state import ReviewJob, StateStore, utcnow
@@ -63,6 +65,14 @@ class ScoutDaemon:
         risk_provider = getattr(risk_config, "provider", None) if getattr(risk_config, "enabled", True) else None
         if risk_provider and risk_provider not in runtime_provider_names:
             runtime_provider_names.append(risk_provider)
+        request_comments_config = getattr(config.review, "request_comments", None)
+        request_comments_provider = (
+            getattr(request_comments_config, "provider", None)
+            if getattr(config.review, "output_mode", "reports") == "inline_comments"
+            else None
+        )
+        if request_comments_provider and request_comments_provider not in runtime_provider_names:
+            runtime_provider_names.append(request_comments_provider)
         self.provider_configs = {
             provider: _provider_config(config, provider)
             for provider in runtime_provider_names
@@ -145,7 +155,7 @@ class ScoutDaemon:
         for repo in self.config.bitbucket.repositories:
             LOG.info("polling repository workspace=%s repo=%s", self.config.bitbucket.workspace, repo.slug)
             try:
-                prs = self.bitbucket.list_open_pull_requests(repo.slug, self.config.polling.pagelen)
+                prs = self.bitbucket.list_open_pull_requests(repo.slug)
             except BitbucketError as exc:
                 LOG.error("Bitbucket poll failed repo=%s retryable=%s error=%s", repo.slug, exc.retryable, exc)
                 continue
@@ -184,15 +194,21 @@ class ScoutDaemon:
                         ignored_count,
                     )
                 prs = [pr for pr in prs if pr.pr_id not in ignored_set]
-            if getattr(repo, "ignore_draft_pull_requests", False):
+            output_mode = getattr(self.config.review, "output_mode", "reports")
+            if output_mode == "inline_comments" or getattr(repo, "ignore_draft_pull_requests", False):
                 ignored_draft_pr_ids = [pr.pr_id for pr in prs if pr.is_draft]
                 if ignored_draft_pr_ids:
                     ignored_set = set(ignored_draft_pr_ids)
+                    reason = (
+                        "PR is draft and inline comment review mode only reviews non-draft pull requests"
+                        if output_mode == "inline_comments"
+                        else "PR is draft and repository is configured to ignore draft pull requests"
+                    )
                     ignored_count = self.state.prune_ignored_pull_requests(
                         self.config.bitbucket.workspace,
                         repo.slug,
                         ignored_draft_pr_ids,
-                        "PR is draft and repository is configured to ignore draft pull requests",
+                        reason,
                     )
                     if ignored_count:
                         LOG.info(
@@ -219,12 +235,17 @@ class ScoutDaemon:
                         pruned,
                     )
             for pr in prs:
+                policy_version = self.config.review.policy_version
+                schema_version = "v1"
                 for provider in self.provider_names:
-                    policy_version = self.config.review.policy_version
-                    schema_version = "v1"
                     if (
-                        not self.state.has_review_for_key(pr, policy_version, schema_version, provider)
-                        and self.state.should_bootstrap_report(pr, policy_version, schema_version, provider)
+                        output_mode == "reports"
+                        and not self.state.has_review_for_key(
+                            pr, policy_version, schema_version, provider, output_mode=output_mode
+                        )
+                        and self.state.should_bootstrap_report(
+                            pr, policy_version, schema_version, provider, output_mode=output_mode
+                        )
                     ):
                         seeded = self._seed_existing_provider_report(
                             pr,
@@ -239,6 +260,7 @@ class ScoutDaemon:
                         policy_version=policy_version,
                         schema_version=schema_version,
                         provider=provider,
+                        output_mode=output_mode,
                     )
                     if queued:
                         LOG.info(
@@ -248,6 +270,177 @@ class ScoutDaemon:
                             pr.pr_id,
                             pr.source_commit_hash,
                         )
+                if output_mode == "inline_comments":
+                    self._process_review_request_comments(pr, policy_version, schema_version, output_mode)
+
+    def _process_review_request_comments(
+        self,
+        pr: PullRequest,
+        policy_version: str,
+        schema_version: str,
+        output_mode: str,
+    ) -> None:
+        try:
+            comments = self.bitbucket.list_pull_request_comments(pr.repo_slug, pr.pr_id)
+        except BitbucketError as exc:
+            LOG.warning(
+                "Bitbucket comment poll failed repo=%s pr=%s retryable=%s error=%s",
+                pr.repo_slug,
+                pr.pr_id,
+                exc.retryable,
+                exc,
+            )
+            return
+
+        for comment in comments:
+            if comment.get("deleted") is True:
+                continue
+            comment_id = str(comment.get("id") or "")
+            updated_on = str(comment.get("updated_on") or "")
+            body = _comment_raw_content(comment)
+            if not comment_id or not updated_on or not has_scout_mention(body):
+                continue
+            processed = self.state.processed_pull_request_comment_review_requested(
+                pr.workspace,
+                pr.repo_slug,
+                pr.pr_id,
+                comment_id,
+                updated_on,
+            )
+            if processed is not None:
+                continue
+            try:
+                classification = self._classify_review_request_comment(pr, comment_id, updated_on, body)
+            except (ProviderError, ProviderSuperseded, CommentRequestValidationError) as exc:
+                LOG.warning(
+                    "review request comment classification failed repo=%s pr=%s comment=%s error=%s",
+                    pr.repo_slug,
+                    pr.pr_id,
+                    comment_id,
+                    exc,
+                )
+                continue
+            except Exception as exc:
+                LOG.warning(
+                    "review request comment classification failed unexpectedly repo=%s pr=%s comment=%s error=%s",
+                    pr.repo_slug,
+                    pr.pr_id,
+                    comment_id,
+                    exc,
+                )
+                continue
+
+            if not classification.review_requested:
+                self.state.mark_pull_request_comment_processed(
+                    pr.workspace,
+                    pr.repo_slug,
+                    pr.pr_id,
+                    comment_id,
+                    updated_on,
+                    False,
+                )
+                LOG.info(
+                    "ignored Scout mention that did not request review repo=%s pr=%s comment=%s reason=%s",
+                    pr.repo_slug,
+                    pr.pr_id,
+                    comment_id,
+                    classification.reason,
+                )
+                continue
+
+            for provider in self.provider_names:
+                queued = self.state.force_enqueue_pr_review(
+                    pr,
+                    policy_version,
+                    schema_version,
+                    provider,
+                    output_mode=output_mode,
+                )
+                if queued:
+                    LOG.info(
+                        "queued review from Scout mention provider=%s repo=%s pr=%s comment=%s",
+                        provider,
+                        pr.repo_slug,
+                        pr.pr_id,
+                        comment_id,
+                    )
+            self.state.mark_pull_request_comment_processed(
+                pr.workspace,
+                pr.repo_slug,
+                pr.pr_id,
+                comment_id,
+                updated_on,
+                True,
+            )
+
+    def _classify_review_request_comment(
+        self,
+        pr: PullRequest,
+        comment_id: str,
+        updated_on: str,
+        body: str,
+    ):
+        request_config = self.config.review.request_comments
+        provider = request_config.provider
+        runner = self.providers.get(provider)
+        if runner is None:
+            raise ProviderError("review request provider is not available: {}".format(provider), retryable=True)
+        cooldown_until = self.state.get_active_provider_cooldown(provider)
+        if cooldown_until is not None:
+            raise ProviderError(
+                "review request provider {} is in cooldown until {}".format(provider, cooldown_until),
+                retryable=True,
+            )
+        if not self._acquire_provider_slot(provider, blocking=False):
+            raise ProviderError("review request provider capacity unavailable: {}".format(provider), retryable=True)
+
+        run_dir = str(
+            Path(self.config.service.state_dir)
+            / "runs"
+            / "comment-requests"
+            / _safe_path_segment(pr.repo_slug)
+            / str(pr.pr_id)
+            / "{}-{}".format(_safe_path_segment(comment_id), _safe_path_segment(updated_on))
+        )
+        try:
+            if provider == "codex":
+                return runner.classify_review_request(
+                    comment=body,
+                    model=request_config.model,
+                    reasoning_effort=request_config.effort,
+                    timeout_seconds=request_config.timeout_seconds,
+                    run_dir=run_dir,
+                    is_superseded=lambda: False,
+                )
+            if provider == "claude":
+                return runner.classify_review_request(
+                    comment=body,
+                    model=request_config.model,
+                    effort=request_config.effort,
+                    timeout_seconds=request_config.timeout_seconds,
+                    run_dir=run_dir,
+                    is_superseded=lambda: False,
+                )
+            raise ProviderError("unsupported review request provider: {}".format(provider), retryable=False)
+        except ProviderError as exc:
+            provider_cooldown_seconds = getattr(exc, "cooldown_seconds", None)
+            if provider_cooldown_seconds:
+                provider_status = exc.provider_status or PROVIDER_COOLDOWN_STATUS
+                cooldown_until = self.state.mark_provider_cooldown(
+                    provider,
+                    str(exc),
+                    provider_cooldown_seconds,
+                    provider_status,
+                )
+                LOG.warning(
+                    "provider cooldown set from review request classification provider=%s status=%s until=%s",
+                    provider,
+                    provider_status,
+                    cooldown_until,
+                )
+            raise
+        finally:
+            self._release_provider_slot(provider)
 
     def _is_ignored_source_branch(self, repo, source_branch: str) -> bool:
         for pattern in getattr(repo, "ignored_source_branches", ()):
@@ -416,42 +609,79 @@ class ScoutDaemon:
                 job.repo_slug,
                 job.pr_id,
             )
-            report_id = self.config.reports.report_id_for(job.provider)
-            report_title = self.config.reports.title_for(job.provider)
-            report = to_bitbucket_report(
-                validated,
-                report_title,
-                provider=job.provider,
-                model_metadata=_provider_model_metadata(job.provider, provider_config),
-            )
-            annotations = to_bitbucket_annotations(validated, provider=job.provider)
-            if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
-                raise ProviderSuperseded("review superseded before report publish")
-            self.bitbucket.publish_report(job.repo_slug, source_commit, report_id, report)
-            if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
-                raise ProviderSuperseded("review superseded before annotation publish")
-            self.bitbucket.publish_annotations(
-                job.repo_slug,
-                source_commit,
-                report_id,
-                annotations,
-                before_request=lambda: self._renew_publish_or_superseded(job),
-            )
-            pr_comment = to_pr_comment(
-                validated,
-                provider=job.provider,
-                source_commit=source_commit,
-                severities=_comment_severities(config=self.config),
-            )
-            if pr_comment:
+            output_mode = getattr(job, "output_mode", getattr(self.config.review, "output_mode", "reports"))
+            if output_mode == "inline_comments":
+                report_id = "inline-comments"
+                review_run_id = job.running_review_run_id or job.target_review_run_id
+                existing_markers = _inline_comment_markers_from_comments(
+                    self.bitbucket.list_pull_request_comments(
+                        job.repo_slug,
+                        job.pr_id,
+                        before_request=lambda: self._renew_publish_or_superseded(job),
+                    ),
+                    _trusted_bitbucket_comment_author(self.bitbucket),
+                )
+                for comment in to_inline_pr_comments(
+                    validated,
+                    provider=job.provider,
+                    source_commit=source_commit,
+                    review_run_id=review_run_id,
+                ):
+                    external_id = comment["external_id"]
+                    marker = _inline_comment_marker(external_id, review_run_id)
+                    if self.state.inline_comment_published(job, external_id):
+                        continue
+                    if marker in existing_markers:
+                        self.state.mark_inline_comment_published(job, external_id)
+                        continue
+                    if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
+                        raise ProviderSuperseded("review superseded before inline comment publish")
+                    self.bitbucket.publish_inline_pull_request_comment(
+                        job.repo_slug,
+                        job.pr_id,
+                        comment["path"],
+                        comment["line"],
+                        comment["content"],
+                        before_request=lambda: self._renew_publish_or_superseded(job),
+                    )
+                    self.state.mark_inline_comment_published(job, external_id)
+            else:
+                report_id = self.config.reports.report_id_for(job.provider)
+                report_title = self.config.reports.title_for(job.provider)
+                report = to_bitbucket_report(
+                    validated,
+                    report_title,
+                    provider=job.provider,
+                    model_metadata=_provider_model_metadata(job.provider, provider_config),
+                )
+                annotations = to_bitbucket_annotations(validated, provider=job.provider)
                 if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
-                    raise ProviderSuperseded("review superseded before PR comment publish")
-                self.bitbucket.publish_pull_request_comment(
+                    raise ProviderSuperseded("review superseded before report publish")
+                self.bitbucket.publish_report(job.repo_slug, source_commit, report_id, report)
+                if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
+                    raise ProviderSuperseded("review superseded before annotation publish")
+                self.bitbucket.publish_annotations(
                     job.repo_slug,
-                    job.pr_id,
-                    pr_comment,
+                    source_commit,
+                    report_id,
+                    annotations,
                     before_request=lambda: self._renew_publish_or_superseded(job),
                 )
+                pr_comment = to_pr_comment(
+                    validated,
+                    provider=job.provider,
+                    source_commit=source_commit,
+                    severities=_comment_severities(config=self.config),
+                )
+                if pr_comment:
+                    if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
+                        raise ProviderSuperseded("review superseded before PR comment publish")
+                    self.bitbucket.publish_pull_request_comment(
+                        job.repo_slug,
+                        job.pr_id,
+                        pr_comment,
+                        before_request=lambda: self._renew_publish_or_superseded(job),
+                    )
             if not self.state.mark_success(job, report_id):
                 raise ProviderSuperseded("review superseded before success mark")
             LOG.info("review job succeeded id=%s repo=%s pr=%s", job.id, job.repo_slug, job.pr_id)
@@ -800,6 +1030,66 @@ def _comment_severities(config: AppConfig):
     if bool(getattr(comments, "critical_enabled", True)):
         return ["CRITICAL"]
     return []
+
+
+def _comment_raw_content(comment: Dict[str, object]) -> str:
+    content = comment.get("content")
+    if not isinstance(content, dict):
+        return ""
+    raw = content.get("raw")
+    return raw if isinstance(raw, str) else ""
+
+
+def _safe_path_segment(value: str) -> str:
+    segment = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip(".-")
+    return segment[:80] or "unknown"
+
+
+def _inline_comment_marker(external_id: str, review_run_id: str) -> tuple:
+    return (str(external_id), str(review_run_id))
+
+
+def _trusted_bitbucket_comment_author(bitbucket) -> Optional[str]:
+    credentials = getattr(bitbucket, "credentials", None)
+    username = getattr(credentials, "username", None)
+    return str(username) if username else None
+
+
+def _inline_comment_markers_from_comments(comments, trusted_author: Optional[str] = None) -> set:
+    markers = set()
+    for comment in comments:
+        if not _comment_author_matches(comment, trusted_author):
+            continue
+        raw = _comment_raw_content(comment)
+        finding = _extract_backticked_marker(raw, "Scout finding:")
+        review_run = _extract_backticked_marker(raw, "Scout review run:")
+        if finding and review_run:
+            markers.add(_inline_comment_marker(finding, review_run))
+    return markers
+
+
+def _comment_author_matches(comment: Dict[str, object], trusted_author: Optional[str]) -> bool:
+    if not trusted_author:
+        return False
+    user = comment.get("user")
+    if not isinstance(user, dict):
+        return False
+    trusted = _normalize_bitbucket_user_id(trusted_author)
+    for field in ("account_id", "nickname", "username", "uuid"):
+        value = user.get(field)
+        if isinstance(value, str) and _normalize_bitbucket_user_id(value) == trusted:
+            return True
+    return False
+
+
+def _normalize_bitbucket_user_id(value: str) -> str:
+    return value.strip().strip("{}").lower()
+
+
+def _extract_backticked_marker(text: str, label: str) -> Optional[str]:
+    pattern = re.escape(label) + r"\s*`([^`]+)`"
+    match = re.search(pattern, text or "")
+    return match.group(1) if match else None
 
 
 def _reap_worker_futures(done, futures: dict) -> None:

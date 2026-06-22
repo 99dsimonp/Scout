@@ -160,6 +160,62 @@ class BitbucketClient:
             before_request()
         self._request_json("POST", self.base_url + path, body)
 
+    def list_pull_request_comments(
+        self,
+        repo_slug: str,
+        pr_id: int,
+        before_request: Optional[Callable[[], None]] = None,
+    ) -> List[Dict[str, Any]]:
+        fields = ",".join(
+            [
+                "values.id",
+                "values.content.raw",
+                "values.updated_on",
+                "values.deleted",
+                "values.inline",
+                "values.user.account_id",
+                "values.user.nickname",
+                "values.user.username",
+                "values.user.uuid",
+                "next",
+            ]
+        )
+        path = "/repositories/{}/{}/pullrequests/{}/comments?{}".format(
+            self.workspace,
+            repo_slug,
+            pr_id,
+            urlencode({"pagelen": "100", "fields": fields}),
+        )
+        url = self.base_url + path
+        comments: List[Dict[str, Any]] = []
+        while url:
+            if before_request is not None:
+                before_request()
+            payload = self._request_json("GET", url)
+            comments.extend(payload.get("values", []))
+            url = payload.get("next")
+        return comments
+
+    def publish_inline_pull_request_comment(
+        self,
+        repo_slug: str,
+        pr_id: int,
+        path: str,
+        line: int,
+        content: str,
+        before_request: Optional[Callable[[], None]] = None,
+    ) -> None:
+        body = {
+            "content": {"raw": content},
+            "inline": {"path": path, "to": line},
+        }
+        request_path = "/repositories/{}/{}/pullrequests/{}/comments".format(
+            self.workspace, repo_slug, pr_id
+        )
+        if before_request is not None:
+            before_request()
+        self._request_json("POST", self.base_url + request_path, body)
+
     def _parse_pr(self, repo_slug: str, item: Dict[str, Any]) -> PullRequest:
         source = item.get("source") or {}
         destination = item.get("destination") or {}

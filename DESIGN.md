@@ -295,7 +295,6 @@ clone_url = "git@bitbucket.org:my-workspace/repo-b.git"
 [polling]
 enabled = true
 interval_seconds = 600
-pagelen = 50
 
 [queue]
 max_parallel_reviews = 4
@@ -1074,6 +1073,24 @@ for multiple selected severities it starts with `Scout: Issues found by
 {provider}:`. Scout does not deduplicate these comments; each completed review
 run may leave a new PR comment so reviewers retain history after Code Insights
 reports move to a new commit.
+
+Scout also supports `review.output_mode = "inline_comments"` as an alternative
+to Code Insights report publishing. In this mode Scout reviews each non-draft PR
+once per provider/policy/schema and stores that PR-level review identity in
+SQLite, excluding source and target commit hashes. New commits update local PR
+metadata but do not enqueue another review. Developers can request a fresh
+review by mentioning `@scout` or `@Scout` in a PR comment; Scout first applies a
+case-insensitive mention prefilter, then classifies the comment with
+`[review.request_comments]` using the configured provider, model, effort, and
+timeout. Processed comment IDs plus `updated_on` values are stored so the same
+comment version is not handled repeatedly.
+
+Inline comment mode publishes no Code Insights report or annotation and ignores
+`[comments].severities` and `[comments].critical_enabled`. Every validated
+annotation is posted as one native Bitbucket inline code comment on
+`annotation.path` and `annotation.line`. If Bitbucket rejects the inline
+location, the job fails and follows normal retry handling; Scout does not fall
+back to a PR-level comment.
 
 Scout enforces `review.max_findings` during output validation. If the provider
 returns too many annotations, the review is rejected rather than truncated and

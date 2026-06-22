@@ -285,6 +285,110 @@ class BitbucketTests(unittest.TestCase):
         self.assertEqual(requests, ["POST"])
         self.assertEqual(heartbeats, ["renew"])
 
+    def test_list_pull_request_comments_paginates_with_required_fields(self):
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append(request.full_url)
+            if len(requests) == 1:
+                return FakeResponse(
+                    {
+                        "values": [
+                            {
+                                "id": 1,
+                                "content": {"raw": "@Scout review this"},
+                                "updated_on": "2026-06-22T10:00:00+00:00",
+                                "deleted": False,
+                                "inline": {"path": "src/app.py", "to": 12},
+                            }
+                        ],
+                        "next": "https://api.bitbucket.org/2.0/next-page",
+                    }
+                )
+            return FakeResponse(
+                {
+                    "values": [
+                        {
+                            "id": 2,
+                            "content": {"raw": "later"},
+                            "updated_on": "2026-06-22T10:01:00+00:00",
+                            "deleted": True,
+                        }
+                    ],
+                    "next": None,
+                }
+            )
+
+        client = BitbucketClient(
+            "https://api.bitbucket.org/2.0",
+            "ws",
+            BitbucketCredentials("alice", "secret"),
+        )
+        with patch("scout.bitbucket.urlopen", fake_urlopen):
+            comments = client.list_pull_request_comments("repo", 9)
+
+        self.assertEqual([comment["id"] for comment in comments], [1, 2])
+        self.assertEqual(requests[1], "https://api.bitbucket.org/2.0/next-page")
+        self.assertIn("values.content.raw", requests[0])
+        self.assertIn("values.updated_on", requests[0])
+        self.assertIn("values.deleted", requests[0])
+        self.assertIn("values.inline", requests[0])
+        self.assertIn("values.user.nickname", requests[0])
+        self.assertIn("values.user.account_id", requests[0])
+
+    def test_list_pull_request_comments_calls_before_request_for_each_page(self):
+        heartbeats = []
+
+        def fake_urlopen(request, timeout):
+            if len(heartbeats) == 1:
+                return FakeResponse({"values": [], "next": "https://api.bitbucket.org/2.0/next-page"})
+            return FakeResponse({"values": [], "next": None})
+
+        client = BitbucketClient(
+            "https://api.bitbucket.org/2.0",
+            "ws",
+            BitbucketCredentials("alice", "secret"),
+        )
+        with patch("scout.bitbucket.urlopen", fake_urlopen):
+            client.list_pull_request_comments(
+                "repo",
+                9,
+                before_request=lambda: heartbeats.append("renew"),
+            )
+
+        self.assertEqual(heartbeats, ["renew", "renew"])
+
+    def test_publish_inline_pull_request_comment_creates_inline_comment(self):
+        requests = []
+        heartbeats = []
+
+        def fake_urlopen(request, timeout):
+            requests.append((request.get_method(), request.full_url, request.data))
+            return FakeResponse({"id": 12})
+
+        client = BitbucketClient(
+            "https://api.bitbucket.org/2.0",
+            "ws",
+            BitbucketCredentials("alice", "secret"),
+        )
+        with patch("scout.bitbucket.urlopen", fake_urlopen):
+            client.publish_inline_pull_request_comment(
+                "repo",
+                9,
+                "src/app.py",
+                12,
+                "body",
+                before_request=lambda: heartbeats.append("renew"),
+            )
+
+        self.assertEqual([request[0] for request in requests], ["POST"])
+        self.assertTrue(requests[0][1].endswith("/pullrequests/9/comments"))
+        self.assertEqual(
+            json.loads(requests[0][2].decode("utf-8")),
+            {"content": {"raw": "body"}, "inline": {"path": "src/app.py", "to": 12}},
+        )
+        self.assertEqual(heartbeats, ["renew"])
+
 
 if __name__ == "__main__":
     unittest.main()

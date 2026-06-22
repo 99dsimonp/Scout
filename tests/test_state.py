@@ -1,6 +1,7 @@
 import tempfile
 import threading
 import unittest
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import scout.state as state_module
@@ -538,6 +539,198 @@ class StateTests(unittest.TestCase):
             self.assertEqual(job["target_source_commit_hash"], "a" * 40)
             self.assertEqual(job["running_source_commit_hash"], "a" * 40)
 
+    def test_inline_review_identity_does_not_change_on_new_commit_after_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            pr1 = PullRequest(
+                workspace="ws",
+                repo_slug="repo",
+                pr_id=1,
+                title="PR",
+                description="",
+                source_branch="feature",
+                source_commit_hash="a" * 40,
+                destination_branch="main",
+                destination_commit_hash="d" * 40,
+                merge_base_hash="m" * 40,
+            )
+            pr2 = PullRequest(
+                workspace="ws",
+                repo_slug="repo",
+                pr_id=1,
+                title="PR",
+                description="",
+                source_branch="feature",
+                source_commit_hash="b" * 40,
+                destination_branch="main",
+                destination_commit_hash="e" * 40,
+                merge_base_hash="n" * 40,
+            )
+            self.assertTrue(
+                store.enqueue_or_update_pr(pr1, "v1", "v1", "codex", output_mode="inline_comments")
+            )
+            job = store.claim_pending_jobs(1, 1200)[0]
+            self.assertTrue(store.mark_publishing(job, 1200))
+            self.assertTrue(store.mark_success(job, "inline-comments"))
+
+            self.assertFalse(
+                store.enqueue_or_update_pr(pr2, "v1", "v1", "codex", output_mode="inline_comments")
+            )
+            self.assertTrue(store.has_review_for_key(pr2, "v1", "v1", "codex", "inline_comments"))
+            self.assertEqual(store.claim_pending_jobs(10, 1200), [])
+
+    def test_force_enqueue_inline_review_reruns_without_auto_requeue_on_new_commits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            pr1 = PullRequest(
+                workspace="ws",
+                repo_slug="repo",
+                pr_id=1,
+                title="PR",
+                description="",
+                source_branch="feature",
+                source_commit_hash="a" * 40,
+                destination_branch="main",
+            )
+            pr2 = PullRequest(
+                workspace="ws",
+                repo_slug="repo",
+                pr_id=1,
+                title="PR",
+                description="",
+                source_branch="feature",
+                source_commit_hash="b" * 40,
+                destination_branch="main",
+            )
+            pr3 = PullRequest(
+                workspace="ws",
+                repo_slug="repo",
+                pr_id=1,
+                title="PR",
+                description="",
+                source_branch="feature",
+                source_commit_hash="c" * 40,
+                destination_branch="main",
+            )
+            store.seed_successful_review(
+                pr1,
+                "v1",
+                "v1",
+                "codex",
+                "inline-comments",
+                output_mode="inline_comments",
+            )
+
+            self.assertFalse(
+                store.enqueue_or_update_pr(pr2, "v1", "v1", "codex", output_mode="inline_comments")
+            )
+            self.assertTrue(
+                store.force_enqueue_pr_review(pr2, "v1", "v1", "codex", output_mode="inline_comments")
+            )
+            rerun = store.claim_pending_jobs(1, 1200)[0]
+            self.assertEqual(rerun.output_mode, "inline_comments")
+            self.assertEqual(rerun.running_source_commit_hash, "b" * 40)
+            self.assertTrue(store.mark_publishing(rerun, 1200))
+            self.assertTrue(store.mark_success(rerun, "inline-comments"))
+
+            self.assertFalse(
+                store.enqueue_or_update_pr(pr3, "v1", "v1", "codex", output_mode="inline_comments")
+            )
+            self.assertEqual(store.claim_pending_jobs(10, 1200), [])
+
+    def test_inline_forced_rerun_pending_job_updates_to_latest_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            pr1 = PullRequest(
+                workspace="ws",
+                repo_slug="repo",
+                pr_id=1,
+                title="PR",
+                description="",
+                source_branch="feature",
+                source_commit_hash="a" * 40,
+                destination_branch="main",
+            )
+            pr2 = PullRequest(
+                workspace="ws",
+                repo_slug="repo",
+                pr_id=1,
+                title="PR",
+                description="",
+                source_branch="feature",
+                source_commit_hash="b" * 40,
+                destination_branch="main",
+            )
+            pr3 = PullRequest(
+                workspace="ws",
+                repo_slug="repo",
+                pr_id=1,
+                title="PR",
+                description="",
+                source_branch="feature",
+                source_commit_hash="c" * 40,
+                destination_branch="main",
+            )
+            store.seed_successful_review(
+                pr1,
+                "v1",
+                "v1",
+                "codex",
+                "inline-comments",
+                output_mode="inline_comments",
+            )
+            self.assertTrue(
+                store.force_enqueue_pr_review(pr2, "v1", "v1", "codex", output_mode="inline_comments")
+            )
+
+            self.assertFalse(
+                store.enqueue_or_update_pr(pr3, "v1", "v1", "codex", output_mode="inline_comments")
+            )
+            rerun = store.claim_pending_jobs(1, 1200)[0]
+
+            self.assertEqual(rerun.running_source_commit_hash, "c" * 40)
+
+    def test_processed_pull_request_comments_track_review_request_by_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+
+            self.assertIsNone(
+                store.processed_pull_request_comment_review_requested(
+                    "ws", "repo", 1, "comment-1", "2026-01-01T00:00:00+00:00"
+                )
+            )
+            store.mark_pull_request_comment_processed(
+                "ws",
+                "repo",
+                1,
+                "comment-1",
+                "2026-01-01T00:00:00+00:00",
+                review_requested=True,
+            )
+            store.mark_pull_request_comment_processed(
+                "ws",
+                "repo",
+                1,
+                "comment-1",
+                "2026-01-02T00:00:00+00:00",
+                review_requested=False,
+            )
+
+            self.assertTrue(
+                store.processed_pull_request_comment_review_requested(
+                    "ws", "repo", 1, "comment-1", "2026-01-01T00:00:00+00:00"
+                )
+            )
+            self.assertFalse(
+                store.processed_pull_request_comment_review_requested(
+                    "ws", "repo", 1, "comment-1", "2026-01-02T00:00:00+00:00"
+                )
+            )
+
     def test_new_target_commit_resets_attempts(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(tmp + "/state.db")
@@ -632,6 +825,94 @@ class StateTests(unittest.TestCase):
             self.assertIsNone(current.leased_until)
             self.assertIsNone(current.lease_token)
             self.assertEqual(current.error_message, "legacy permanent failure")
+
+    def test_initialize_migrates_legacy_review_jobs_for_inline_mode_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = tmp + "/state.db"
+            with sqlite3.connect(db_path) as conn:
+                conn.executescript(
+                    """
+                    create table review_jobs (
+                      id integer primary key,
+                      workspace text not null,
+                      repo_slug text not null,
+                      pr_id integer not null,
+                      title text,
+                      description text,
+                      source_branch text,
+                      target_source_commit_hash text not null,
+                      running_source_commit_hash text,
+                      destination_branch text,
+                      destination_commit_hash text,
+                      merge_base_hash text,
+                      reviewer_policy_version text not null,
+                      schema_version text not null,
+                      provider text not null,
+                      status text not null,
+                      superseded integer not null default 0,
+                      attempts integer not null default 0,
+                      leased_until text,
+                      lease_token text,
+                      target_review_key text not null,
+                      running_review_key text,
+                      error_message text,
+                      created_at text not null,
+                      updated_at text not null,
+                      unique(workspace, repo_slug, pr_id, reviewer_policy_version, schema_version, provider)
+                    );
+                    insert into review_jobs(
+                      workspace, repo_slug, pr_id, title, description,
+                      source_branch, target_source_commit_hash, running_source_commit_hash,
+                      destination_branch, destination_commit_hash, merge_base_hash,
+                      reviewer_policy_version, schema_version, provider, status,
+                      target_review_key, running_review_key, created_at, updated_at
+                    )
+                    values(
+                      'ws', 'repo', 1, 'PR', '',
+                      'feature', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                      'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                      'main', null, null, 'v1', 'v1', 'codex', 'succeeded',
+                      'legacy-key', 'legacy-key', '2026-01-01T00:00:00+00:00',
+                      '2026-01-01T00:00:00+00:00'
+                    );
+                    """
+                )
+
+            store = StateStore(db_path)
+            store.initialize()
+
+            with store.connect() as conn:
+                migrated = conn.execute(
+                    """
+                    select output_mode, target_review_run_id, running_review_run_id
+                    from review_jobs
+                    where id=1
+                    """
+                ).fetchone()
+                conn.execute(
+                    """
+                    insert into review_jobs(
+                      workspace, repo_slug, pr_id, title, description,
+                      source_branch, target_source_commit_hash,
+                      destination_branch, reviewer_policy_version,
+                      schema_version, provider, output_mode, status,
+                      target_review_key, target_review_run_id, created_at, updated_at
+                    )
+                    values(
+                      'ws', 'repo', 1, 'PR', '',
+                      'feature', 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                      'main', 'v1', 'v1', 'codex', 'inline_comments', 'pending',
+                      'inline-key', 'inline-run', '2026-01-01T00:00:00+00:00',
+                      '2026-01-01T00:00:00+00:00'
+                    )
+                    """
+                )
+                count = conn.execute("select count(*) from review_jobs").fetchone()[0]
+
+            self.assertEqual(migrated["output_mode"], "reports")
+            self.assertTrue(migrated["target_review_run_id"])
+            self.assertEqual(migrated["running_review_run_id"], migrated["target_review_run_id"])
+            self.assertEqual(count, 2)
 
     def test_concurrent_claims_select_distinct_pending_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:

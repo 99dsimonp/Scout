@@ -78,6 +78,13 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--model") + 1], "claude-sonnet-4-6")
         self.assertEqual(cmd[cmd.index("--effort") + 1], "low")
 
+    def test_build_comment_request_command_uses_classifier_model_and_effort(self):
+        runner = ClaudeRunner(claude_config(model="claude-sonnet-4-6", effort="max"), CredentialStore("/tmp/unused"))
+        cmd = runner.build_comment_request_command('{"type":"object"}', model="claude-sonnet-4-6", effort="low")
+        self.assertEqual(cmd[cmd.index("--disallowedTools") + 1], CLAUDE_DENIED_TOOLS)
+        self.assertEqual(cmd[cmd.index("--model") + 1], "claude-sonnet-4-6")
+        self.assertEqual(cmd[cmd.index("--effort") + 1], "low")
+
     def test_assess_risk_passes_description_on_stdin_and_parses_result(self):
         with tempfile.TemporaryDirectory() as tmp:
             command = Path(tmp) / "fake-claude"
@@ -115,6 +122,45 @@ JSON
             self.assertEqual(risk, "low")
             self.assertIn("Docs only", stdin_capture.read_text(encoding="utf-8"))
             self.assertNotIn("Docs only", argv_capture.read_text(encoding="utf-8"))
+
+    def test_classify_review_request_passes_comment_on_stdin_and_parses_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command = Path(tmp) / "fake-claude"
+            stdin_capture = Path(tmp) / "stdin.txt"
+            argv_capture = Path(tmp) / "argv.txt"
+            command.write_text(
+                """#!/bin/sh
+cat > '"""
+                + str(stdin_capture)
+                + """'
+printf '%s\n' "$@" > '"""
+                + str(argv_capture)
+                + """'
+cat <<'JSON'
+{"type":"result","is_error":false,"result":"{\\"review_requested\\":true,\\"reason\\":\\"explicit request\\"}"}
+JSON
+""",
+                encoding="utf-8",
+            )
+            command.chmod(0o755)
+            runner = ClaudeRunner(
+                claude_config(command=str(command), timeout_seconds=5),
+                CredentialStore("/tmp/unused"),
+            )
+
+            result = runner.classify_review_request(
+                comment="@Scout please review",
+                model="claude-sonnet-4-6",
+                effort="low",
+                timeout_seconds=5,
+                run_dir=str(Path(tmp) / "comment-request"),
+                is_superseded=lambda: False,
+            )
+
+            self.assertTrue(result.review_requested)
+            self.assertEqual(result.reason, "explicit request")
+            self.assertIn("@Scout please review", stdin_capture.read_text(encoding="utf-8"))
+            self.assertNotIn("@Scout please review", argv_capture.read_text(encoding="utf-8"))
 
     def test_api_auth_env_uses_anthropic_api_key_and_configured_home(self):
         with tempfile.TemporaryDirectory() as tmp:

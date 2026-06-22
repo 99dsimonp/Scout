@@ -163,6 +163,29 @@ def to_critical_pr_comment(
     return to_pr_comment(review, provider=provider, source_commit=source_commit, severities=("CRITICAL",))
 
 
+def to_inline_pr_comments(
+    review: ValidatedReview,
+    provider: str = "codex",
+    source_commit: str = "",
+    review_run_id: str = "",
+) -> List[Dict[str, Any]]:
+    provider_label = _provider_label(provider)
+    comments = []
+    for annotation in sorted(
+        review.annotations,
+        key=lambda item: (item["path"], item["line"], item["external_id"]),
+    ):
+        comments.append(
+            {
+                "external_id": annotation["external_id"],
+                "path": annotation["path"],
+                "line": annotation["line"],
+                "content": _format_inline_comment(annotation, provider_label, source_commit, review_run_id),
+            }
+        )
+    return comments
+
+
 def summarize_findings(review: ValidatedReview) -> Dict[str, Any]:
     by_reviewer = {reviewer: 0 for reviewer in REVIEWER_ORDER}
     by_severity = {severity: 0 for severity in SEVERITY_ORDER}
@@ -338,6 +361,48 @@ def _format_details(annotation: Dict[str, Any], provider_label: str) -> str:
         "Suggested fix:\n{smallest_fix}\n\n"
         "Reviewer: {provider} / {reviewer} / {confidence} confidence"
     ).format(provider=provider_label, **annotation)
+
+
+def _format_inline_comment(
+    annotation: Dict[str, Any],
+    provider_label: str,
+    source_commit: str,
+    review_run_id: str,
+) -> str:
+    lines = [
+        "**Scout: {} issue found by {}**".format(
+            _sentence_case(annotation["severity"]),
+            provider_label,
+        ),
+        "",
+    ]
+    if source_commit:
+        lines.extend(["Commit: `{}`".format(source_commit[:12]), ""])
+    lines.extend(
+        [
+            "**{}**".format(annotation["summary"]),
+            "",
+            "Reviewer: {} / {} confidence".format(
+                _reviewer_label(annotation["reviewer"]),
+                annotation["confidence"],
+            ),
+            "",
+            "Scout finding: `{}`".format(annotation["external_id"]),
+        ]
+    )
+    if review_run_id:
+        lines.extend(["Scout review run: `{}`".format(review_run_id)])
+    lines.extend(
+        [
+            "",
+            "Why it matters:",
+            annotation["details"],
+            "",
+            "Smallest fix:",
+            annotation["smallest_fix"],
+        ]
+    )
+    return _truncate("\n".join(lines).rstrip(), BITBUCKET_COMMENT_MAX_LENGTH)
 
 
 def _provider_label(provider: str) -> str:
