@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 from copy import deepcopy
 from dataclasses import dataclass
@@ -373,9 +372,6 @@ def _format_inline_comment(
     source_commit: str,
     review_run_id: str,
 ) -> str:
-    marker_lines = [_hidden_inline_marker("scout-finding", annotation["external_id"])]
-    if review_run_id:
-        marker_lines.append(_hidden_inline_marker("scout-review-run", review_run_id))
     body = "\n".join(
         [
             "**{}**".format(annotation["summary"]),
@@ -397,33 +393,24 @@ def _format_inline_comment(
     if isinstance(suggested_change, dict) and isinstance(suggested_change.get("replacement"), str):
         replacement = suggested_change["replacement"]
         suggestion = "\n\nSuggested change:\n\n```suggestion\n{}\n```".format(replacement)
-        content_with_suggestion = _format_inline_comment_parts(marker_lines, body + suggestion, footer)
+        content_with_suggestion = _format_inline_comment_parts(body + suggestion, footer)
         if len(content_with_suggestion) <= BITBUCKET_COMMENT_MAX_LENGTH:
             return content_with_suggestion
-    return _format_inline_comment_parts(marker_lines, body, footer, limit=BITBUCKET_COMMENT_MAX_LENGTH)
-
-
-def _hidden_inline_marker(label: str, value: str) -> str:
-    encoded = base64.b64encode(str(value).encode("utf-8")).decode("ascii")
-    return "<!-- {}: {} -->".format(label, encoded)
+    return _format_inline_comment_parts(body, footer, limit=BITBUCKET_COMMENT_MAX_LENGTH)
 
 
 def _format_inline_comment_parts(
-    marker_lines: List[str],
     body: str,
     footer: str,
     limit: Optional[int] = None,
 ) -> str:
-    prefix = ""
-    if marker_lines:
-        prefix = "\n".join(marker_lines) + "\n\n"
     suffix = "\n\n" + footer
-    if limit is None or len(prefix) + len(body) + len(suffix) <= limit:
-        return prefix + body + suffix
-    body_limit = limit - len(prefix) - len(suffix)
+    if limit is None or len(body) + len(suffix) <= limit:
+        return body + suffix
+    body_limit = limit - len(suffix)
     if body_limit <= 0:
-        return _truncate(prefix + footer, limit)
-    return prefix + _truncate(body, body_limit) + suffix
+        return _truncate(footer, limit)
+    return _truncate(body, body_limit) + suffix
 
 
 def _provider_label(provider: str) -> str:

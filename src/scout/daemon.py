@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
@@ -614,14 +613,6 @@ class ScoutDaemon:
             if output_mode == "inline_comments":
                 report_id = "inline-comments"
                 review_run_id = job.running_review_run_id or job.target_review_run_id
-                existing_markers = _inline_comment_markers_from_comments(
-                    self.bitbucket.list_pull_request_comments(
-                        job.repo_slug,
-                        job.pr_id,
-                        before_request=lambda: self._renew_publish_or_superseded(job),
-                    ),
-                    _trusted_bitbucket_comment_author(self.bitbucket),
-                )
                 for comment in to_inline_pr_comments(
                     validated,
                     provider=job.provider,
@@ -629,11 +620,7 @@ class ScoutDaemon:
                     review_run_id=review_run_id,
                 ):
                     external_id = comment["external_id"]
-                    marker = _inline_comment_marker(external_id, review_run_id)
                     if self.state.inline_comment_published(job, external_id):
-                        continue
-                    if marker in existing_markers:
-                        self.state.mark_inline_comment_published(job, external_id)
                         continue
                     if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
                         raise ProviderSuperseded("review superseded before inline comment publish")
@@ -1044,70 +1031,6 @@ def _comment_raw_content(comment: Dict[str, object]) -> str:
 def _safe_path_segment(value: str) -> str:
     segment = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip(".-")
     return segment[:80] or "unknown"
-
-
-def _inline_comment_marker(external_id: str, review_run_id: str) -> tuple:
-    return (str(external_id), str(review_run_id))
-
-
-def _trusted_bitbucket_comment_author(bitbucket) -> Optional[str]:
-    credentials = getattr(bitbucket, "credentials", None)
-    username = getattr(credentials, "username", None)
-    return str(username) if username else None
-
-
-def _inline_comment_markers_from_comments(comments, trusted_author: Optional[str] = None) -> set:
-    markers = set()
-    for comment in comments:
-        if not _comment_author_matches(comment, trusted_author):
-            continue
-        raw = _comment_raw_content(comment)
-        finding = (
-            _extract_hidden_inline_marker(raw, "scout-finding")
-            or _extract_backticked_marker(raw, "Scout finding:")
-        )
-        review_run = (
-            _extract_hidden_inline_marker(raw, "scout-review-run")
-            or _extract_backticked_marker(raw, "Scout review run:")
-        )
-        if finding and review_run:
-            markers.add(_inline_comment_marker(finding, review_run))
-    return markers
-
-
-def _comment_author_matches(comment: Dict[str, object], trusted_author: Optional[str]) -> bool:
-    if not trusted_author:
-        return False
-    user = comment.get("user")
-    if not isinstance(user, dict):
-        return False
-    trusted = _normalize_bitbucket_user_id(trusted_author)
-    for field in ("account_id", "nickname", "username", "uuid"):
-        value = user.get(field)
-        if isinstance(value, str) and _normalize_bitbucket_user_id(value) == trusted:
-            return True
-    return False
-
-
-def _normalize_bitbucket_user_id(value: str) -> str:
-    return value.strip().strip("{}").lower()
-
-
-def _extract_backticked_marker(text: str, label: str) -> Optional[str]:
-    pattern = re.escape(label) + r"\s*`([^`]+)`"
-    match = re.search(pattern, text or "")
-    return match.group(1) if match else None
-
-
-def _extract_hidden_inline_marker(text: str, label: str) -> Optional[str]:
-    pattern = r"<!--\s*" + re.escape(label) + r"\s*:\s*([A-Za-z0-9+/=]+)\s*-->"
-    match = re.search(pattern, text or "")
-    if not match:
-        return None
-    try:
-        return base64.b64decode(match.group(1).encode("ascii"), validate=True).decode("utf-8")
-    except (ValueError, UnicodeDecodeError):
-        return None
 
 
 def _reap_worker_futures(done, futures: dict) -> None:

@@ -235,8 +235,8 @@ class SchemaTests(unittest.TestCase):
         self.assertNotIn("Commit:", comments[0]["content"])
         self.assertNotIn("Scout finding:", comments[0]["content"])
         self.assertNotIn("Scout review run:", comments[0]["content"])
-        self.assertIn("<!-- scout-finding: ", comments[0]["content"])
-        self.assertIn("<!-- scout-review-run: ", comments[0]["content"])
+        self.assertNotIn("<!-- scout-finding:", comments[0]["content"])
+        self.assertNotIn("<!-- scout-review-run:", comments[0]["content"])
         self.assertNotIn("finding-001", comments[0]["content"])
 
     def test_suggested_change_renders_only_in_inline_pr_comments(self):

@@ -11,7 +11,6 @@ from scout.daemon import (
     _append_provider_usage_log_entry,
     _append_review_log_entry,
     _format_provider_model_metadata,
-    _inline_comment_markers_from_comments,
     _lease_seconds,
     _provider_usage_log_entry,
     _review_log_entry,
@@ -178,25 +177,6 @@ class DaemonReviewLogTests(unittest.TestCase):
 
         self.assertEqual(futures, {})
         self.assertTrue(any("review worker failed unexpectedly job=7" in message for message in logs.output))
-
-    def test_inline_comment_markers_extract_hidden_metadata(self):
-        comments = [
-            {
-                "content": {
-                    "raw": (
-                        "<!-- scout-finding: ZmluZGluZy0wMDE= -->\n"
-                        "<!-- scout-review-run: cnVu -->\n\n"
-                        "**High issue**\n\n"
-                        "Scout: High issue found by Codex. Reviewer: Correctness / HIGH confidence"
-                    ),
-                },
-                "user": {"nickname": "scout-bot"},
-            }
-        ]
-
-        markers = _inline_comment_markers_from_comments(comments, "scout-bot")
-
-        self.assertEqual(markers, {("finding-001", "run")})
 
     def test_seconds_until_next_poll_uses_remaining_interval_after_worker_completion(self):
         self.assertEqual(_seconds_until_next_poll(1600.0, 1000.0), 600.0)
@@ -1436,7 +1416,7 @@ class DaemonReviewLogTests(unittest.TestCase):
             self.assertEqual(daemon.bitbucket.operations, ["inline_comment", "inline_comment"])
             self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
 
-    def test_run_job_inline_mode_deduplicates_existing_retry_comment(self):
+    def test_run_job_inline_mode_deduplicates_from_publication_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             daemon = ScoutDaemon.__new__(ScoutDaemon)
             daemon.config = SimpleNamespace(
@@ -1499,27 +1479,18 @@ class DaemonReviewLogTests(unittest.TestCase):
                 }
             )
             daemon.providers = {"codex": provider}
-            daemon.state = _FakeRunJobState()
+            daemon.state = _FakeRunJobState(published_inline_comments={"finding-001"})
             daemon.git = _FakeGit()
             daemon.bitbucket = _FakeBitbucket()
-            daemon.bitbucket.inline_comments.append(
-                (
-                    "repo",
-                    13,
-                    "src/app.py",
-                    12,
-                    "Scout finding: `finding-001`\nScout review run: `run`",
-                )
-            )
             daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
 
             daemon.run_job(review_job(provider="codex", job_id=16, output_mode="inline_comments"))
 
-            self.assertEqual(len(daemon.bitbucket.inline_comments), 1)
+            self.assertEqual(len(daemon.bitbucket.inline_comments), 0)
             self.assertEqual(daemon.bitbucket.operations, [])
             self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
 
-    def test_run_job_inline_mode_does_not_deduplicate_user_forged_marker(self):
+    def test_run_job_inline_mode_ignores_existing_comment_text_for_dedupe(self):
         with tempfile.TemporaryDirectory() as tmp:
             daemon = ScoutDaemon.__new__(ScoutDaemon)
             daemon.config = SimpleNamespace(
@@ -1588,7 +1559,7 @@ class DaemonReviewLogTests(unittest.TestCase):
             daemon.bitbucket.existing_comments.append(
                 {
                     "content": {
-                        "raw": "Scout finding: `finding-001`\nScout review run: `run`",
+                        "raw": "Scout: High issue found by Codex. Reviewer: Correctness / HIGH confidence",
                     },
                     "user": {"nickname": "alice"},
                 }
@@ -1877,13 +1848,15 @@ class _FakeReports:
 
 
 class _FakeRunJobState:
-    def __init__(self, cooldowns=None):
+    def __init__(self, cooldowns=None, published_inline_comments=None):
         self.publishing_leases = []
         self.renewals = []
         self.successes = []
         self.retryable_failures = []
         self.cooldowns = dict(cooldowns or {})
         self.marked_provider_cooldowns = []
+        self.published_inline_comments = set(published_inline_comments or ())
+        self.marked_inline_comments = []
 
     def get_active_provider_cooldown(self, provider):
         return self.cooldowns.get(provider)
@@ -1927,10 +1900,11 @@ class _FakeRunJobState:
         pass
 
     def inline_comment_published(self, job, external_id):
-        return False
+        return external_id in self.published_inline_comments
 
     def mark_inline_comment_published(self, job, external_id):
-        pass
+        self.marked_inline_comments.append(external_id)
+        self.published_inline_comments.add(external_id)
 
 
 class _FakeGit:
