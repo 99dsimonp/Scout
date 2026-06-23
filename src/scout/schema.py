@@ -19,6 +19,7 @@ SEVERITIES = set(SEVERITY_ORDER)
 REVIEWER_ORDER = ["correctness", "security", "tests", "performance", "best-practices"]
 REVIEWERS = set(REVIEWER_ORDER)
 CONFIDENCE = {"HIGH", "MEDIUM", "LOW"}
+INTERNAL_EXTERNAL_ID_PREFIX = "__scout_"
 BITBUCKET_REPORT_DETAILS_MAX_LENGTH = 2000
 BITBUCKET_COMMENT_MAX_LENGTH = 8000
 
@@ -163,6 +164,13 @@ def to_critical_pr_comment(
     return to_pr_comment(review, provider=provider, source_commit=source_commit, severities=("CRITICAL",))
 
 
+def to_no_findings_pr_comment(review: ValidatedReview, provider: str = "codex") -> str:
+    if review.annotations:
+        return ""
+    provider_label = _provider_label(provider)
+    return "Scout: {} reviewed this pull request and found no material issues.".format(provider_label)
+
+
 def to_inline_pr_comments(
     review: ValidatedReview,
     provider: str = "codex",
@@ -275,6 +283,10 @@ def _validate_annotations(value: Any, max_findings: int) -> List[Dict[str, Any]]
         _require_keys(item, required, label)
         _reject_extra_keys(item, allowed, label)
         external_id = _nonempty_string(item["external_id"], "{}.external_id".format(label))
+        if external_id.startswith(INTERNAL_EXTERNAL_ID_PREFIX):
+            raise ReviewValidationError(
+                "{} must not use reserved Scout prefix: {}".format(label, INTERNAL_EXTERNAL_ID_PREFIX)
+            )
         if external_id in seen_external_ids:
             raise ReviewValidationError("duplicate annotation external_id: {}".format(external_id))
         seen_external_ids.add(external_id)

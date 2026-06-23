@@ -1416,6 +1416,277 @@ class DaemonReviewLogTests(unittest.TestCase):
             self.assertEqual(daemon.bitbucket.operations, ["inline_comment", "inline_comment"])
             self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
 
+    def test_run_job_inline_mode_comments_when_no_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                queue=SimpleNamespace(
+                    job_timeout_seconds=1200,
+                    max_attempts=3,
+                    retry_backoff_seconds=300,
+                ),
+                review=SimpleNamespace(
+                    policy_version="v1",
+                    schema_path="/tmp/schema.json",
+                    max_findings=100,
+                    output_mode="inline_comments",
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                ),
+                service=SimpleNamespace(state_dir=tmp),
+                reports=_FakeReports(),
+                comments=SimpleNamespace(severities=[]),
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1200,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                    subagent_max_per_lens=2,
+                ),
+            }
+            provider = _FakeProvider(
+                {
+                    "recommendation": "approve",
+                    "report": {
+                        "title": "Codex PR Review",
+                        "details": "No issues.",
+                        "report_type": "BUG",
+                        "reporter": "scout",
+                        "data": [],
+                    },
+                    "annotations": [],
+                }
+            )
+            daemon.providers = {"codex": provider}
+            daemon.state = _FakeRunJobState()
+            daemon.git = _FakeGit()
+            daemon.bitbucket = _FakeBitbucket()
+            daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
+
+            daemon.run_job(review_job(provider="codex", job_id=18, output_mode="inline_comments"))
+
+            self.assertEqual(daemon.bitbucket.reports, [])
+            self.assertEqual(daemon.bitbucket.annotations, [])
+            self.assertEqual(daemon.bitbucket.inline_comments, [])
+            self.assertEqual(
+                daemon.bitbucket.comments,
+                [("repo", 13, "Scout: Codex reviewed this pull request and found no material issues.")],
+            )
+            self.assertEqual(daemon.bitbucket.operations, ["comment"])
+            self.assertEqual(daemon.state.marked_inline_comments, ["__scout_no_findings__"])
+            self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
+
+    def test_run_job_inline_mode_deduplicates_no_findings_comment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                queue=SimpleNamespace(
+                    job_timeout_seconds=1200,
+                    max_attempts=3,
+                    retry_backoff_seconds=300,
+                ),
+                review=SimpleNamespace(
+                    policy_version="v1",
+                    schema_path="/tmp/schema.json",
+                    max_findings=100,
+                    output_mode="inline_comments",
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                ),
+                service=SimpleNamespace(state_dir=tmp),
+                reports=_FakeReports(),
+                comments=SimpleNamespace(severities=[]),
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1200,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                    subagent_max_per_lens=2,
+                ),
+            }
+            provider = _FakeProvider(
+                {
+                    "recommendation": "approve",
+                    "report": {
+                        "title": "Codex PR Review",
+                        "details": "No issues.",
+                        "report_type": "BUG",
+                        "reporter": "scout",
+                        "data": [],
+                    },
+                    "annotations": [],
+                }
+            )
+            daemon.providers = {"codex": provider}
+            daemon.state = _FakeRunJobState(published_inline_comments={"__scout_no_findings__"})
+            daemon.git = _FakeGit()
+            daemon.bitbucket = _FakeBitbucket()
+            daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
+
+            daemon.run_job(review_job(provider="codex", job_id=19, output_mode="inline_comments"))
+
+            self.assertEqual(daemon.bitbucket.comments, [])
+            self.assertEqual(daemon.bitbucket.inline_comments, [])
+            self.assertEqual(daemon.bitbucket.operations, [])
+            self.assertEqual(daemon.state.marked_inline_comments, [])
+            self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
+
+    def test_run_job_inline_mode_deduplicates_existing_no_findings_comment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                queue=SimpleNamespace(
+                    job_timeout_seconds=1200,
+                    max_attempts=3,
+                    retry_backoff_seconds=300,
+                ),
+                review=SimpleNamespace(
+                    policy_version="v1",
+                    schema_path="/tmp/schema.json",
+                    max_findings=100,
+                    output_mode="inline_comments",
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                ),
+                service=SimpleNamespace(state_dir=tmp),
+                reports=_FakeReports(),
+                comments=SimpleNamespace(severities=[]),
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1200,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                    subagent_max_per_lens=2,
+                ),
+            }
+            provider = _FakeProvider(
+                {
+                    "recommendation": "approve",
+                    "report": {
+                        "title": "Codex PR Review",
+                        "details": "No issues.",
+                        "report_type": "BUG",
+                        "reporter": "scout",
+                        "data": [],
+                    },
+                    "annotations": [],
+                }
+            )
+            daemon.providers = {"codex": provider}
+            daemon.state = _FakeRunJobState()
+            daemon.git = _FakeGit()
+            daemon.bitbucket = _FakeBitbucket()
+            daemon.bitbucket.existing_comments.append(
+                {
+                    "content": {
+                        "raw": "Scout: Codex reviewed this pull request and found no material issues.",
+                    },
+                    "user": {"nickname": "scout-bot"},
+                }
+            )
+            daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
+
+            daemon.run_job(review_job(provider="codex", job_id=20, output_mode="inline_comments"))
+
+            self.assertEqual(daemon.bitbucket.comments, [])
+            self.assertEqual(daemon.bitbucket.inline_comments, [])
+            self.assertEqual(daemon.bitbucket.operations, [])
+            self.assertEqual(daemon.state.marked_inline_comments, ["__scout_no_findings__"])
+            self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
+
+    def test_run_job_inline_mode_ignores_user_no_findings_comment_for_dedupe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                queue=SimpleNamespace(
+                    job_timeout_seconds=1200,
+                    max_attempts=3,
+                    retry_backoff_seconds=300,
+                ),
+                review=SimpleNamespace(
+                    policy_version="v1",
+                    schema_path="/tmp/schema.json",
+                    max_findings=100,
+                    output_mode="inline_comments",
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                ),
+                service=SimpleNamespace(state_dir=tmp),
+                reports=_FakeReports(),
+                comments=SimpleNamespace(severities=[]),
+            )
+            daemon.provider_configs = {
+                "codex": SimpleNamespace(
+                    max_parallel=1,
+                    timeout_seconds=1200,
+                    max_subagents=20,
+                    subagent_small_loc_limit=150,
+                    subagent_medium_loc_limit=600,
+                    subagent_large_loc_limit=1500,
+                    subagent_high_risk_bonus=0,
+                    subagent_max_per_lens=2,
+                ),
+            }
+            provider = _FakeProvider(
+                {
+                    "recommendation": "approve",
+                    "report": {
+                        "title": "Codex PR Review",
+                        "details": "No issues.",
+                        "report_type": "BUG",
+                        "reporter": "scout",
+                        "data": [],
+                    },
+                    "annotations": [],
+                }
+            )
+            daemon.providers = {"codex": provider}
+            daemon.state = _FakeRunJobState()
+            daemon.git = _FakeGit()
+            daemon.bitbucket = _FakeBitbucket()
+            daemon.bitbucket.existing_comments.append(
+                {
+                    "content": {
+                        "raw": "Scout: Codex reviewed this pull request and found no material issues.",
+                    },
+                    "user": {"nickname": "alice"},
+                }
+            )
+            daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
+
+            daemon.run_job(review_job(provider="codex", job_id=21, output_mode="inline_comments"))
+
+            self.assertEqual(
+                daemon.bitbucket.comments,
+                [("repo", 13, "Scout: Codex reviewed this pull request and found no material issues.")],
+            )
+            self.assertEqual(daemon.bitbucket.operations, ["comment"])
+            self.assertEqual(daemon.state.marked_inline_comments, ["__scout_no_findings__"])
+            self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
+
     def test_run_job_inline_mode_deduplicates_from_publication_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             daemon = ScoutDaemon.__new__(ScoutDaemon)

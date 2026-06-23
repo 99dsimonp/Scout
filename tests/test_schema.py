@@ -12,6 +12,7 @@ from scout.schema import (
     to_bitbucket_annotations,
     to_critical_pr_comment,
     to_inline_pr_comments,
+    to_no_findings_pr_comment,
     to_pr_comment,
     to_bitbucket_report,
     validate_review_output,
@@ -239,6 +240,26 @@ class SchemaTests(unittest.TestCase):
         self.assertNotIn("<!-- scout-review-run:", comments[0]["content"])
         self.assertNotIn("finding-001", comments[0]["content"])
 
+    def test_no_findings_pr_comment_mentions_review_without_metadata(self):
+        payload = valid_review()
+        payload["recommendation"] = "approve"
+        payload["annotations"] = []
+        review = validate_review_output(payload)
+
+        comment = to_no_findings_pr_comment(review, provider="codex")
+
+        self.assertEqual(
+            comment,
+            "Scout: Codex reviewed this pull request and found no material issues.",
+        )
+        self.assertNotIn("Commit:", comment)
+        self.assertNotIn("review run", comment.lower())
+        self.assertNotIn("external_id", comment)
+        self.assertNotIn("Scout finding:", comment)
+        self.assertNotIn("Scout review run:", comment)
+        self.assertNotIn("<!-- scout-finding:", comment)
+        self.assertNotIn("<!-- scout-review-run:", comment)
+
     def test_suggested_change_renders_only_in_inline_pr_comments(self):
         payload = valid_review()
         payload["annotations"][0]["suggested_change"] = {"replacement": "return fallback"}
@@ -273,6 +294,13 @@ class SchemaTests(unittest.TestCase):
                 payload["annotations"][0]["suggested_change"] = value
                 with self.assertRaises(ReviewValidationError):
                     validate_review_output(payload)
+
+    def test_annotation_external_id_rejects_reserved_scout_prefix(self):
+        payload = valid_review()
+        payload["annotations"][0]["external_id"] = "__scout_no_findings__"
+
+        with self.assertRaises(ReviewValidationError):
+            validate_review_output(payload)
 
     def test_suggested_change_null_is_no_suggestion(self):
         payload = valid_review()

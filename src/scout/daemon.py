@@ -32,6 +32,7 @@ from .schema import (
     to_pr_comment,
     to_bitbucket_report,
     to_inline_pr_comments,
+    to_no_findings_pr_comment,
     validate_review_output,
 )
 from .state import ReviewJob, StateStore, utcnow
@@ -39,6 +40,7 @@ from .usage import parse_provider_usage_from_logs
 
 LOG = logging.getLogger(__name__)
 _REVIEW_LOG_LOCK = threading.Lock()
+_NO_FINDINGS_INLINE_COMMENT_ID = "__scout_no_findings__"
 
 
 class ScoutDaemon:
@@ -613,6 +615,29 @@ class ScoutDaemon:
             if output_mode == "inline_comments":
                 report_id = "inline-comments"
                 review_run_id = job.running_review_run_id or job.target_review_run_id
+                no_findings_comment = to_no_findings_pr_comment(validated, provider=job.provider)
+                if no_findings_comment and not self.state.inline_comment_published(
+                    job,
+                    _NO_FINDINGS_INLINE_COMMENT_ID,
+                ):
+                    if _pull_request_comment_exists(
+                        self.bitbucket,
+                        job.repo_slug,
+                        job.pr_id,
+                        no_findings_comment,
+                        before_request=lambda: self._renew_publish_or_superseded(job),
+                    ):
+                        self.state.mark_inline_comment_published(job, _NO_FINDINGS_INLINE_COMMENT_ID)
+                    else:
+                        if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
+                            raise ProviderSuperseded("review superseded before no-findings comment publish")
+                        self.bitbucket.publish_pull_request_comment(
+                            job.repo_slug,
+                            job.pr_id,
+                            no_findings_comment,
+                            before_request=lambda: self._renew_publish_or_superseded(job),
+                        )
+                        self.state.mark_inline_comment_published(job, _NO_FINDINGS_INLINE_COMMENT_ID)
                 for comment in to_inline_pr_comments(
                     validated,
                     provider=job.provider,
@@ -1026,6 +1051,42 @@ def _comment_raw_content(comment: Dict[str, object]) -> str:
         return ""
     raw = content.get("raw")
     return raw if isinstance(raw, str) else ""
+
+
+def _pull_request_comment_exists(bitbucket, repo_slug: str, pr_id: int, content: str, before_request=None) -> bool:
+    trusted_author = _trusted_bitbucket_comment_author(bitbucket)
+    for comment in bitbucket.list_pull_request_comments(repo_slug, pr_id, before_request=before_request):
+        if comment.get("deleted") is True:
+            continue
+        if not _comment_author_matches(comment, trusted_author):
+            continue
+        if _comment_raw_content(comment).strip() == content.strip():
+            return True
+    return False
+
+
+def _trusted_bitbucket_comment_author(bitbucket) -> Optional[str]:
+    credentials = getattr(bitbucket, "credentials", None)
+    username = getattr(credentials, "username", None)
+    return str(username) if username else None
+
+
+def _comment_author_matches(comment: Dict[str, object], trusted_author: Optional[str]) -> bool:
+    if not trusted_author:
+        return False
+    user = comment.get("user")
+    if not isinstance(user, dict):
+        return False
+    trusted = _normalize_bitbucket_user_id(trusted_author)
+    for field in ("account_id", "nickname", "username", "uuid"):
+        value = user.get(field)
+        if isinstance(value, str) and _normalize_bitbucket_user_id(value) == trusted:
+            return True
+    return False
+
+
+def _normalize_bitbucket_user_id(value: str) -> str:
+    return value.strip().strip("{}").lower()
 
 
 def _safe_path_segment(value: str) -> str:
