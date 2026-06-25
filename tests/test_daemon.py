@@ -240,6 +240,32 @@ class DaemonReviewLogTests(unittest.TestCase):
             self.assertEqual(sorted(daemon.provider_configs), ["claude", "codex"])
             self.assertEqual(daemon.max_parallel_reviews, 2)
 
+    def test_init_uses_oauth_bitbucket_credentials(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            Path(tmp, "bb_client_id").write_text("client-id\n", encoding="utf-8")
+            Path(tmp, "bb_client_secret").write_text("client-secret\n", encoding="utf-8")
+            config = parse_config(
+                {
+                    "service": {
+                        "state_db": str(Path(tmp) / "state.db"),
+                        "state_dir": tmp,
+                    },
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "api_auth": "oauth_client_credentials",
+                        "oauth_client_id_credential": "bb_client_id",
+                        "oauth_client_secret_credential": "bb_client_secret",
+                        "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                    },
+                }
+            )
+
+            daemon = ScoutDaemon(config, CredentialStore(tmp))
+
+            self.assertEqual(daemon.bitbucket.credentials.auth_type, "oauth_client_credentials")
+            self.assertEqual(daemon.bitbucket.credentials.oauth_client_id, "client-id")
+            self.assertEqual(daemon.bitbucket.credentials.oauth_client_secret, "client-secret")
+
     def test_schedule_claims_from_global_queue_with_provider_specific_leases(self):
         daemon = ScoutDaemon.__new__(ScoutDaemon)
         daemon.config = SimpleNamespace(queue=SimpleNamespace(job_timeout_seconds=1200))

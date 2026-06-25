@@ -9,9 +9,15 @@ retention_days = 7
 [bitbucket]
 workspace = "my-workspace"
 api_base_url = "https://api.bitbucket.org/2.0"
+# Supported values: "basic" or "oauth_client_credentials".
 api_auth = "basic"
 api_username_credential = "bitbucket_username"
 api_key_credential = "bitbucket_api_key"
+# When api_auth = "oauth_client_credentials", Scout reads these systemd
+# credentials and exchanges them for a Bitbucket OAuth access token.
+oauth_client_id_credential = "bitbucket_oauth_client_id"
+oauth_client_secret_credential = "bitbucket_oauth_client_secret"
+oauth_token_url = "https://bitbucket.org/site/oauth2/access_token"
 # Optional. If omitted, git uses normal SSH config/agent or a local clone URL.
 # ssh_key_credential = "bitbucket_ssh_key"
 

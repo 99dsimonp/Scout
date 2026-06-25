@@ -28,31 +28,33 @@ class SetupScriptTests(unittest.TestCase):
         if shutil.which("bash") is None:
             self.skipTest("bash is not available")
 
-        result = subprocess.run(
-            [
-                "bash",
-                str(SETUP),
-                "--print-unit",
-                "--binary",
-                "/usr/bin/scout",
-                "--config",
-                "/etc/scout/config.toml",
-            ],
-            check=True,
-            env=clean_env(),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = str(Path(tmp) / "config.toml")
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(SETUP),
+                    "--print-unit",
+                    "--binary",
+                    "/usr/bin/scout",
+                    "--config",
+                    config_path,
+                ],
+                check=True,
+                env=clean_env(),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
 
         self.assertIn("User=scout\n", result.stdout)
         self.assertIn("Group=scout\n", result.stdout)
         self.assertIn(
-            "ExecStopPost=-/usr/bin/scout --config /etc/scout/config.toml --recover-abandoned-jobs",
+            "ExecStopPost=-/usr/bin/scout --config {} --recover-abandoned-jobs".format(config_path),
             result.stdout,
         )
         self.assertIn(
-            "ExecStartPre=/usr/bin/scout --config /etc/scout/config.toml --check-startup",
+            "ExecStartPre=/usr/bin/scout --config {} --check-startup".format(config_path),
             result.stdout,
         )
         self.assertIn("LoadCredential=bitbucket_username:/etc/scout/secrets/bitbucket_username", result.stdout)
@@ -62,6 +64,42 @@ class SetupScriptTests(unittest.TestCase):
             or "LoadCredential=bitbucket_ssh_key:/etc/scout/secrets/bitbucket_ssh_key" in result.stdout
         )
         self.assertIn("ProtectHome=true\n", result.stdout)
+
+    def test_print_unit_can_load_oauth_bitbucket_credentials(self):
+        if shutil.which("bash") is None:
+            self.skipTest("bash is not available")
+
+        result = subprocess.run(
+            [
+                "bash",
+                str(SETUP),
+                "--print-unit",
+                "--binary",
+                "/usr/bin/scout",
+                "--config",
+                "/etc/scout/config.toml",
+                "--bitbucket-oauth-client-id-file",
+                "/tmp/client-id",
+                "--bitbucket-oauth-client-secret-file",
+                "/tmp/client-secret",
+            ],
+            check=True,
+            env=clean_env(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        self.assertIn(
+            "LoadCredential=bitbucket_oauth_client_id:/etc/scout/secrets/bitbucket_oauth_client_id",
+            result.stdout,
+        )
+        self.assertIn(
+            "LoadCredential=bitbucket_oauth_client_secret:/etc/scout/secrets/bitbucket_oauth_client_secret",
+            result.stdout,
+        )
+        self.assertNotIn("LoadCredential=bitbucket_username:", result.stdout)
+        self.assertNotIn("LoadCredential=bitbucket_api_key:", result.stdout)
 
     def test_print_unit_current_user_mode_is_explicit(self):
         if shutil.which("bash") is None:

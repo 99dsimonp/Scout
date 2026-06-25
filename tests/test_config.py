@@ -68,9 +68,42 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.comments.critical_enabled)
         self.assertEqual(config.comments.severities, ["CRITICAL"])
         self.assertEqual(config.bitbucket.ssh_key_credential, "bitbucket_ssh_key")
+        self.assertEqual(config.bitbucket.oauth_client_id_credential, "bitbucket_oauth_client_id")
+        self.assertEqual(config.bitbucket.oauth_client_secret_credential, "bitbucket_oauth_client_secret")
+        self.assertEqual(config.bitbucket.oauth_token_url, "https://bitbucket.org/site/oauth2/access_token")
         self.assertEqual(config.bitbucket.repositories[0].pr_ids, [])
         self.assertEqual(config.bitbucket.repositories[0].ignored_target_branches, [])
         self.assertFalse(config.bitbucket.repositories[0].ignore_draft_pull_requests)
+
+    def test_parse_oauth_bitbucket_auth(self):
+        config = parse_config(
+            {
+                "bitbucket": {
+                    "workspace": "ws",
+                    "api_auth": "oauth_client_credentials",
+                    "oauth_client_id_credential": "bb_client_id",
+                    "oauth_client_secret_credential": "bb_client_secret",
+                    "oauth_token_url": "https://example.test/oauth/token",
+                    "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                },
+            }
+        )
+        self.assertEqual(config.bitbucket.api_auth, "oauth_client_credentials")
+        self.assertEqual(config.bitbucket.oauth_client_id_credential, "bb_client_id")
+        self.assertEqual(config.bitbucket.oauth_client_secret_credential, "bb_client_secret")
+        self.assertEqual(config.bitbucket.oauth_token_url, "https://example.test/oauth/token")
+
+    def test_rejects_unknown_bitbucket_auth(self):
+        with self.assertRaises(ConfigError):
+            parse_config(
+                {
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "api_auth": "oauth",
+                        "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
+                    },
+                }
+            )
 
     def test_parse_can_disable_critical_comments(self):
         config = parse_config(

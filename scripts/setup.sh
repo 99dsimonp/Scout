@@ -18,8 +18,11 @@ ENABLE_NOW=0
 PRINT_UNIT=0
 BITBUCKET_USERNAME_FILE=""
 BITBUCKET_API_KEY_FILE=""
+BITBUCKET_OAUTH_CLIENT_ID_FILE=""
+BITBUCKET_OAUTH_CLIENT_SECRET_FILE=""
 BITBUCKET_SSH_KEY_FILE=""
 BITBUCKET_URL=""
+BITBUCKET_API_AUTH_MODE=""
 LOAD_SSH_CREDENTIAL=0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,6 +51,8 @@ Options:
   --bitbucket-url URL           Bitbucket Cloud repo or pull-requests URL.
   --bitbucket-username-file PATH
   --bitbucket-api-key-file PATH
+  --bitbucket-oauth-client-id-file PATH
+  --bitbucket-oauth-client-secret-file PATH
   --bitbucket-ssh-key-file PATH Optional SSH key credential source.
   --enable-now                  Enable and start the service after setup.
   --print-unit                  Print the generated unit and exit.
@@ -275,10 +280,45 @@ ssh_clone_url_for_repo() {
   echo "git@bitbucket.org:${DERIVED_WORKSPACE}/${DERIVED_REPO}.git"
 }
 
+detect_bitbucket_api_auth() {
+  local path="$1"
+  if [[ ! -f "${path}" ]]; then
+    return 1
+  fi
+  awk '
+    /^[[:space:]]*\[bitbucket\][[:space:]]*$/ { in_bitbucket=1; next }
+    /^[[:space:]]*\[/ { in_bitbucket=0 }
+    in_bitbucket && /^[[:space:]]*api_auth[[:space:]]*=/ {
+      value = $0
+      sub(/^[^=]*=/, "", value)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+      gsub(/^"|"$/, "", value)
+      print value
+      exit
+    }
+  ' "${path}"
+}
+
+bitbucket_api_auth_mode() {
+  local detected
+  if [[ -n "${BITBUCKET_API_AUTH_MODE}" ]]; then
+    echo "${BITBUCKET_API_AUTH_MODE}"
+    return
+  fi
+  detected="$(detect_bitbucket_api_auth "${CONFIG_PATH}" || true)"
+  if [[ -n "${detected}" ]]; then
+    echo "${detected}"
+    return
+  fi
+  echo "basic"
+}
+
 write_initial_config_for_bitbucket_url() {
   local clone_url
+  local api_auth
   local tmp
   clone_url="$(ssh_clone_url_for_repo)"
+  api_auth="$(bitbucket_api_auth_mode)"
   tmp="$(mktemp)"
   cat >"${tmp}" <<CONFIG
 [service]
@@ -291,9 +331,12 @@ retention_days = 7
 [bitbucket]
 workspace = "${DERIVED_WORKSPACE}"
 api_base_url = "https://api.bitbucket.org/2.0"
-api_auth = "basic"
+api_auth = "${api_auth}"
 api_username_credential = "bitbucket_username"
 api_key_credential = "bitbucket_api_key"
+oauth_client_id_credential = "bitbucket_oauth_client_id"
+oauth_client_secret_credential = "bitbucket_oauth_client_secret"
+oauth_token_url = "https://bitbucket.org/site/oauth2/access_token"
 
 [[bitbucket.repositories]]
 slug = "${DERIVED_REPO}"
@@ -594,6 +637,18 @@ while (($#)); do
       BITBUCKET_API_KEY_FILE="$2"
       shift 2
       ;;
+    --bitbucket-oauth-client-id-file)
+      require_value "$1" "${2:-}"
+      BITBUCKET_OAUTH_CLIENT_ID_FILE="$2"
+      BITBUCKET_API_AUTH_MODE="oauth_client_credentials"
+      shift 2
+      ;;
+    --bitbucket-oauth-client-secret-file)
+      require_value "$1" "${2:-}"
+      BITBUCKET_OAUTH_CLIENT_SECRET_FILE="$2"
+      BITBUCKET_API_AUTH_MODE="oauth_client_credentials"
+      shift 2
+      ;;
     --bitbucket-ssh-key-file)
       require_value "$1" "${2:-}"
       BITBUCKET_SSH_KEY_FILE="$2"
@@ -636,14 +691,20 @@ if [[ -n "${BITBUCKET_URL}" ]]; then
   parse_bitbucket_url "${BITBUCKET_URL}"
 fi
 
+if [[ -n "${BITBUCKET_API_AUTH_MODE}" && ( -n "${BITBUCKET_USERNAME_FILE}" || -n "${BITBUCKET_API_KEY_FILE}" ) ]]; then
+  die "Bitbucket OAuth credential options cannot be combined with --bitbucket-username-file or --bitbucket-api-key-file"
+fi
+
 if [[ -f "${SECRET_DIR}/bitbucket_ssh_key" ]]; then
   LOAD_SSH_CREDENTIAL=1
 fi
 
 render_unit() {
+  local api_auth
   local protect_home="true"
   local home_dir
   local read_write_paths="${STATE_DIR} ${LOG_DIR}"
+  api_auth="$(bitbucket_api_auth_mode)"
   home_dir="$(service_home_dir)"
   if [[ -z "${home_dir}" ]]; then
     die "could not determine home directory for ${SERVICE_USER}"
@@ -674,9 +735,18 @@ StateDirectory=scout
 ConfigurationDirectory=scout
 LogsDirectory=scout
 
+UNIT
+  if [[ "${api_auth}" == "oauth_client_credentials" ]]; then
+    cat <<UNIT
+LoadCredential=bitbucket_oauth_client_id:${SECRET_DIR}/bitbucket_oauth_client_id
+LoadCredential=bitbucket_oauth_client_secret:${SECRET_DIR}/bitbucket_oauth_client_secret
+UNIT
+  else
+    cat <<UNIT
 LoadCredential=bitbucket_username:${SECRET_DIR}/bitbucket_username
 LoadCredential=bitbucket_api_key:${SECRET_DIR}/bitbucket_api_key
 UNIT
+  fi
   if [[ "${LOAD_SSH_CREDENTIAL}" -eq 1 ]]; then
     echo "LoadCredential=bitbucket_ssh_key:${SECRET_DIR}/bitbucket_ssh_key"
   else
@@ -753,11 +823,24 @@ if [[ ! -f "${SCHEMA_PATH}" ]]; then
     echo "warning: ${SCHEMA_PATH} does not exist and ${SCHEMA_SRC} was not found" >&2
   fi
 fi
+if [[ -n "${BITBUCKET_API_AUTH_MODE}" ]]; then
+  toml_set_string_in_table "${CONFIG_PATH}" "bitbucket" "api_auth" "${BITBUCKET_API_AUTH_MODE}"
+  if [[ "${BITBUCKET_API_AUTH_MODE}" == "oauth_client_credentials" ]]; then
+    toml_set_string_in_table "${CONFIG_PATH}" "bitbucket" "oauth_client_id_credential" "bitbucket_oauth_client_id"
+    toml_set_string_in_table "${CONFIG_PATH}" "bitbucket" "oauth_client_secret_credential" "bitbucket_oauth_client_secret"
+    toml_set_string_in_table "${CONFIG_PATH}" "bitbucket" "oauth_token_url" "https://bitbucket.org/site/oauth2/access_token"
+  fi
+fi
 write_detected_provider_commands
 write_detected_codex_max_subagents
 
-install_secret "bitbucket_username" "${BITBUCKET_USERNAME_FILE}" "--bitbucket-username-file"
-install_secret "bitbucket_api_key" "${BITBUCKET_API_KEY_FILE}" "--bitbucket-api-key-file"
+if [[ "$(bitbucket_api_auth_mode)" == "oauth_client_credentials" ]]; then
+  install_secret "bitbucket_oauth_client_id" "${BITBUCKET_OAUTH_CLIENT_ID_FILE}" "--bitbucket-oauth-client-id-file"
+  install_secret "bitbucket_oauth_client_secret" "${BITBUCKET_OAUTH_CLIENT_SECRET_FILE}" "--bitbucket-oauth-client-secret-file"
+else
+  install_secret "bitbucket_username" "${BITBUCKET_USERNAME_FILE}" "--bitbucket-username-file"
+  install_secret "bitbucket_api_key" "${BITBUCKET_API_KEY_FILE}" "--bitbucket-api-key-file"
+fi
 if [[ -n "${BITBUCKET_SSH_KEY_FILE}" ]]; then
   install_secret "bitbucket_ssh_key" "${BITBUCKET_SSH_KEY_FILE}" "--bitbucket-ssh-key-file"
   LOAD_SSH_CREDENTIAL=1

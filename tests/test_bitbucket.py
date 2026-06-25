@@ -3,6 +3,7 @@ import json
 import unittest
 from io import BytesIO
 from unittest.mock import patch
+from urllib.parse import parse_qs
 from urllib.error import HTTPError
 
 from scout.bitbucket import BitbucketClient, BitbucketCredentials
@@ -43,6 +44,46 @@ class BitbucketTests(unittest.TestCase):
         self.assertEqual(seen["auth"], "Basic " + expected)
         self.assertEqual(seen["user_agent"], "scout")
         self.assertIn("values.draft", seen["url"])
+
+    def test_oauth_client_credentials_token_is_exchanged_and_cached(self):
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append(
+                {
+                    "method": request.get_method(),
+                    "url": request.full_url,
+                    "auth": request.headers["Authorization"],
+                    "content_type": request.headers.get("Content-type"),
+                    "data": request.data,
+                }
+            )
+            if request.full_url == "https://bitbucket.org/site/oauth2/access_token":
+                return FakeResponse({"access_token": "access-token", "expires_in": 3600})
+            return FakeResponse({"values": [], "next": None})
+
+        client = BitbucketClient(
+            "https://api.bitbucket.org/2.0",
+            "ws",
+            BitbucketCredentials(
+                "",
+                "",
+                auth_type="oauth_client_credentials",
+                oauth_client_id="client-id",
+                oauth_client_secret="client-secret",
+            ),
+        )
+        with patch("scout.bitbucket.urlopen", fake_urlopen):
+            self.assertEqual(client.list_open_pull_requests("repo"), [])
+            self.assertEqual(client.list_open_pull_requests("repo"), [])
+
+        expected_client_auth = base64.b64encode(b"client-id:client-secret").decode("ascii")
+        self.assertEqual(requests[0]["method"], "POST")
+        self.assertEqual(requests[0]["url"], "https://bitbucket.org/site/oauth2/access_token")
+        self.assertEqual(requests[0]["auth"], "Basic " + expected_client_auth)
+        self.assertEqual(requests[0]["content_type"], "application/x-www-form-urlencoded")
+        self.assertEqual(parse_qs(requests[0]["data"].decode("utf-8")), {"grant_type": ["client_credentials"]})
+        self.assertEqual([request["auth"] for request in requests[1:]], ["Bearer access-token", "Bearer access-token"])
 
     def test_list_open_pull_requests_parses_draft_status(self):
         def fake_urlopen(request, timeout):

@@ -20,6 +20,12 @@ LogsDirectory=scout
 
 LoadCredential=bitbucket_username:/etc/scout/secrets/bitbucket_username
 LoadCredential=bitbucket_api_key:/etc/scout/secrets/bitbucket_api_key
+# For bitbucket.api_auth = "oauth_client_credentials", replace the two
+# Bitbucket credentials above with these credentials in a systemd drop-in:
+# [Service]
+# LoadCredential=
+# LoadCredential=bitbucket_oauth_client_id:/etc/scout/secrets/bitbucket_oauth_client_id
+# LoadCredential=bitbucket_oauth_client_secret:/etc/scout/secrets/bitbucket_oauth_client_secret
 # Optional SSH key credentials should be added with a systemd drop-in because
 # LoadCredential fails service startup when its source file is missing.
 # LoadCredential=bitbucket_ssh_key:/etc/scout/secrets/bitbucket_ssh_key

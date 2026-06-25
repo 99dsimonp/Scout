@@ -48,6 +48,9 @@ class BitbucketConfig:
     api_auth: str
     api_username_credential: str
     api_key_credential: str
+    oauth_client_id_credential: str
+    oauth_client_secret_credential: str
+    oauth_token_url: str
     ssh_key_credential: str
     repositories: List[RepositoryConfig]
 
@@ -225,8 +228,8 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
         raise ConfigError("bitbucket.repositories must contain at least one repository")
 
     api_auth = str(bitbucket.get("api_auth", "basic"))
-    if api_auth != "basic":
-        raise ConfigError("only bitbucket.api_auth = \"basic\" is supported in v1")
+    if api_auth not in {"basic", "oauth_client_credentials"}:
+        raise ConfigError("bitbucket.api_auth must be basic or oauth_client_credentials")
 
     codex_auth_mode = str(codex.get("auth_mode", "logged_in"))
     if codex_auth_mode not in {"logged_in", "api"}:
@@ -366,6 +369,15 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
             api_auth=api_auth,
             api_username_credential=str(bitbucket.get("api_username_credential", "bitbucket_username")),
             api_key_credential=str(bitbucket.get("api_key_credential", "bitbucket_api_key")),
+            oauth_client_id_credential=str(
+                bitbucket.get("oauth_client_id_credential", "bitbucket_oauth_client_id")
+            ),
+            oauth_client_secret_credential=str(
+                bitbucket.get("oauth_client_secret_credential", "bitbucket_oauth_client_secret")
+            ),
+            oauth_token_url=str(
+                bitbucket.get("oauth_token_url", "https://bitbucket.org/site/oauth2/access_token")
+            ),
             ssh_key_credential=str(bitbucket.get("ssh_key_credential", "bitbucket_ssh_key")),
             repositories=repositories,
         ),

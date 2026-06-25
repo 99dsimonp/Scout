@@ -124,6 +124,8 @@ The current implementation intentionally keeps runtime dependencies small:
 - Manual schema validation in `scout.schema` plus provider-side schema flags
   where supported.
 - `tomli` for TOML parsing on Python 3.9. Python 3.11+ uses `tomllib`.
+- Standard-library HTTP and form helpers for Bitbucket Basic and OAuth
+  client-credentials authentication.
 
 Scout should prefer boring service behavior over framework complexity. A simple
 daemon loop with explicit poll, lease, review, publish, and cleanup phases is

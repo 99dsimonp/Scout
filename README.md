@@ -109,6 +109,21 @@ sudo scripts/setup.sh \
   --bitbucket-api-key-file ./bitbucket_api_key
 ```
 
+Bitbucket OAuth client-credentials auth is also supported for service accounts.
+Use these flags instead of the username/API-key flags:
+
+```bash
+sudo scout-setup \
+  --bitbucket-url https://bitbucket.org/my-workspace/my-repo/pull-requests/ \
+  --bitbucket-oauth-client-id-file ./bitbucket_oauth_client_id \
+  --bitbucket-oauth-client-secret-file ./bitbucket_oauth_client_secret
+```
+
+This writes `bitbucket.api_auth = "oauth_client_credentials"` and loads
+`bitbucket_oauth_client_id` / `bitbucket_oauth_client_secret` as systemd
+credentials. For manual configuration, set the same `api_auth` value in
+`/etc/scout/config.toml`.
+
 By default the service runs as the dedicated `scout` user. That is the usual
 service pattern: the daemon gets its own unprivileged identity, state directory,
 and credential set instead of inheriting the installing user's shell. If a
@@ -129,7 +144,7 @@ read your home directory. In dedicated-user mode, log the CLI in under the
 
 The optional Bitbucket SSH deploy key can be installed with
 `--bitbucket-ssh-key-file ./id_bitbucket`. The generated unit uses
-`LoadCredential=` for `bitbucket_username`, `bitbucket_api_key`, and the SSH key
+`LoadCredential=` for the selected Bitbucket API credentials and the SSH key
 when present. In the default dedicated-user mode, setup also creates
 `/var/lib/scout/.ssh/id_ed25519` when absent and prints the public key to add to
 Bitbucket as a read-only access key. Edit `/etc/scout/config.toml` before
@@ -249,13 +264,19 @@ When running under systemd, set `agents.codex.command` or
 `agents.claude.command` to an absolute CLI binary path if the service PATH does
 not include the provider CLI.
 
-The packaged unit loads the always-required Bitbucket credentials. For each
+The packaged unit loads Basic Bitbucket credentials by default. When using
+`bitbucket.api_auth = "oauth_client_credentials"` without `scout-setup`, add a
+systemd drop-in that resets `LoadCredential=` and loads
+`bitbucket_oauth_client_id` plus `bitbucket_oauth_client_secret`. For each
 selected provider that uses `auth_mode = "api"`, add a systemd drop-in for that
 provider credential,
 for example:
 
 ```ini
 [Service]
+LoadCredential=
+LoadCredential=bitbucket_oauth_client_id:/etc/scout/secrets/bitbucket_oauth_client_id
+LoadCredential=bitbucket_oauth_client_secret:/etc/scout/secrets/bitbucket_oauth_client_secret
 LoadCredential=claude:/etc/scout/secrets/claude
 ```
 

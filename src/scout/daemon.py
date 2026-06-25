@@ -51,10 +51,7 @@ class ScoutDaemon:
         self.bitbucket = BitbucketClient(
             base_url=config.bitbucket.api_base_url,
             workspace=config.bitbucket.workspace,
-            credentials=BitbucketCredentials(
-                username=credentials.read(config.bitbucket.api_username_credential),
-                api_key=credentials.read(config.bitbucket.api_key_credential),
-            ),
+            credentials=_bitbucket_credentials(config, credentials),
         )
         try:
             ssh_key_path = str(credentials.path(config.bitbucket.ssh_key_credential))
@@ -974,6 +971,24 @@ def _provider_runner(config: AppConfig, credentials: CredentialStore, provider: 
     if provider == "claude":
         return ClaudeRunner(config.agents.claude, credentials)
     raise ConfigError("unsupported provider: {}".format(provider))
+
+
+def _bitbucket_credentials(config: AppConfig, credentials: CredentialStore) -> BitbucketCredentials:
+    if config.bitbucket.api_auth == "basic":
+        return BitbucketCredentials(
+            username=credentials.read(config.bitbucket.api_username_credential),
+            api_key=credentials.read(config.bitbucket.api_key_credential),
+        )
+    if config.bitbucket.api_auth == "oauth_client_credentials":
+        return BitbucketCredentials(
+            username="",
+            api_key="",
+            auth_type="oauth_client_credentials",
+            oauth_client_id=credentials.read(config.bitbucket.oauth_client_id_credential),
+            oauth_client_secret=credentials.read(config.bitbucket.oauth_client_secret_credential),
+            oauth_token_url=config.bitbucket.oauth_token_url,
+        )
+    raise ConfigError("unsupported bitbucket.api_auth {}".format(config.bitbucket.api_auth))
 
 
 def _provider_model_metadata(provider: str, provider_config) -> str:

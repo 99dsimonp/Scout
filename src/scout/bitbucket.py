@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 from urllib.parse import quote, urlencode
@@ -28,6 +29,16 @@ class BitbucketNotFound(BitbucketError):
 class BitbucketCredentials:
     username: str
     api_key: str
+    auth_type: str = "basic"
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
+    oauth_token_url: str = "https://bitbucket.org/site/oauth2/access_token"
+
+
+@dataclass
+class _OAuthToken:
+    access_token: str
+    expires_at: float
 
 
 class BitbucketClient:
@@ -36,6 +47,7 @@ class BitbucketClient:
         self.workspace = workspace
         self.credentials = credentials
         self.timeout = timeout
+        self._oauth_token: Optional[_OAuthToken] = None
 
     def list_open_pull_requests(self, repo_slug: str, pagelen: int = 50) -> List[PullRequest]:
         fields = ",".join(
@@ -242,7 +254,7 @@ class BitbucketClient:
         data = None
         headers = {
             "Accept": "application/json",
-            "Authorization": "Basic {}".format(self._basic_auth_token()),
+            "Authorization": self._authorization_header(),
             "User-Agent": "scout",
         }
         if body is not None:
@@ -273,6 +285,64 @@ class BitbucketClient:
     def _basic_auth_token(self) -> str:
         raw = "{}:{}".format(self.credentials.username, self.credentials.api_key).encode("utf-8")
         return base64.b64encode(raw).decode("ascii")
+
+    def _authorization_header(self) -> str:
+        if self.credentials.auth_type == "basic":
+            return "Basic {}".format(self._basic_auth_token())
+        if self.credentials.auth_type == "oauth_client_credentials":
+            return "Bearer {}".format(self._oauth_access_token())
+        raise BitbucketError("unsupported Bitbucket auth type: {}".format(self.credentials.auth_type), retryable=False)
+
+    def _oauth_access_token(self) -> str:
+        now = time.time()
+        if self._oauth_token is not None and self._oauth_token.expires_at - 60 > now:
+            return self._oauth_token.access_token
+
+        data = urlencode({"grant_type": "client_credentials"}).encode("utf-8")
+        raw_credentials = "{}:{}".format(
+            self.credentials.oauth_client_id,
+            self.credentials.oauth_client_secret,
+        ).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Authorization": "Basic {}".format(base64.b64encode(raw_credentials).decode("ascii")),
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "scout",
+        }
+        request = Request(self.credentials.oauth_token_url, data=data, headers=headers, method="POST")
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                raw = response.read()
+        except HTTPError as exc:
+            exc.close()
+            retryable = exc.code == 429 or 500 <= exc.code <= 599
+            raise BitbucketError(
+                "Bitbucket OAuth token request failed with HTTP {}".format(exc.code),
+                retryable=retryable,
+            ) from exc
+        except URLError as exc:
+            raise BitbucketError("Bitbucket OAuth token request failed: {}".format(exc), retryable=True) from exc
+        if not raw:
+            raise BitbucketError("Bitbucket OAuth token request returned an empty response", retryable=True)
+        try:
+            parsed = json.loads(raw.decode("utf-8"))
+        except json.JSONDecodeError as exc:
+            raise BitbucketError("Bitbucket OAuth token request returned invalid JSON", retryable=True) from exc
+        if not isinstance(parsed, dict):
+            raise BitbucketError("Bitbucket OAuth token request returned unexpected JSON", retryable=True)
+        access_token = parsed.get("access_token")
+        if not isinstance(access_token, str) or not access_token:
+            raise BitbucketError("Bitbucket OAuth token response did not include access_token", retryable=True)
+        expires_in = parsed.get("expires_in", 3600)
+        try:
+            expires_in_seconds = int(expires_in)
+        except (TypeError, ValueError):
+            expires_in_seconds = 3600
+        self._oauth_token = _OAuthToken(
+            access_token=access_token,
+            expires_at=now + max(expires_in_seconds, 0),
+        )
+        return access_token
 
 
 def _quote_external_id(external_id: str) -> str:
