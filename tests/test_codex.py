@@ -51,6 +51,21 @@ class CodexRunnerTests(unittest.TestCase):
         self.assertIn("--disable", cmd)
         self.assertIn("fast_mode", cmd)
 
+    def test_build_command_adds_related_repository_directories(self):
+        runner = CodexRunner(codex_config(), CredentialStore("/tmp/unused"))
+        cmd = runner.build_command(
+            "/repo",
+            "/schema.json",
+            "/out.json",
+            "prompt",
+            additional_dirs=["/context/contracts", "/context/service"],
+        )
+
+        self.assertEqual(
+            [cmd[index + 1] for index, item in enumerate(cmd) if item == "--add-dir"],
+            ["/context/contracts", "/context/service"],
+        )
+
     def test_build_risk_command_uses_classifier_model_and_reasoning(self):
         config = codex_config(model="gpt-5.5", reasoning_effort="xhigh")
         runner = CodexRunner(config, CredentialStore("/tmp/unused"))

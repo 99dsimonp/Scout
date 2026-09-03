@@ -30,6 +30,9 @@ class RepositoryConfig:
     ignored_source_branches: List[str]
     ignored_target_branches: List[str]
     ignore_draft_pull_requests: bool
+    related_repositories: List[str]
+    review_enabled: bool
+    context_ref: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -221,11 +224,43 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
                 repo.get("ignore_draft_pull_requests", False),
                 "bitbucket.repositories.ignore_draft_pull_requests",
             ),
+            related_repositories=_str_list(
+                repo.get("related_repositories", []),
+                "bitbucket.repositories.related_repositories",
+            ),
+            review_enabled=_bool_value(
+                repo.get("review_enabled", True),
+                "bitbucket.repositories.review_enabled",
+            ),
+            context_ref=_optional_str(
+                repo.get("context_ref"),
+                "bitbucket.repositories.context_ref",
+            ),
         )
         for repo in bitbucket.get("repositories", [])
     ]
     if not repositories:
         raise ConfigError("bitbucket.repositories must contain at least one repository")
+    repositories_by_slug = {}
+    for repo in repositories:
+        if repo.slug in repositories_by_slug:
+            raise ConfigError("bitbucket.repositories contains duplicate slug: {}".format(repo.slug))
+        repositories_by_slug[repo.slug] = repo
+    if not any(repo.review_enabled for repo in repositories):
+        raise ConfigError("bitbucket.repositories must contain at least one review-enabled repository")
+    for repo in repositories:
+        for related_slug in repo.related_repositories:
+            if related_slug == repo.slug:
+                raise ConfigError(
+                    "bitbucket repository {} cannot list itself as related".format(repo.slug)
+                )
+            if related_slug not in repositories_by_slug:
+                raise ConfigError(
+                    "bitbucket repository {} references unknown related repository: {}".format(
+                        repo.slug,
+                        related_slug,
+                    )
+                )
 
     api_auth = str(bitbucket.get("api_auth", "basic"))
     if api_auth not in {"basic", "oauth_client_credentials"}:
@@ -485,6 +520,14 @@ def _required_str(section: Dict[str, Any], key: str, label: str) -> str:
     return value
 
 
+def _optional_str(value: Any, label: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or value.startswith("-"):
+        raise ConfigError("{} must be a non-empty git ref that does not start with '-'".format(label))
+    return value
+
+
 def _positive_int(value: Any, label: str) -> int:
     try:
         parsed = int(value)
@@ -650,6 +693,23 @@ def _int_list(value: Any, label: str) -> List[int]:
     parsed = []
     for item in value:
         parsed.append(_positive_int(item, label))
+    return parsed
+
+
+def _str_list(value: Any, label: str) -> List[str]:
+    if value in (None, []):
+        return []
+    if not isinstance(value, list):
+        raise ConfigError("{} must be a list of repository slugs".format(label))
+    parsed = []
+    seen = set()
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ConfigError("{} must be a list of repository slugs".format(label))
+        if item in seen:
+            raise ConfigError("{} contains duplicate repository: {}".format(label, item))
+        parsed.append(item)
+        seen.add(item)
     return parsed
 
 

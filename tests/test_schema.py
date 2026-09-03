@@ -15,6 +15,7 @@ from scout.schema import (
     to_no_findings_pr_comment,
     to_pr_comment,
     to_bitbucket_report,
+    validate_annotation_locations,
     validate_review_output,
 )
 
@@ -422,6 +423,65 @@ class SchemaTests(unittest.TestCase):
     def test_parse_requires_json_object(self):
         with self.assertRaises(ReviewValidationError):
             parse_review_json("[]")
+
+    def test_annotation_location_must_be_added_line_in_primary_diff(self):
+        review = validate_review_output(valid_review())
+        diff = """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -10,3 +10,4 @@
+ unchanged
+-old
++new
++added
+ unchanged
+"""
+        review.annotations[0]["line"] = 12
+        validate_annotation_locations(review, diff)
+
+        review.annotations[0]["line"] = 10
+        with self.assertRaisesRegex(ReviewValidationError, "changed line in the primary PR diff"):
+            validate_annotation_locations(review, diff)
+
+    def test_annotation_location_rejects_related_repository_path(self):
+        review = validate_review_output(valid_review())
+        review.annotations[0]["path"] = "contracts/schema.json"
+        diff = """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -11 +12 @@
+-old
++new
+"""
+        with self.assertRaisesRegex(ReviewValidationError, "contracts/schema.json:12"):
+            validate_annotation_locations(review, diff)
+
+    def test_annotation_location_decodes_git_c_quoted_path(self):
+        review = validate_review_output(valid_review())
+        review.annotations[0]["path"] = "docs/æ\tline\nbreak.py"
+        review.annotations[0]["line"] = 7
+        diff = r'''diff --git "a/docs/\303\246\tline\nbreak.py" "b/docs/\303\246\tline\nbreak.py"
+--- "a/docs/\303\246\tline\nbreak.py"
++++ "b/docs/\303\246\tline\nbreak.py"
+@@ -6 +7 @@
+-old
++new
+'''
+
+        validate_annotation_locations(review, diff)
+
+    def test_added_content_beginning_with_double_plus_is_not_a_file_header(self):
+        review = validate_review_output(valid_review())
+        review.annotations[0]["line"] = 2
+        diff = """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -1 +1,2 @@
+ unchanged
++++ b/not-a-file-header
+"""
+
+        validate_annotation_locations(review, diff)
 
 
 if __name__ == "__main__":

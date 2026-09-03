@@ -7,7 +7,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, List, Optional
 
 from .comment_request import (
     CommentRequestClassification,
@@ -71,6 +71,7 @@ class CodexRunner:
         schema_path: str,
         run_dir: str,
         is_superseded: Callable[[], bool],
+        additional_dirs: Optional[List[str]] = None,
     ) -> ProviderResult:
         Path(run_dir).mkdir(parents=True, exist_ok=True)
         output_file = Path(run_dir) / "codex-final-message.json"
@@ -79,7 +80,13 @@ class CodexRunner:
         prompt_file = Path(run_dir) / "codex-prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
 
-        cmd = self.build_command(worktree, schema_path, str(output_file), prompt)
+        cmd = self.build_command(
+            worktree,
+            schema_path,
+            str(output_file),
+            prompt,
+            additional_dirs=additional_dirs,
+        )
         LOG.info("starting Codex review command=%s prompt_file=%s", _redacted_cmd(cmd), prompt_file)
         with prompt_file.open("r", encoding="utf-8") as prompt_input, \
             stdout_file.open("w", encoding="utf-8") as stdout, \
@@ -337,7 +344,14 @@ class CodexRunner:
             )
         return extract_comment_request(final_message)
 
-    def build_command(self, worktree: str, schema_path: str, output_file: str, prompt: str) -> list:
+    def build_command(
+        self,
+        worktree: str,
+        schema_path: str,
+        output_file: str,
+        prompt: str,
+        additional_dirs: Optional[List[str]] = None,
+    ) -> list:
         cmd = [
             self.config.command,
             "exec",
@@ -362,6 +376,8 @@ class CodexRunner:
                 output_file,
             ]
         )
+        for directory in additional_dirs or []:
+            cmd.extend(["--add-dir", directory])
         return cmd
 
     def build_risk_command(

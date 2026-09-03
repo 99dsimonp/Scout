@@ -9,7 +9,7 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from .bitbucket import BitbucketClient, BitbucketCredentials, BitbucketError
 from .claude import ClaudeRunner
@@ -33,6 +33,7 @@ from .schema import (
     to_bitbucket_report,
     to_inline_pr_comments,
     to_no_findings_pr_comment,
+    validate_annotation_locations,
     validate_review_output,
 )
 from .state import ReviewJob, StateStore, utcnow
@@ -87,6 +88,9 @@ class ScoutDaemon:
         self.clone_urls: Dict[str, str] = {
             repo.slug: repo.clone_url for repo in config.bitbucket.repositories
         }
+        self.repository_configs = {
+            repo.slug: repo for repo in config.bitbucket.repositories
+        }
         self._risk_cache: Dict[tuple, str] = {}
         self._risk_cache_locks: Dict[tuple, threading.Lock] = {}
         self._risk_cache_guard = threading.Lock()
@@ -98,7 +102,12 @@ class ScoutDaemon:
         self.state.initialize()
         Path(self.config.service.state_dir).mkdir(parents=True, exist_ok=True)
         for repo in self.config.bitbucket.repositories:
-            self.state.upsert_repository(self.config.bitbucket.workspace, repo.slug, repo.clone_url)
+            self.state.upsert_repository(
+                self.config.bitbucket.workspace,
+                repo.slug,
+                repo.clone_url,
+                enabled=getattr(repo, "review_enabled", True),
+            )
         self.validate_startup()
         recovered = self.state.recover_abandoned_jobs()
         if recovered:
@@ -152,6 +161,8 @@ class ScoutDaemon:
         if not self.config.polling.enabled:
             return
         for repo in self.config.bitbucket.repositories:
+            if not getattr(repo, "review_enabled", True):
+                continue
             LOG.info("polling repository workspace=%s repo=%s", self.config.bitbucket.workspace, repo.slug)
             try:
                 prs = self.bitbucket.list_open_pull_requests(repo.slug)
@@ -524,6 +535,8 @@ class ScoutDaemon:
             return
         mirror = None
         worktree = None
+        related_worktrees: List[Tuple[object, object]] = []
+        related_context: List[Dict[str, str]] = []
         run_dir = None
         source_commit = job.running_source_commit_hash or job.target_source_commit_hash
         usage_logged = False
@@ -543,7 +556,53 @@ class ScoutDaemon:
             clone_url = self.clone_urls[job.repo_slug]
             mirror = self.git.ensure_mirror(job.workspace, job.repo_slug, clone_url)
             worktree = self.git.create_worktree(mirror, pr, suffix="job-{}".format(job.id))
-            context = self.git.prepare_context(mirror, worktree, pr)
+            repository_configs = getattr(self, "repository_configs", {})
+            repo_config = repository_configs.get(job.repo_slug)
+            for related_slug in getattr(repo_config, "related_repositories", ()):
+                related_config = repository_configs[related_slug]
+                related_mirror = self.git.ensure_mirror(
+                    job.workspace,
+                    related_slug,
+                    related_config.clone_url,
+                )
+                resolved_ref, related_commit = self.git.resolve_context_revision(
+                    related_mirror,
+                    getattr(related_config, "context_ref", None),
+                )
+                related_worktree = self.git.create_context_worktree(
+                    related_mirror,
+                    job.workspace,
+                    job.repo_slug,
+                    related_slug,
+                    related_commit,
+                    job.id,
+                )
+                related_worktrees.append((related_mirror, related_worktree))
+                related_entry = {
+                    "slug": related_slug,
+                    "ref": resolved_ref,
+                    "commit": related_commit,
+                    "path": str(related_worktree),
+                }
+                related_context.append(related_entry)
+                LOG.info(
+                    "prepared related repository context job=%s primary_repo=%s related_repo=%s ref=%s commit=%s path=%s",
+                    job.id,
+                    job.repo_slug,
+                    related_slug,
+                    resolved_ref,
+                    related_commit,
+                    related_worktree,
+                )
+            if related_context:
+                context = self.git.prepare_context(
+                    mirror,
+                    worktree,
+                    pr,
+                    related_repositories=related_context,
+                )
+            else:
+                context = self.git.prepare_context(mirror, worktree, pr)
             risk = self._risk_for_job(job, source_commit)
             review_plan = build_review_plan(
                 changed_lines=int(context["changed_lines"]),
@@ -577,29 +636,53 @@ class ScoutDaemon:
             run_dir = str(Path(self.config.service.state_dir) / "runs" / str(job.id))
             self._acquire_provider_slot(job.provider, blocking=True)
             try:
-                result = provider_runner.run(
+                provider_run_args = dict(
                     worktree=str(worktree),
                     prompt=prompt,
                     schema_path=self.config.review.schema_path,
                     run_dir=run_dir,
                     is_superseded=lambda: self.state.is_job_superseded(job.id, job.lease_token),
                 )
+                if related_context:
+                    provider_run_args["additional_dirs"] = [
+                        entry["path"] for entry in related_context
+                    ]
+                result = provider_runner.run(**provider_run_args)
             finally:
                 self._release_provider_slot(job.provider)
             _append_provider_usage_log_entry(
                 self.config.service.state_dir,
-                _provider_usage_log_entry(job, source_commit, run_dir, "provider_completed", result.usage),
+                _provider_usage_log_entry(
+                    job,
+                    source_commit,
+                    run_dir,
+                    "provider_completed",
+                    result.usage,
+                    related_repositories=related_context,
+                ),
             )
             usage_logged = True
             if self.state.is_job_superseded(job.id, job.lease_token):
                 raise ProviderSuperseded("review superseded before publish")
             parsed = parse_review_json(result.final_message)
             validated = validate_review_output(parsed, max_findings=self.config.review.max_findings)
+            if validated.annotations:
+                diff = context.get("diff")
+                if not isinstance(diff, str):
+                    diff = Path(str(context["diff_path"])).read_text(encoding="utf-8")
+                validate_annotation_locations(validated, diff)
             if not self.state.mark_publishing(job, self._lease_seconds(job.provider)):
                 raise ProviderSuperseded("review superseded before publish")
             review_log_path = _append_review_log_entry(
                 self.config.service.state_dir,
-                _review_log_entry(job, source_commit, validated, run_dir, result.usage),
+                _review_log_entry(
+                    job,
+                    source_commit,
+                    validated,
+                    run_dir,
+                    result.usage,
+                    related_repositories=related_context,
+                ),
             )
             LOG.info(
                 "appended review log path=%s job=%s repo=%s pr=%s",
@@ -700,7 +783,14 @@ class ScoutDaemon:
             if run_dir is not None and not usage_logged:
                 _append_provider_usage_log_entry(
                     self.config.service.state_dir,
-                    _provider_usage_log_entry_from_logs(job, source_commit, run_dir, "superseded", str(exc)),
+                    _provider_usage_log_entry_from_logs(
+                        job,
+                        source_commit,
+                        run_dir,
+                        "superseded",
+                        str(exc),
+                        related_repositories=related_context,
+                    ),
                 )
             self.state.return_superseded_to_pending(job.id, job.lease_token)
         except (BitbucketError, GitError, ProviderError, ReviewValidationError) as exc:
@@ -709,7 +799,14 @@ class ScoutDaemon:
             if run_dir is not None and not usage_logged:
                 _append_provider_usage_log_entry(
                     self.config.service.state_dir,
-                    _provider_usage_log_entry_from_logs(job, source_commit, run_dir, "failed", str(exc)),
+                    _provider_usage_log_entry_from_logs(
+                        job,
+                        source_commit,
+                        run_dir,
+                        "failed",
+                        str(exc),
+                        related_repositories=related_context,
+                    ),
                 )
             provider_cooldown_seconds = getattr(exc, "cooldown_seconds", None)
             if isinstance(exc, ProviderError) and provider_cooldown_seconds:
@@ -773,6 +870,15 @@ class ScoutDaemon:
             if not marked:
                 self.state.return_superseded_to_pending(job.id, job.lease_token)
         finally:
+            for related_mirror, related_worktree in reversed(related_worktrees):
+                try:
+                    self.git.remove_worktree(related_mirror, related_worktree)
+                except Exception as exc:
+                    LOG.warning(
+                        "failed to remove related repository worktree path=%s error=%s",
+                        related_worktree,
+                        exc,
+                    )
             if mirror is not None and worktree is not None:
                 try:
                     self.git.remove_worktree(mirror, worktree)
@@ -1136,6 +1242,7 @@ def _review_log_entry(
     review: ValidatedReview,
     run_dir: str,
     usage: Optional[Dict[str, object]] = None,
+    related_repositories: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, object]:
     summary = summarize_findings(review)
     entry = {
@@ -1153,6 +1260,7 @@ def _review_log_entry(
             "by_reviewer_and_severity": summary["by_reviewer_and_severity"],
         },
         "raw_provider_logs": _raw_provider_log_paths(job.provider, run_dir),
+        "related_repositories": list(related_repositories or []),
     }
     if usage is not None:
         entry["usage"] = usage
@@ -1178,6 +1286,7 @@ def _provider_usage_log_entry(
     status: str,
     usage: Optional[Dict[str, object]] = None,
     error: Optional[str] = None,
+    related_repositories: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, object]:
     entry = {
         "timestamp": utcnow(),
@@ -1195,6 +1304,8 @@ def _provider_usage_log_entry(
         entry["usage"] = usage
     if error:
         entry["error"] = error[:1000]
+    if related_repositories:
+        entry["related_repositories"] = list(related_repositories)
     return entry
 
 
@@ -1204,6 +1315,7 @@ def _provider_usage_log_entry_from_logs(
     run_dir: str,
     status: str,
     error: Optional[str] = None,
+    related_repositories: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, object]:
     return _provider_usage_log_entry(
         job,
@@ -1212,6 +1324,7 @@ def _provider_usage_log_entry_from_logs(
         status,
         parse_provider_usage_from_logs(job.provider, run_dir),
         error,
+        related_repositories,
     )
 
 

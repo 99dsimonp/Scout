@@ -182,18 +182,47 @@ class StateStore:
         finally:
             conn.close()
 
-    def upsert_repository(self, workspace: str, repo_slug: str, clone_url: str) -> None:
+    def upsert_repository(
+        self,
+        workspace: str,
+        repo_slug: str,
+        clone_url: str,
+        enabled: bool = True,
+    ) -> None:
+        enabled_value = 1 if enabled else 0
         with self.connect() as conn:
+            conn.execute("begin immediate")
             conn.execute(
                 """
                 insert into repositories(workspace, repo_slug, clone_url, enabled)
-                values(?, ?, ?, 1)
+                values(?, ?, ?, ?)
                 on conflict(workspace, repo_slug) do update set
                   clone_url=excluded.clone_url,
-                  enabled=1
+                  enabled=excluded.enabled
                 """,
-                (workspace, repo_slug, clone_url),
+                (workspace, repo_slug, clone_url, enabled_value),
             )
+            if not enabled:
+                conn.execute(
+                    """
+                    delete from review_jobs
+                    where workspace=? and repo_slug=?
+                      and status in ('pending', 'failed_retryable', 'cancelled')
+                    """,
+                    (workspace, repo_slug),
+                )
+                conn.execute(
+                    """
+                    update review_jobs set
+                      status='cancelled',
+                      superseded=1,
+                      error_message='Repository review is disabled',
+                      updated_at=?
+                    where workspace=? and repo_slug=?
+                      and status in ('running', 'publishing')
+                    """,
+                    (utcnow(), workspace, repo_slug),
+                )
 
     def enqueue_or_update_pr(
         self,
@@ -208,6 +237,8 @@ class StateStore:
         now = utcnow()
         with self.connect() as conn:
             conn.execute("begin immediate")
+            if _repository_disabled(conn, pr.workspace, pr.repo_slug):
+                return False
             conn.execute(
                 """
                 insert into pull_request_state(
@@ -296,6 +327,46 @@ class StateStore:
                 )
                 return True
 
+            if existing["target_review_key"] == key and existing["status"] == "cancelled":
+                run_id = uuid.uuid4().hex
+                conn.execute(
+                    """
+                    update review_jobs set
+                      title=?,
+                      description=?,
+                      source_branch=?,
+                      target_source_commit_hash=?,
+                      running_source_commit_hash=null,
+                      destination_branch=?,
+                      destination_commit_hash=?,
+                      merge_base_hash=?,
+                      target_review_run_id=?,
+                      running_review_key=null,
+                      running_review_run_id=null,
+                      status='pending',
+                      superseded=0,
+                      attempts=0,
+                      leased_until=null,
+                      lease_token=null,
+                      error_message=null,
+                      updated_at=?
+                    where id=?
+                    """,
+                    (
+                        pr.title,
+                        pr.description,
+                        pr.source_branch,
+                        pr.source_commit_hash,
+                        pr.destination_branch,
+                        pr.destination_commit_hash,
+                        pr.merge_base_hash,
+                        run_id,
+                        now,
+                        existing["id"],
+                    ),
+                )
+                return True
+
             if existing["target_review_key"] == key:
                 conn.execute(
                     """
@@ -378,6 +449,8 @@ class StateStore:
         now = utcnow()
         with self.connect() as conn:
             conn.execute("begin immediate")
+            if _repository_disabled(conn, pr.workspace, pr.repo_slug):
+                return False
             conn.execute(
                 """
                 insert into pull_request_state(
@@ -544,6 +617,7 @@ class StateStore:
                 where workspace=? and repo_slug=? and pr_id=?
                   and reviewer_policy_version=? and schema_version=? and provider=? and output_mode=?
                   and target_review_key=?
+                  and status != 'cancelled'
                 """,
                 (pr.workspace, pr.repo_slug, pr.pr_id, policy_version, schema_version, provider, output_mode, key),
             ).fetchone()
@@ -1075,6 +1149,12 @@ class StateStore:
                   error_message=?,
                   updated_at=?
                 where status in ('running', 'publishing')
+                  and not exists (
+                    select 1 from repositories
+                    where repositories.workspace=review_jobs.workspace
+                      and repositories.repo_slug=review_jobs.repo_slug
+                      and repositories.enabled=0
+                  )
                 """,
                 (error_message[:2000], now),
             )
@@ -1131,6 +1211,12 @@ class StateStore:
                    )
                 )
                 and not exists (
+                  select 1 from repositories
+                  where repositories.workspace=review_jobs.workspace
+                    and repositories.repo_slug=review_jobs.repo_slug
+                    and repositories.enabled=0
+                )
+                and not exists (
                   select 1 from provider_state
                   where provider_state.provider=review_jobs.provider
                     and provider_state.status in ('rate_limited', 'quota_exhausted')
@@ -1173,6 +1259,12 @@ class StateStore:
                       )
                     )
                     and not exists (
+                      select 1 from repositories
+                      where repositories.workspace=review_jobs.workspace
+                        and repositories.repo_slug=review_jobs.repo_slug
+                        and repositories.enabled=0
+                    )
+                    and not exists (
                       select 1 from provider_state
                       where provider_state.provider=review_jobs.provider
                         and provider_state.status in ('rate_limited', 'quota_exhausted')
@@ -1212,6 +1304,12 @@ class StateStore:
                      and review_jobs.leased_until is not null
                      and review_jobs.leased_until <= ?
                    )
+                )
+                and not exists (
+                  select 1 from repositories
+                  where repositories.workspace=review_jobs.workspace
+                    and repositories.repo_slug=review_jobs.repo_slug
+                    and repositories.enabled=0
                 )
                 and not exists (
                   select 1 from provider_state
@@ -1262,6 +1360,12 @@ class StateStore:
                     and leased_until is not null
                     and leased_until <= ?
                   )
+                )
+                and not exists (
+                  select 1 from repositories
+                  where repositories.workspace=review_jobs.workspace
+                    and repositories.repo_slug=review_jobs.repo_slug
+                    and repositories.enabled=0
                 )
                 and not exists (
                   select 1 from provider_state
@@ -1670,6 +1774,17 @@ def _clear_expired_provider_cooldowns(conn: sqlite3.Connection, now: str) -> Non
         """,
         (now, now),
     )
+
+
+def _repository_disabled(conn: sqlite3.Connection, workspace: str, repo_slug: str) -> bool:
+    row = conn.execute(
+        """
+        select 1 from repositories
+        where workspace=? and repo_slug=? and enabled=0
+        """,
+        (workspace, repo_slug),
+    ).fetchone()
+    return row is not None
 
 
 def _lease_filter(lease_token: Optional[str]) -> tuple:

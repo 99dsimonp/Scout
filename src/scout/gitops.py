@@ -11,7 +11,7 @@ import subprocess
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from .models import PullRequest
 from .review_plan import count_changed_lines
@@ -70,7 +70,69 @@ class GitManager:
                 raise
         return worktree
 
-    def prepare_context(self, mirror: Path, worktree: Path, pr: PullRequest) -> Dict[str, str]:
+    def resolve_context_revision(self, mirror: Path, context_ref: Optional[str] = None) -> Tuple[str, str]:
+        if context_ref:
+            candidates = [context_ref]
+            if not context_ref.startswith("refs/"):
+                candidates = ["refs/heads/{}".format(context_ref), context_ref]
+            for candidate in candidates:
+                result = self._run_git(
+                    ["-C", str(mirror), "rev-parse", "--verify", "{}^{{commit}}".format(candidate)]
+                )
+                if result.returncode == 0:
+                    return context_ref, result.stdout.strip()
+            raise GitError("related repository ref not found: {}".format(context_ref))
+
+        remote_head = self._git_capture(
+            ["-C", str(mirror), "ls-remote", "--symref", "origin", "HEAD"]
+        )
+        default_ref = None
+        for line in remote_head.splitlines():
+            if line.startswith("ref: ") and line.endswith("\tHEAD"):
+                default_ref = line[5:].split("\t", 1)[0]
+                break
+        if default_ref is None:
+            raise GitError("could not resolve related repository remote default branch")
+        commit = self._git_capture(
+            ["-C", str(mirror), "rev-parse", "--verify", "{}^{{commit}}".format(default_ref)]
+        ).strip()
+        return default_ref, commit
+
+    def create_context_worktree(
+        self,
+        mirror: Path,
+        workspace: str,
+        primary_repo_slug: str,
+        repo_slug: str,
+        commit: str,
+        job_id: int,
+    ) -> Path:
+        worktree = (
+            self.worktrees_dir
+            / workspace
+            / primary_repo_slug
+            / "context-job-{}".format(job_id)
+            / "{}-{}".format(repo_slug, commit[:12])
+        )
+        with self._mirror_lock(mirror):
+            if worktree.exists():
+                self._remove_worktree_unlocked(mirror, worktree)
+            worktree.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self._git(["-C", str(mirror), "worktree", "add", "--detach", str(worktree), commit])
+                self._make_readonly(worktree)
+            except Exception:
+                self._remove_worktree_unlocked(mirror, worktree)
+                raise
+        return worktree
+
+    def prepare_context(
+        self,
+        mirror: Path,
+        worktree: Path,
+        pr: PullRequest,
+        related_repositories: Optional[List[Dict[str, str]]] = None,
+    ) -> Dict[str, object]:
         base_ref = pr.destination_commit_hash or pr.destination_branch
         merge_base = self._git_capture(["-C", str(worktree), "merge-base", "HEAD", base_ref]).strip()
         diff = self._git_capture(["-C", str(worktree), "diff", "{}..HEAD".format(merge_base)])
@@ -78,7 +140,7 @@ class GitManager:
         changed_lines = count_changed_lines(diff)
         context_dir = worktree / ".scout-review"
         context_dir.mkdir(parents=True, exist_ok=True)
-        context = {
+        context: Dict[str, object] = {
             "workspace": pr.workspace,
             "repo_slug": pr.repo_slug,
             "pr_id": str(pr.pr_id),
@@ -92,12 +154,13 @@ class GitManager:
             "changed_lines": str(changed_lines),
             "diff_path": str(context_dir / "diff.patch"),
             "files_path": str(context_dir / "files.txt"),
+            "related_repositories": list(related_repositories or []),
         }
+        context["context_path"] = str(context_dir / "context.json")
         (context_dir / "context.json").write_text(json.dumps(context, indent=2, sort_keys=True), encoding="utf-8")
         (context_dir / "diff.patch").write_text(diff, encoding="utf-8")
         (context_dir / "files.txt").write_text(files, encoding="utf-8")
         self._make_readonly(worktree)
-        context["context_path"] = str(context_dir / "context.json")
         return context
 
     def remove_worktree(self, mirror: Path, worktree: Path) -> None:
@@ -114,6 +177,11 @@ class GitManager:
             try:
                 self._git(["-C", str(mirror), "worktree", "prune"])
             except GitError:
+                pass
+        if worktree.parent.name.startswith("context-job-"):
+            try:
+                worktree.parent.rmdir()
+            except OSError:
                 pass
 
     def _git(self, args: list) -> None:

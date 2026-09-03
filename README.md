@@ -192,6 +192,44 @@ source branches, or `ignored_target_branches` to ignore PRs targeting matching
 destination branches.
 To process only non-draft PRs, set `ignore_draft_pull_requests = true` for the
 repository block.
+
+Repositories can also provide read-only context for a review:
+
+```toml
+[[bitbucket.repositories]]
+slug = "app"
+clone_url = "git@bitbucket.org:my-workspace/app.git"
+related_repositories = ["contracts"]
+
+[[bitbucket.repositories]]
+slug = "contracts"
+clone_url = "git@bitbucket.org:my-workspace/contracts.git"
+review_enabled = false
+context_ref = "master"
+```
+
+`related_repositories` names other configured repository blocks. Scout fetches
+each directly listed repository for every review job, resolves `context_ref` to
+an exact commit, and gives that detached, read-only worktree to the reviewer.
+When `context_ref` is omitted, Scout uses the remote repository's default
+branch. Related relationships are not expanded recursively. A repository with
+`review_enabled = false` is not polled for pull requests, although startup still
+validates its Bitbucket repository and clone URL because review jobs may need it.
+
+Related repositories must be disclosure-compatible trust domains. Scout sends
+their contents to the configured AI provider as review context. The provider may
+quote that content in its response; Scout may then reproduce those excerpts in
+Bitbucket reports or comments and retain them in raw files under
+`state_dir/runs/`. Only relate a repository when its content may be disclosed to
+every contributor or viewer who can read review output in the primary
+repository. Prompt instructions tell the reviewer how to use related code, but
+they do not enforce this confidentiality boundary.
+
+Related branch changes do not alter review identity and do not automatically
+rerun an unchanged PR. Bump `review.policy_version` when enabling or changing
+related repository context so existing PR commits are reviewed under the new
+policy.
+
 Workers claim the oldest eligible row from the global queue after filtering for
 provider capacity and cooldowns. A running or cooling-down provider does not
 force other eligible providers to sit idle behind an older PR.

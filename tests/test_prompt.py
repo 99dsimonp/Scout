@@ -67,6 +67,31 @@ class PromptTests(unittest.TestCase):
         )
         self.assertIn("Claude", prompt)
 
+    def test_prompt_lists_related_repositories_as_context_only(self):
+        review_context = context()
+        review_context["related_repositories"] = [
+            {
+                "slug": "contracts",
+                "ref": "refs/heads/main",
+                "commit": "1234567890abcdef",
+                "path": "/context/contracts",
+            }
+        ]
+        prompt = build_codex_prompt(
+            review_context,
+            "/tmp/schema.json",
+            ReviewPlan(changed_lines=240, high_risk=False, subagents_per_lens=2),
+        )
+
+        self.assertIn(
+            "contracts: ref=refs/heads/main, commit=1234567890abcdef, path=/context/contracts",
+            prompt,
+        )
+        self.assertIn("supporting context only", prompt)
+        self.assertIn("Never report findings against related-repository files", prompt)
+        self.assertIn("anchored to a changed line listed in the primary PR", prompt)
+        self.assertIn("not recursively look for other repositories", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

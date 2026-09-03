@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from typing import Dict
+from typing import Dict, List
 
 from .review_plan import ReviewPlan, format_review_plan
 
 
-def build_provider_prompt(provider: str, context: Dict[str, str], schema_path: str, review_plan: ReviewPlan) -> str:
+def build_provider_prompt(provider: str, context: Dict[str, object], schema_path: str, review_plan: ReviewPlan) -> str:
     if provider == "codex":
         return build_codex_prompt(context, schema_path, review_plan)
     if provider == "claude":
@@ -13,7 +13,7 @@ def build_provider_prompt(provider: str, context: Dict[str, str], schema_path: s
     raise ValueError("unsupported provider: {}".format(provider))
 
 
-def build_codex_prompt(context: Dict[str, str], schema_path: str, review_plan: ReviewPlan) -> str:
+def build_codex_prompt(context: Dict[str, object], schema_path: str, review_plan: ReviewPlan) -> str:
     return _build_prompt(
         intro="You are reviewing a Bitbucket Cloud pull request for Scout.",
         subagent_instructions="""When spawning subagents, keep the current Codex model and reasoning effort.
@@ -27,7 +27,7 @@ can support, not only the first or highest severity finding.""",
     )
 
 
-def build_claude_prompt(context: Dict[str, str], schema_path: str, review_plan: ReviewPlan) -> str:
+def build_claude_prompt(context: Dict[str, object], schema_path: str, review_plan: ReviewPlan) -> str:
     return _build_prompt(
         intro="You are Claude reviewing a Bitbucket Cloud pull request for Scout.",
         subagent_instructions="""When spawning subagents, keep the current Claude model and effort configuration.
@@ -44,10 +44,14 @@ can support, not only the first or highest severity finding.""",
 def _build_prompt(
     intro: str,
     subagent_instructions: str,
-    context: Dict[str, str],
+    context: Dict[str, object],
     schema_path: str,
     review_plan: ReviewPlan,
 ) -> str:
+    formatted_context = dict(context)
+    formatted_context["related_repositories"] = _format_related_repositories(
+        context.get("related_repositories", [])
+    )
     return """{intro}
 
 Repository context:
@@ -69,10 +73,16 @@ Generated review context files:
 - Diff patch: {diff_path}
 - Output schema: {schema_path}
 
+Related repositories (supporting context only):
+{related_repositories}
+
 Review only committed changes in the PR diff from merge base to HEAD. You may
-inspect surrounding repository code when needed to understand impact, but
-findings must be anchored to changed lines. Do not modify files. Do not perform
-network operations. Do not invent line numbers.
+inspect surrounding repository code and the directly listed related repositories
+when needed to understand contracts, callers, schemas, or shared behavior. Do
+not recursively look for other repositories. Every finding must refer to the
+primary repository and be anchored to a changed line listed in the primary PR
+diff. Never report findings against related-repository files. Do not modify
+files. Do not perform network operations. Do not invent line numbers.
 
 {review_plan_text}
 
@@ -99,5 +109,15 @@ actionable findings.
         schema_path=schema_path,
         subagent_instructions=subagent_instructions,
         review_plan_text=format_review_plan(review_plan),
-        **context
+        **formatted_context
+    )
+
+
+def _format_related_repositories(value: object) -> str:
+    if not value:
+        return "- None configured."
+    repositories: List[Dict[str, str]] = value  # type: ignore[assignment]
+    return "\n".join(
+        "- {slug}: ref={ref}, commit={commit}, path={path}".format(**repo)
+        for repo in repositories
     )

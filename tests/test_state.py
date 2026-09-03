@@ -10,6 +10,133 @@ from scout.state import StateStore
 
 
 class StateTests(unittest.TestCase):
+    def test_disabling_repository_cancels_queued_failed_and_active_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            store.upsert_repository("ws", "repo", "ssh://repo")
+
+            def pull_request(pr_id):
+                return PullRequest(
+                    workspace="ws",
+                    repo_slug="repo",
+                    pr_id=pr_id,
+                    title="PR {}".format(pr_id),
+                    description="",
+                    source_branch="feature",
+                    source_commit_hash=str(pr_id) * 40,
+                    destination_branch="main",
+                )
+
+            store.enqueue_or_update_pr(pull_request(1), "v1", "v1", "codex")
+            failed = store.claim_pending_jobs(1, 1200)[0]
+            store.mark_retryable_failure(failed.id, "failed", 3)
+            store.enqueue_or_update_pr(pull_request(2), "v1", "v1", "codex")
+            active = store.claim_pending_jobs(1, 1200)[0]
+            store.enqueue_or_update_pr(pull_request(3), "v1", "v1", "codex")
+
+            store.upsert_repository("ws", "repo", "ssh://repo", enabled=False)
+
+            self.assertEqual(store.claim_pending_jobs(10, 1200), [])
+            self.assertIsNone(store.claim_next_pending_job({"codex": 1200}))
+            self.assertEqual(store.recover_abandoned_jobs(), 0)
+            current = store.get_job(active.id)
+            self.assertEqual(current.status, "cancelled")
+            self.assertTrue(current.superseded)
+            store.return_superseded_to_pending(active.id, active.lease_token)
+            self.assertEqual(store.get_job(active.id).status, "cancelled")
+            self.assertFalse(
+                store.enqueue_or_update_pr(pull_request(4), "v1", "v1", "codex")
+            )
+            with store.connect() as conn:
+                self.assertEqual(
+                    conn.execute(
+                        "select enabled from repositories where workspace='ws' and repo_slug='repo'"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(conn.execute("select count(*) from review_jobs").fetchone()[0], 1)
+
+    def test_reenabling_repository_queues_unchanged_formerly_pending_pr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            pr = PullRequest(
+                workspace="ws",
+                repo_slug="repo",
+                pr_id=1,
+                title="PR",
+                description="",
+                source_branch="feature",
+                source_commit_hash="a" * 40,
+                destination_branch="main",
+            )
+            store.upsert_repository("ws", "repo", "ssh://repo")
+            self.assertTrue(store.enqueue_or_update_pr(pr, "v1", "v1", "codex"))
+            store.upsert_repository("ws", "repo", "ssh://repo", enabled=False)
+            self.assertEqual(store.claim_pending_jobs(1, 1200), [])
+
+            store.upsert_repository("ws", "repo", "ssh://repo", enabled=True)
+
+            self.assertTrue(store.enqueue_or_update_pr(pr, "v1", "v1", "codex"))
+            queued = store.claim_pending_jobs(1, 1200)
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(queued[0].running_source_commit_hash, "a" * 40)
+
+    def test_claim_paths_filter_repository_disabled_outside_upsert(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            store.upsert_repository("ws", "repo", "ssh://repo")
+            pr = PullRequest(
+                workspace="ws",
+                repo_slug="repo",
+                pr_id=1,
+                title="PR",
+                description="",
+                source_branch="feature",
+                source_commit_hash="a" * 40,
+                destination_branch="main",
+            )
+            store.enqueue_or_update_pr(pr, "v1", "v1", "codex")
+            with store.connect() as conn:
+                conn.execute("update repositories set enabled=0 where repo_slug='repo'")
+
+            self.assertEqual(store.claim_pending_jobs(1, 1200), [])
+            self.assertIsNone(store.claim_next_pending_job({"codex": 1200}))
+
+            store.upsert_repository("ws", "repo", "ssh://repo", enabled=True)
+            self.assertIsNotNone(store.claim_next_pending_job({"codex": 1200}))
+
+    def test_recovery_does_not_requeue_disabled_abandoned_active_job(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            store.upsert_repository("ws", "repo", "ssh://repo")
+            pr = PullRequest(
+                workspace="ws",
+                repo_slug="repo",
+                pr_id=1,
+                title="PR",
+                description="",
+                source_branch="feature",
+                source_commit_hash="a" * 40,
+                destination_branch="main",
+            )
+            store.enqueue_or_update_pr(pr, "v1", "v1", "codex")
+            active = store.claim_pending_jobs(1, 1200)[0]
+            with store.connect() as conn:
+                conn.execute("update repositories set enabled=0 where repo_slug='repo'")
+                conn.execute(
+                    "update review_jobs set leased_until='2000-01-01T00:00:00+00:00' where id=?",
+                    (active.id,),
+                )
+
+            self.assertEqual(store.recover_abandoned_jobs(), 0)
+            self.assertEqual(store.claim_pending_jobs(1, 1200), [])
+            self.assertIsNone(store.claim_next_pending_job({"codex": 1200}))
+            self.assertEqual(store.get_job(active.id).status, "running")
+
     def test_queue_collapses_new_commits_for_same_pr(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(tmp + "/state.db")

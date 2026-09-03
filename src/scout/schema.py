@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
@@ -55,6 +56,100 @@ def validate_review_output(obj: Dict[str, Any], max_findings: int = 100) -> Vali
         raise ReviewValidationError("request_changes recommendation must include at least one annotation")
 
     return ValidatedReview(recommendation=recommendation, report=report, annotations=annotations)
+
+
+def validate_annotation_locations(review: ValidatedReview, diff: str) -> None:
+    changed_lines = _changed_new_lines(diff)
+    for annotation in review.annotations:
+        location = (annotation["path"], annotation["line"])
+        if location not in changed_lines:
+            raise ReviewValidationError(
+                "annotation {} must target a changed line in the primary PR diff: {}:{}".format(
+                    annotation["external_id"],
+                    annotation["path"],
+                    annotation["line"],
+                )
+            )
+
+
+def _changed_new_lines(diff: str) -> set:
+    changed = set()
+    path = None
+    new_line = None
+    expect_new_path = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            path = None
+            new_line = None
+            expect_new_path = False
+            continue
+        if new_line is None and line.startswith("--- "):
+            expect_new_path = True
+            continue
+        if new_line is None and expect_new_path and line.startswith("+++ "):
+            path = _decode_diff_path(line[4:])
+            if path == "/dev/null":
+                path = None
+            elif path.startswith("b/"):
+                path = path[2:]
+            expect_new_path = False
+            continue
+        if line.startswith("@@ "):
+            match = re.search(r"\+(\d+)(?:,\d+)?", line)
+            new_line = int(match.group(1)) if match and path is not None else None
+            continue
+        if new_line is None:
+            continue
+        if line.startswith("+"):
+            changed.add((path, new_line))
+            new_line += 1
+        elif line.startswith("-") or line.startswith("\\"):
+            continue
+        else:
+            new_line += 1
+    return changed
+
+
+def _decode_diff_path(value: str) -> str:
+    if not value.startswith('"'):
+        return value.split("\t", 1)[0]
+
+    encoded = bytearray()
+    index = 1
+    escapes = {
+        "a": 7,
+        "b": 8,
+        "t": 9,
+        "n": 10,
+        "v": 11,
+        "f": 12,
+        "r": 13,
+        '"': 34,
+        "\\": 92,
+    }
+    while index < len(value):
+        char = value[index]
+        if char == '"':
+            break
+        if char != "\\":
+            encoded.extend(char.encode("utf-8"))
+            index += 1
+            continue
+        index += 1
+        if index >= len(value):
+            encoded.append(92)
+            break
+        escaped = value[index]
+        if escaped in "01234567":
+            end = index + 1
+            while end < min(index + 3, len(value)) and value[end] in "01234567":
+                end += 1
+            encoded.append(int(value[index:end], 8))
+            index = end
+            continue
+        encoded.append(escapes.get(escaped, ord(escaped)))
+        index += 1
+    return encoded.decode("utf-8", errors="replace")
 
 
 def report_result_for_recommendation(recommendation: str) -> str:

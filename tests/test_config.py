@@ -74,6 +74,79 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.bitbucket.repositories[0].pr_ids, [])
         self.assertEqual(config.bitbucket.repositories[0].ignored_target_branches, [])
         self.assertFalse(config.bitbucket.repositories[0].ignore_draft_pull_requests)
+        self.assertEqual(config.bitbucket.repositories[0].related_repositories, [])
+        self.assertTrue(config.bitbucket.repositories[0].review_enabled)
+        self.assertIsNone(config.bitbucket.repositories[0].context_ref)
+
+    def test_parse_related_and_context_only_repositories(self):
+        config = parse_config(
+            {
+                "bitbucket": {
+                    "workspace": "ws",
+                    "repositories": [
+                        {
+                            "slug": "app",
+                            "clone_url": "git@bitbucket.org:ws/app.git",
+                            "related_repositories": ["contracts"],
+                        },
+                        {
+                            "slug": "contracts",
+                            "clone_url": "git@bitbucket.org:ws/contracts.git",
+                            "review_enabled": False,
+                            "context_ref": "main",
+                        },
+                    ],
+                },
+            }
+        )
+
+        self.assertEqual(config.bitbucket.repositories[0].related_repositories, ["contracts"])
+        self.assertFalse(config.bitbucket.repositories[1].review_enabled)
+        self.assertEqual(config.bitbucket.repositories[1].context_ref, "main")
+
+    def test_rejects_unknown_duplicate_and_self_related_repositories(self):
+        base = {
+            "bitbucket": {
+                "workspace": "ws",
+                "repositories": [
+                    {
+                        "slug": "app",
+                        "clone_url": "ssh://app",
+                        "related_repositories": ["missing"],
+                    }
+                ],
+            }
+        }
+        with self.assertRaisesRegex(ConfigError, "unknown related repository"):
+            parse_config(base)
+
+        base["bitbucket"]["repositories"][0]["related_repositories"] = ["app"]
+        with self.assertRaisesRegex(ConfigError, "cannot list itself"):
+            parse_config(base)
+
+        base["bitbucket"]["repositories"] = [
+            {"slug": "app", "clone_url": "ssh://one"},
+            {"slug": "app", "clone_url": "ssh://two"},
+        ]
+        with self.assertRaisesRegex(ConfigError, "duplicate slug"):
+            parse_config(base)
+
+    def test_rejects_configuration_with_only_context_repositories(self):
+        with self.assertRaisesRegex(ConfigError, "at least one review-enabled"):
+            parse_config(
+                {
+                    "bitbucket": {
+                        "workspace": "ws",
+                        "repositories": [
+                            {
+                                "slug": "context",
+                                "clone_url": "ssh://context",
+                                "review_enabled": False,
+                            }
+                        ],
+                    }
+                }
+            )
 
     def test_parse_oauth_bitbucket_auth(self):
         config = parse_config(

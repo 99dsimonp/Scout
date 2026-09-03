@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 from .comment_request import (
     CommentRequestClassification,
@@ -56,6 +56,7 @@ class ClaudeRunner:
         schema_path: str,
         run_dir: str,
         is_superseded: Callable[[], bool],
+        additional_dirs: Optional[List[str]] = None,
     ) -> ProviderResult:
         Path(run_dir).mkdir(parents=True, exist_ok=True)
         stdout_file = Path(run_dir) / "claude-stdout.log"
@@ -64,7 +65,7 @@ class ClaudeRunner:
         prompt_file.write_text(prompt, encoding="utf-8")
 
         schema_content = self._read_schema(schema_path)
-        cmd = self.build_command(prompt, schema_content)
+        cmd = self.build_command(prompt, schema_content, additional_dirs=additional_dirs)
         LOG.info("starting Claude review command=%s prompt_file=%s", _redacted_cmd(cmd), prompt_file)
         with prompt_file.open("r", encoding="utf-8") as prompt_input, \
             stdout_file.open("w", encoding="utf-8") as stdout, \
@@ -289,7 +290,12 @@ class ClaudeRunner:
             )
         return extract_comment_request(stdout_text)
 
-    def build_command(self, prompt: str, schema_content: str) -> list:
+    def build_command(
+        self,
+        prompt: str,
+        schema_content: str,
+        additional_dirs: Optional[List[str]] = None,
+    ) -> list:
         cmd = [
             self.config.command,
             "-p",
@@ -314,6 +320,8 @@ class ClaudeRunner:
             cmd.extend(["--model", self.config.model.strip()])
         if self.config.effort.strip():
             cmd.extend(["--effort", self.config.effort.strip()])
+        for directory in additional_dirs or []:
+            cmd.extend(["--add-dir", directory])
         return cmd
 
     def build_risk_command(self, schema_content: str, model: str, effort: str) -> list:

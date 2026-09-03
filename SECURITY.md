@@ -51,7 +51,10 @@ In scope &mdash; please report:
   - execute attacker-controlled code outside the provider CLI's documented
     sandbox,
   - post Bitbucket reports or comments outside the PR being reviewed,
-  - exfiltrate other repositories' content,
+  - exfiltrate content from a repository that was not explicitly configured as
+    related context for this primary repository, or that the operator did not
+    authorize for disclosure to the primary repository's contributors and
+    review viewers,
   - or bypass the readonly-worktree guarantees.
 - SQL injection or unsafe deserialization anywhere in the state layer.
 - Bypasses of the configured tool allowlist that Scout passes to provider CLIs
@@ -68,11 +71,15 @@ Out of scope:
 - Issues that require an attacker who already has root on the host running
   Scout, or who already has write access to `/etc/scout/` or the state
   directory.
-- Issues that require an attacker with write access to Scout's configured
-  Bitbucket workspace already having permissions equivalent to a maintainer
-  on the reviewed repositories. Scout assumes the reviewed Bitbucket workspace
-  and repositories are trusted by the operator (see `DESIGN.md` &sect;
-  "Non-Goals for v1").
+- Issues that require an attacker who already has maintainer-equivalent access
+  to the primary repository or an authorized related repository to influence
+  that repository's review inputs. This trust does not authorize access to any
+  repository outside the configured relationship or disclosure audience (see
+  `DESIGN.md` &sect; "Non-Goals for v1").
+- Disclosure of an explicitly related repository through the configured AI
+  provider, Bitbucket review output, or retained raw provider logs, when the
+  operator has authorized that repository as disclosure-compatible with the
+  primary repository.
 - Denial of service through legitimate API rate limits, provider usage caps,
   or expected Bitbucket throttling.
 - Missing security hardening that is documented as a non-goal (for example,
@@ -100,6 +107,24 @@ Out of scope:
   assignment for qualifying issues.
 
 ## Operator-side hardening (not a vulnerability, but worth knowing)
+
+### Related repository confidentiality boundary
+
+Scout treats a primary repository and each repository named in its
+`related_repositories` setting as one disclosure-compatible trust domain. Scout
+sends related source code to the configured AI provider. The provider can quote
+that source in its response, which can cause Scout to publish it in Bitbucket
+review text and retain it in raw logs under `state_dir/runs/`.
+
+Only configure a relationship when every contributor or viewer who can read the
+primary repository's review output is permitted to receive the related
+repository's content. If a private internal repository is related to a primary
+repository with outside contributors, a provider response can disclose internal
+source to those contributors. Prompt instructions that say not to report
+related-repository findings reduce accidental misuse, but they are not a
+security or confidentiality control. Exfiltration from unrelated repositories,
+or from repositories the operator did not authorize for that audience, remains
+in scope as a vulnerability.
 
 If you operate Scout, the following reduce blast radius and should be in place
 before exposing the daemon to live PR traffic:

@@ -70,6 +70,19 @@ class ClaudeRunnerTests(unittest.TestCase):
         cmd = runner.build_command("prompt", '{"type":"object"}')
         self.assertNotIn("--effort", cmd)
 
+    def test_build_command_adds_related_repository_directories(self):
+        runner = ClaudeRunner(claude_config(), CredentialStore("/tmp/unused"))
+        cmd = runner.build_command(
+            "prompt",
+            '{"type":"object"}',
+            additional_dirs=["/context/contracts", "/context/service"],
+        )
+
+        self.assertEqual(
+            [cmd[index + 1] for index, item in enumerate(cmd) if item == "--add-dir"],
+            ["/context/contracts", "/context/service"],
+        )
+
     def test_build_risk_command_uses_classifier_model_and_effort(self):
         runner = ClaudeRunner(claude_config(model="claude-sonnet-4-6", effort="max"), CredentialStore("/tmp/unused"))
         cmd = runner.build_risk_command('{"type":"object"}', model="claude-sonnet-4-6", effort="low")

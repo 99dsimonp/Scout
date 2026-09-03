@@ -20,7 +20,7 @@ from scout.daemon import (
 from scout.config import CredentialStore, parse_config
 from scout.gitops import GitError
 from scout.models import PullRequest
-from scout.provider import ProviderResult
+from scout.provider import ProviderError, ProviderResult
 from scout.schema import validate_review_output
 from scout.state import ReviewJob, StateStore
 
@@ -205,13 +205,42 @@ class DaemonReviewLogTests(unittest.TestCase):
 
             self.assertEqual(
                 daemon.state.calls,
-                ["initialize", ("upsert", "ws", "repo", "ssh://repo"), "recover", "cleanup"],
+                ["initialize", ("upsert", "ws", "repo", "ssh://repo", True), "recover", "cleanup"],
             )
             self.assertEqual(daemon.providers["codex"].calls, ["validate_startup"])
             self.assertEqual(daemon.bitbucket.validated, ["repo"])
             self.assertEqual(daemon.git.validated, ["ssh://repo"])
             self.assertTrue(
                 any("recovered abandoned active review jobs count=2" in message for message in logs.output)
+            )
+
+    def test_initialize_persists_context_only_repository_as_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = ScoutDaemon.__new__(ScoutDaemon)
+            daemon.config = SimpleNamespace(
+                service=SimpleNamespace(state_dir=tmp, retention_days=7),
+                bitbucket=SimpleNamespace(
+                    workspace="ws",
+                    repositories=[
+                        SimpleNamespace(
+                            slug="context",
+                            clone_url="ssh://context",
+                            review_enabled=False,
+                        )
+                    ],
+                ),
+            )
+            daemon.state = _FakeStartupState(recovered=0)
+            daemon.providers = {"codex": _FakeStartupProvider()}
+            daemon.bitbucket = _FakeStartupBitbucket()
+            daemon.git = _FakeStartupGit()
+            daemon.cleanup_old_artifacts = lambda: None
+
+            daemon.initialize()
+
+            self.assertIn(
+                ("upsert", "ws", "context", "ssh://context", False),
+                daemon.state.calls,
             )
 
     def test_init_loads_risk_provider_without_adding_review_provider(self):
@@ -340,6 +369,21 @@ class DaemonReviewLogTests(unittest.TestCase):
         )
         self.assertEqual(len(daemon.state.seeded), 1)
         self.assertEqual(daemon.state.enqueued, [])
+
+    def test_poll_once_does_not_poll_context_only_repository(self):
+        daemon = _polling_daemon(report_exists=False)
+        daemon.config.bitbucket.repositories.append(
+            SimpleNamespace(
+                slug="contracts",
+                pr_ids=[],
+                ignored_source_branches=[],
+                review_enabled=False,
+            )
+        )
+
+        daemon.poll_once()
+
+        self.assertEqual(daemon.bitbucket.list_calls, ["repo"])
 
     def test_empty_db_bootstrap_seeds_existing_reports_for_all_providers(self):
         daemon = _polling_daemon(report_exists=True, providers=["codex", "claude"])
@@ -1869,6 +1913,81 @@ class DaemonReviewLogTests(unittest.TestCase):
             self.assertEqual(daemon.bitbucket.operations, ["inline_comment"])
             self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
 
+    def test_run_job_passes_related_context_and_records_exact_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = _related_run_job_daemon(tmp)
+
+            daemon.run_job(review_job(provider="codex", job_id=31))
+
+            run = daemon.providers["codex"].runs[0]
+            self.assertEqual(
+                daemon.git.ensured,
+                [("ws", "repo", "ssh://repo"), ("ws", "contracts", "ssh://contracts")],
+            )
+            self.assertEqual(run["additional_dirs"], ["/context-job-31/contracts"])
+            self.assertIn("contracts: ref=main, commit={}".format("c" * 40), run["prompt"])
+            self.assertEqual(
+                daemon.git.prepared_related,
+                [
+                    {
+                        "slug": "contracts",
+                        "ref": "main",
+                        "commit": "c" * 40,
+                        "path": "/context-job-31/contracts",
+                    }
+                ],
+            )
+            self.assertEqual(
+                daemon.git.removed,
+                [
+                    ("/mirror/contracts", "/context-job-31/contracts"),
+                    ("/mirror/repo", "/worktree"),
+                ],
+            )
+            review_log = json.loads(
+                Path(tmp, "review-log.jsonl").read_text(encoding="utf-8").strip()
+            )
+            self.assertEqual(review_log["related_repositories"], daemon.git.prepared_related)
+            usage_log = json.loads(
+                Path(tmp, "provider-usage.jsonl").read_text(encoding="utf-8").strip()
+            )
+            self.assertEqual(usage_log["related_repositories"], daemon.git.prepared_related)
+
+    def test_run_job_cleans_related_context_when_provider_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = _related_run_job_daemon(tmp, provider=_FailingReviewProvider())
+
+            daemon.run_job(review_job(provider="codex", job_id=32))
+
+            self.assertEqual(
+                daemon.git.removed,
+                [
+                    ("/mirror/contracts", "/context-job-32/contracts"),
+                    ("/mirror/repo", "/worktree"),
+                ],
+            )
+            self.assertEqual(daemon.state.retryable_failures, [(32, 3, 300)])
+
+    def test_run_job_rejects_annotation_outside_primary_changed_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = valid_review()
+            payload.annotations[0]["path"] = "contracts/schema.json"
+            provider = _FakeProvider(
+                final_message={
+                    "recommendation": payload.recommendation,
+                    "report": payload.report,
+                    "annotations": payload.annotations,
+                }
+            )
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+
+            daemon.run_job(review_job(provider="codex", job_id=33))
+
+            self.assertEqual(daemon.bitbucket.reports, [])
+            self.assertEqual(daemon.bitbucket.annotations, [])
+            self.assertEqual(daemon.state.retryable_failures, [(33, 3, 300)])
+            self.assertEqual(len(daemon.git.removed), 2)
+
     def test_git_failure_stays_retryable_after_max_attempts(self):
         with tempfile.TemporaryDirectory() as tmp:
             daemon = ScoutDaemon.__new__(ScoutDaemon)
@@ -1958,8 +2077,8 @@ class _FakeStartupState:
         self.calls.append("recover")
         return self.recovered
 
-    def upsert_repository(self, workspace, repo_slug, clone_url):
-        self.calls.append(("upsert", workspace, repo_slug, clone_url))
+    def upsert_repository(self, workspace, repo_slug, clone_url, enabled=True):
+        self.calls.append(("upsert", workspace, repo_slug, clone_url, enabled))
 
 
 class _FakeStartupProvider:
@@ -2061,9 +2180,11 @@ class _FakePollingBitbucket:
         self.prs = prs
         self.report_exists_result = report_exists
         self.report_checks = []
+        self.list_calls = []
         self.comments_by_pr = {}
 
     def list_open_pull_requests(self, repo_slug, pagelen=50):
+        self.list_calls.append(repo_slug)
         return list(self.prs)
 
     def report_exists(self, repo_slug, commit_hash, report_id):
@@ -2086,13 +2207,14 @@ class _FakeProvider:
         self.risk_error = risk_error
         self.review_requested = review_requested
 
-    def run(self, worktree, prompt, schema_path, run_dir, is_superseded):
+    def run(self, worktree, prompt, schema_path, run_dir, is_superseded, additional_dirs=None):
         self.runs.append(
             {
                 "worktree": worktree,
                 "prompt": prompt,
                 "schema_path": schema_path,
                 "run_dir": run_dir,
+                "additional_dirs": list(additional_dirs or []),
             }
         )
         payload = self.final_message
@@ -2228,10 +2350,105 @@ class _FakeGit:
             "context_path": "/context.json",
             "files_path": "/files.txt",
             "diff_path": "/diff.patch",
+            "diff": (
+                "diff --git a/src/app.py b/src/app.py\n"
+                "--- a/src/app.py\n"
+                "+++ b/src/app.py\n"
+                "@@ -0,0 +12,9 @@\n"
+                "+12\n+13\n+14\n+15\n+16\n+17\n+18\n+19\n+20\n"
+            ),
         }
 
     def remove_worktree(self, mirror, worktree):
         pass
+
+
+class _RelatedFakeGit(_FakeGit):
+    def __init__(self):
+        self.removed = []
+        self.prepared_related = None
+        self.ensured = []
+
+    def ensure_mirror(self, workspace, repo_slug, clone_url):
+        self.ensured.append((workspace, repo_slug, clone_url))
+        return "/mirror/{}".format(repo_slug)
+
+    def resolve_context_revision(self, mirror, context_ref=None):
+        return context_ref or "refs/heads/main", "c" * 40
+
+    def create_context_worktree(
+        self, mirror, workspace, primary_repo_slug, repo_slug, commit, job_id
+    ):
+        return "/context-job-{}/{}".format(job_id, repo_slug)
+
+    def prepare_context(self, mirror, worktree, pr, related_repositories=None):
+        self.prepared_related = related_repositories
+        context = super().prepare_context(mirror, worktree, pr)
+        context["related_repositories"] = list(related_repositories or [])
+        return context
+
+    def remove_worktree(self, mirror, worktree):
+        self.removed.append((mirror, worktree))
+
+
+class _FailingReviewProvider(_FakeProvider):
+    def run(self, *args, **kwargs):
+        super().run(*args, **kwargs)
+        raise ProviderError("provider failed")
+
+
+def _related_run_job_daemon(tmp, provider=None):
+    daemon = ScoutDaemon.__new__(ScoutDaemon)
+    daemon.config = SimpleNamespace(
+        queue=SimpleNamespace(
+            job_timeout_seconds=1200,
+            max_attempts=3,
+            retry_backoff_seconds=300,
+        ),
+        review=SimpleNamespace(
+            schema_path="/tmp/schema.json",
+            max_findings=100,
+        ),
+        service=SimpleNamespace(state_dir=tmp),
+        reports=_FakeReports(),
+        comments=SimpleNamespace(critical_enabled=True),
+    )
+    daemon.provider_configs = {
+        "codex": SimpleNamespace(
+            max_parallel=1,
+            timeout_seconds=1200,
+            model="gpt-5.5",
+            reasoning_effort="high",
+            max_subagents=20,
+            subagent_small_loc_limit=150,
+            subagent_medium_loc_limit=600,
+            subagent_large_loc_limit=1500,
+            subagent_high_risk_bonus=0,
+            subagent_max_per_lens=2,
+        )
+    }
+    daemon.providers = {"codex": provider or _FakeProvider()}
+    daemon.state = _FakeRunJobState()
+    daemon.git = _RelatedFakeGit()
+    daemon.bitbucket = _FakeBitbucket()
+    daemon.clone_urls = {
+        "repo": "ssh://repo",
+        "contracts": "ssh://contracts",
+    }
+    daemon.repository_configs = {
+        "repo": SimpleNamespace(
+            slug="repo",
+            clone_url="ssh://repo",
+            related_repositories=["contracts"],
+        ),
+        "contracts": SimpleNamespace(
+            slug="contracts",
+            clone_url="ssh://contracts",
+            context_ref="main",
+            review_enabled=False,
+        ),
+    }
+    return daemon
 
 
 class _FailingGit:

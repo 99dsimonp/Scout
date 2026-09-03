@@ -1,5 +1,7 @@
 import subprocess
 import shutil
+import json
+import stat
 import tempfile
 import threading
 import time
@@ -332,6 +334,93 @@ class GitManagerTests(unittest.TestCase):
 
             self.assertEqual(errors, [])
             self.assertEqual(max_active, 1)
+
+    def test_resolves_default_and_explicit_context_refs_and_creates_readonly_job_worktrees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            upstream = root / "upstream.git"
+            seed = root / "seed"
+            state = root / "state"
+            self.run_git(["init", "--bare", str(upstream)])
+            self.run_git(["init", str(seed)])
+            self.run_git(["config", "user.email", "scout@example.test"], cwd=seed)
+            self.run_git(["config", "user.name", "Scout Tests"], cwd=seed)
+            (seed / "contract.txt").write_text("v1\n", encoding="utf-8")
+            self.run_git(["add", "contract.txt"], cwd=seed)
+            self.run_git(["commit", "-m", "initial"], cwd=seed)
+            self.run_git(["branch", "-M", "main"], cwd=seed)
+            self.run_git(["remote", "add", "origin", str(upstream)], cwd=seed)
+            self.run_git(["push", "origin", "main"], cwd=seed)
+            self.run_git(["symbolic-ref", "HEAD", "refs/heads/main"], cwd=upstream)
+
+            manager = GitManager(str(state))
+            mirror = manager.ensure_mirror("ws", "contracts", str(upstream))
+            explicit_ref, explicit_commit = manager.resolve_context_revision(mirror, "main")
+            default_ref, default_commit = manager.resolve_context_revision(mirror)
+
+            self.assertEqual(explicit_ref, "main")
+            self.assertEqual(default_ref, "refs/heads/main")
+            self.assertEqual(default_commit, explicit_commit)
+            first = manager.create_context_worktree(
+                mirror, "ws", "app", "contracts", default_commit, 7
+            )
+            second = manager.create_context_worktree(
+                mirror, "ws", "app", "contracts", default_commit, 8
+            )
+            self.assertNotEqual(first, second)
+            self.assertEqual(first.parent.name, "context-job-7")
+            self.assertEqual(stat.S_IMODE((first / "contract.txt").stat().st_mode) & 0o222, 0)
+
+            manager.remove_worktree(mirror, first)
+            manager.remove_worktree(mirror, second)
+            self.assertFalse(first.exists())
+            self.assertFalse(second.exists())
+            self.assertFalse(first.parent.exists())
+            self.assertFalse(second.parent.exists())
+
+    def test_prepare_context_records_related_repository_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = GitManager(tmp)
+            worktree = Path(tmp) / "worktree"
+            worktree.mkdir()
+            pr = type(
+                "PR",
+                (),
+                {
+                    "workspace": "ws",
+                    "repo_slug": "app",
+                    "pr_id": 12,
+                    "title": "Change",
+                    "description": "Description",
+                    "source_branch": "feature",
+                    "source_commit_hash": "a" * 40,
+                    "destination_branch": "main",
+                    "destination_commit_hash": "b" * 40,
+                },
+            )()
+            related = [
+                {
+                    "slug": "contracts",
+                    "ref": "refs/heads/main",
+                    "commit": "c" * 40,
+                    "path": "/context/contracts",
+                }
+            ]
+            with patch.object(
+                manager,
+                "_git_capture",
+                side_effect=["d" * 40 + "\n", "+added\n", "src/app.py\n"],
+            ):
+                context = manager.prepare_context(
+                    Path(tmp) / "mirror.git",
+                    worktree,
+                    pr,
+                    related_repositories=related,
+                )
+
+            manifest = json.loads(Path(context["context_path"]).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["related_repositories"], related)
+            self.assertEqual(context["related_repositories"], related)
 
 
 if __name__ == "__main__":

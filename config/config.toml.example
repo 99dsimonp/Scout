@@ -24,6 +24,9 @@ oauth_token_url = "https://bitbucket.org/site/oauth2/access_token"
 [[bitbucket.repositories]]
 slug = "repo-a"
 clone_url = "git@bitbucket.org:my-workspace/repo-a.git"
+# Optional: make other configured repositories available as read-only review
+# context. Relationships are direct and are not recursively expanded.
+# related_repositories = ["repo-b"]
 # Optional: limit live test runs to specific PR IDs.
 # pr_ids = [123]
 # Optional: skip PRs whose source branch matches any regex pattern.
@@ -36,6 +39,11 @@ clone_url = "git@bitbucket.org:my-workspace/repo-a.git"
 [[bitbucket.repositories]]
 slug = "repo-b"
 clone_url = "git@bitbucket.org:my-workspace/repo-b.git"
+# Optional: keep this repository available as related context without polling
+# it for pull requests.
+# review_enabled = false
+# Optional: related reviews use this ref; omit it to use the remote default branch.
+# context_ref = "master"
 # Leave pr_ids unset to review every changed open PR in this repository.
 # Optionally ignore source branches with regex patterns.
 # ignored_source_branches = ["^release/"]
