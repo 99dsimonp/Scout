@@ -32,10 +32,11 @@ class PromptTests(unittest.TestCase):
         )
         self.assertIn("Changed LOC: 240", prompt)
         self.assertIn("Subagents per review category: 2", prompt)
-        self.assertIn("Total reviewer subagents: 10", prompt)
+        self.assertIn("Total reviewer subagents: 12", prompt)
         self.assertIn("correctness-1", prompt)
         self.assertIn("correctness-2", prompt)
         self.assertIn("best-practices-2", prompt)
+        self.assertIn("compatibility-2", prompt)
         self.assertIn("keep the current Codex model and reasoning effort", prompt)
         self.assertIn("Do not override agent type, model, or reasoning effort", prompt)
         self.assertIn("all actionable findings it", prompt)
@@ -91,6 +92,23 @@ class PromptTests(unittest.TestCase):
         self.assertIn("Never report findings against related-repository files", prompt)
         self.assertIn("anchored to a changed line listed in the primary PR", prompt)
         self.assertIn("not recursively look for other repositories", prompt)
+        self.assertIn("cross-repository contract, version-skew, and rollout-order risks", prompt)
+        self.assertIn("compatibility shims, versioning or deprecation policy, tests", prompt)
+        self.assertIn("supported older or newer related-component versions", prompt)
+        self.assertIn("Do not assert behavior for unavailable versions", prompt)
+        self.assertIn("proves only the listed revision", prompt)
+
+    def test_compatibility_lens_without_related_repositories_stays_grounded(self):
+        prompt = build_codex_prompt(
+            context(),
+            "/tmp/schema.json",
+            ReviewPlan(changed_lines=240, high_risk=False, subagents_per_lens=1),
+        )
+
+        self.assertIn("compatibility", prompt)
+        self.assertIn("externally consumed interfaces, configuration, and data or wire formats", prompt)
+        self.assertIn("No related repositories are configured", prompt)
+        self.assertIn("do not infer other components or force a compatibility finding", prompt)
 
 
 if __name__ == "__main__":

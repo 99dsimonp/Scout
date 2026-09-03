@@ -3,6 +3,7 @@ import unittest
 from scout.review_plan import (
     build_review_plan,
     count_changed_lines,
+    effective_subagent_max_per_lens,
 )
 
 
@@ -41,7 +42,7 @@ class ReviewPlanTests(unittest.TestCase):
                     risk="medium",
                 )
                 self.assertEqual(plan.subagents_per_lens, expected)
-                self.assertEqual(plan.total_subagents, expected * 5)
+                self.assertEqual(plan.total_subagents, expected * 6)
                 self.assertEqual(plan.risk, "medium")
 
     def test_low_risk_uses_one_reviewer_per_lens_regardless_loc(self):
@@ -56,7 +57,7 @@ class ReviewPlanTests(unittest.TestCase):
             risk="low",
         )
         self.assertEqual(plan.subagents_per_lens, 1)
-        self.assertEqual(plan.total_subagents, 5)
+        self.assertEqual(plan.total_subagents, 6)
         self.assertFalse(plan.high_risk)
 
     def test_high_risk_adds_one_per_lens_with_cap(self):
@@ -71,7 +72,7 @@ class ReviewPlanTests(unittest.TestCase):
             risk="high",
         )
         self.assertEqual(plan.subagents_per_lens, 4)
-        self.assertEqual(plan.total_subagents, 20)
+        self.assertEqual(plan.total_subagents, 24)
         self.assertTrue(plan.high_risk)
         self.assertEqual(plan.risk, "high")
 
@@ -103,7 +104,13 @@ class ReviewPlanTests(unittest.TestCase):
         self.assertIn("correctness-1", plan.reviewers)
         self.assertIn("correctness-2", plan.reviewers)
         self.assertIn("security-2", plan.reviewers)
-        self.assertEqual(len(plan.reviewers), 10)
+        self.assertIn("compatibility-1", plan.reviewers)
+        self.assertIn("compatibility-2", plan.reviewers)
+        self.assertEqual(len(plan.reviewers), 12)
+
+    def test_effective_lens_cap_preserves_total_provider_limit(self):
+        self.assertEqual(effective_subagent_max_per_lens(3, 15), 2)
+        self.assertEqual(effective_subagent_max_per_lens(3, 18), 3)
 
 
 if __name__ == "__main__":

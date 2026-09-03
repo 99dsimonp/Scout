@@ -21,7 +21,12 @@ from .models import PullRequest
 from .prompt import build_provider_prompt
 from .provider import PROVIDER_COOLDOWN_STATUS, ProviderError, ProviderSuperseded
 from .retention import cleanup_review_artifacts
-from .review_plan import DEFAULT_RISK, build_review_plan, normalize_risk
+from .review_plan import (
+    DEFAULT_RISK,
+    build_review_plan,
+    effective_subagent_max_per_lens,
+    normalize_risk,
+)
 from .runtime_lock import RuntimeLock
 from .schema import (
     ReviewValidationError,
@@ -604,6 +609,10 @@ class ScoutDaemon:
             else:
                 context = self.git.prepare_context(mirror, worktree, pr)
             risk = self._risk_for_job(job, source_commit)
+            effective_max_per_lens = effective_subagent_max_per_lens(
+                provider_config.subagent_max_per_lens,
+                provider_config.max_subagents,
+            )
             review_plan = build_review_plan(
                 changed_lines=int(context["changed_lines"]),
                 description=pr.description,
@@ -611,7 +620,7 @@ class ScoutDaemon:
                 medium_loc_limit=provider_config.subagent_medium_loc_limit,
                 large_loc_limit=provider_config.subagent_large_loc_limit,
                 high_risk_bonus=provider_config.subagent_high_risk_bonus,
-                max_subagents_per_lens=provider_config.subagent_max_per_lens,
+                max_subagents_per_lens=effective_max_per_lens,
                 risk=risk,
             )
             LOG.info(

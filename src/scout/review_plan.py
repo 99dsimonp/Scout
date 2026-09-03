@@ -4,7 +4,14 @@ from dataclasses import dataclass
 from typing import List
 
 
-REVIEW_LENSES = ["correctness", "security", "tests", "performance", "best-practices"]
+REVIEW_LENSES = [
+    "correctness",
+    "security",
+    "tests",
+    "performance",
+    "best-practices",
+    "compatibility",
+]
 RISK_LEVELS = ("low", "medium", "high")
 DEFAULT_RISK = "medium"
 
@@ -71,6 +78,10 @@ def count_changed_lines(diff: str) -> int:
         if line.startswith("+") or line.startswith("-"):
             changed += 1
     return changed
+
+
+def effective_subagent_max_per_lens(configured_per_lens: int, max_subagents: int) -> int:
+    return min(configured_per_lens, max_subagents // len(REVIEW_LENSES))
 
 
 def normalize_risk(risk: str) -> str:

@@ -169,8 +169,10 @@ class SetupScriptTests(unittest.TestCase):
                 ).lstrip(),
                 encoding="utf-8",
             )
+            original_config = config_path.read_text(encoding="utf-8")
             (state_dir / ".codex").mkdir(parents=True)
-            (state_dir / ".codex" / "config.toml").write_text("[agents]\nmax_threads = 8\n", encoding="utf-8")
+            codex_config_path = state_dir / ".codex" / "config.toml"
+            codex_config_path.write_text("[agents]\nmax_threads = 5\n", encoding="utf-8")
 
             write_executable(
                 bin_dir / "id",
@@ -294,23 +296,51 @@ class SetupScriptTests(unittest.TestCase):
                 }
             )
 
-            result = subprocess.run(
-                [
-                    "bash",
-                    str(SETUP),
-                    "--binary",
-                    "/usr/bin/scout",
-                    "--config",
-                    str(config_path),
-                    "--bitbucket-url",
-                    "https://bitbucket.org/example-workspace/example-repo/pull-requests/1148/overview",
-                ],
-                check=True,
+            setup_command = [
+                "bash",
+                str(SETUP),
+                "--binary",
+                "/usr/bin/scout",
+                "--config",
+                str(config_path),
+                "--bitbucket-url",
+                "https://bitbucket.org/example-workspace/example-repo/pull-requests/1148/overview",
+            ]
+            too_small = subprocess.run(
+                setup_command,
+                check=False,
                 env=env,
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
+            self.assertNotEqual(too_small.returncode, 0)
+            self.assertIn("Scout requires at least 6", too_small.stderr)
+            self.assertEqual(config_path.read_text(encoding="utf-8"), original_config)
+            self.assertFalse(schema_path.exists())
+            self.assertFalse(secret_dir.exists())
+            self.assertFalse(log_dir.exists())
+            self.assertFalse(service_path.exists())
+            self.assertFalse((state_dir / ".ssh").exists())
+            self.assertEqual(
+                sorted(path.relative_to(state_dir) for path in state_dir.rglob("*")),
+                [Path(".codex"), Path(".codex/config.toml")],
+            )
+
+            codex_config_path.write_text("[agents]\nmax_threads = 6\n", encoding="utf-8")
+            schema_path.write_text(
+                '{"reviewer":{"enum":["correctness","security","tests","performance","best-practices"]}}',
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                setup_command,
+                check=False,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
             config = config_path.read_text(encoding="utf-8")
             self.assertIn('workspace = "example-workspace"', config)
@@ -322,7 +352,7 @@ class SetupScriptTests(unittest.TestCase):
             self.assertIn('command = "{}"'.format(bin_dir / "codex"), config)
             self.assertIn('command = "{}"'.format(bin_dir / "claude"), config)
             self.assertRegex(config, r"(?s)\[agents\.claude\].*enabled = false")
-            self.assertIn("max_subagents = 8", config)
+            self.assertIn("max_subagents = 6", config)
             self.assertRegex(
                 config,
                 r"(?s)\[agents\.codex\].*subagent_max_per_lens = 1.*\[agents\.claude\].*subagent_max_per_lens = 1",
@@ -330,7 +360,23 @@ class SetupScriptTests(unittest.TestCase):
             self.assertTrue((state_dir / ".ssh" / "id_ed25519").exists())
             self.assertIn("ssh-ed25519 fake-key scout", result.stdout)
             self.assertIn("Add this public key to Bitbucket", result.stdout)
-            self.assertIn("Codex max_subagents is 8", result.stderr)
+            self.assertIn("Codex max_subagents is 6", result.stderr)
+            self.assertIn('"compatibility"', schema_path.read_text(encoding="utf-8"))
+
+            custom_schema_path = config_dir / "custom-review.schema.json"
+            custom_schema_path.write_text('{"custom":true}', encoding="utf-8")
+            custom_schema_env = dict(env)
+            custom_schema_env["SCOUT_SCHEMA_PATH"] = str(custom_schema_path)
+            result = subprocess.run(
+                setup_command,
+                check=False,
+                env=custom_schema_env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(custom_schema_path.read_text(encoding="utf-8"), '{"custom":true}')
 
     def test_setup_ignores_noisy_login_output_when_detecting_provider_paths(self):
         if shutil.which("bash") is None:
@@ -522,6 +568,8 @@ class SetupScriptTests(unittest.TestCase):
             self.assertNotIn("Loading .bashrc", config)
             self.assertNotIn("DEVELOPER_SETUP", config)
             self.assertNotIn("setting local-env", config)
+            self.assertIn("max_subagents = 18", config)
+            self.assertIn("subagent_max_per_lens = 3", config)
 
     def test_setup_rejects_non_bitbucket_url(self):
         if shutil.which("bash") is None:

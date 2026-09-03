@@ -17,7 +17,14 @@ DATA_TYPES = {"BOOLEAN", "DATE", "DURATION", "LINK", "NUMBER", "PERCENTAGE", "TE
 ANNOTATION_TYPES = {"BUG", "VULNERABILITY", "CODE_SMELL"}
 SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
 SEVERITIES = set(SEVERITY_ORDER)
-REVIEWER_ORDER = ["correctness", "security", "tests", "performance", "best-practices"]
+REVIEWER_ORDER = [
+    "correctness",
+    "security",
+    "tests",
+    "performance",
+    "best-practices",
+    "compatibility",
+]
 REVIEWERS = set(REVIEWER_ORDER)
 CONFIDENCE = {"HIGH", "MEDIUM", "LOW"}
 INTERNAL_EXTERNAL_ID_PREFIX = "__scout_"

@@ -122,13 +122,20 @@ class SchemaTests(unittest.TestCase):
             annotation = dict(valid_review()["annotations"][0])
             annotation["external_id"] = "finding-{:03d}".format(index)
             annotation["summary"] = "Long material finding summary " + ("x" * 80)
-            annotation["reviewer"] = ["correctness", "security", "tests", "performance", "best-practices"][index % 5]
+            annotation["reviewer"] = [
+                "correctness",
+                "security",
+                "tests",
+                "performance",
+                "best-practices",
+                "compatibility",
+            ][index % 6]
             annotation["severity"] = ["CRITICAL", "HIGH", "MEDIUM", "LOW"][index % 4]
             payload["annotations"].append(annotation)
         review = validate_review_output(payload)
         report = to_bitbucket_report(review, "Codex PR Review", provider="codex")
         self.assertLessEqual(len(report["details"]), 2000)
-        self.assertIn("- Correctness: 12 issues", report["details"])
+        self.assertIn("- Correctness: 10 issues", report["details"])
         self.assertIn("- Critical: 15", report["details"])
         self.assertNotIn("Long material finding summary", report["details"])
 
@@ -151,6 +158,29 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(summary["by_reviewer"], {"correctness": 2, "security": 1})
         self.assertEqual(summary["by_severity"], {"CRITICAL": 1, "HIGH": 1, "MEDIUM": 1})
         self.assertEqual(summary["by_reviewer_and_severity"]["correctness"], {"HIGH": 1, "MEDIUM": 1})
+
+    def test_compatibility_annotations_validate_and_summarize_in_lens_order(self):
+        payload = valid_review()
+        best_practices = dict(valid_review()["annotations"][0])
+        best_practices["external_id"] = "finding-002"
+        best_practices["reviewer"] = "best-practices"
+        compatibility = dict(valid_review()["annotations"][0])
+        compatibility["external_id"] = "finding-003"
+        compatibility["reviewer"] = "compatibility"
+        payload["annotations"] = [compatibility, best_practices, payload["annotations"][0]]
+
+        review = validate_review_output(payload)
+        summary = summarize_findings(review)
+        annotations = to_bitbucket_annotations(review, provider="codex")
+        report = to_bitbucket_report(review, "Codex PR Review", provider="codex")
+
+        self.assertEqual(
+            list(summary["by_reviewer"]),
+            ["correctness", "best-practices", "compatibility"],
+        )
+        self.assertIn("Reviewer: Codex / compatibility / HIGH confidence", annotations[0]["details"])
+        self.assertLess(report["details"].index("- Correctness:"), report["details"].index("- Best practices:"))
+        self.assertLess(report["details"].index("- Best practices:"), report["details"].index("- Compatibility:"))
 
     def test_critical_pr_comment_only_includes_critical_findings(self):
         payload = valid_review()
@@ -352,6 +382,11 @@ class SchemaTests(unittest.TestCase):
 
         self.assertEqual(config_schema, data_schema)
         annotation_schema = config_schema["properties"]["annotations"]["items"]
+
+        self.assertEqual(
+            annotation_schema["properties"]["reviewer"]["enum"],
+            ["correctness", "security", "tests", "performance", "best-practices", "compatibility"],
+        )
 
         self.assertIn("suggested_change", annotation_schema["required"])
         self.assertEqual(

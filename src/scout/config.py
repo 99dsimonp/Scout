@@ -16,7 +16,7 @@ class ConfigError(ValueError):
     pass
 
 
-REVIEW_LENS_COUNT = 5
+REVIEW_LENS_COUNT = 6
 SUPPORTED_PROVIDERS = ("codex", "claude")
 COMMENT_SEVERITIES = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 REVIEW_OUTPUT_MODES = ("reports", "inline_comments")
@@ -341,50 +341,29 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
     }
     codex_review_sizing = _parse_provider_review_sizing("codex", codex, review_sizing)
     claude_review_sizing = _parse_provider_review_sizing("claude", claude, review_sizing)
-    codex_max_subagents = _positive_int(codex.get("max_subagents", 15), "agents.codex.max_subagents")
+    codex_max_subagents = _positive_int(codex.get("max_subagents", 18), "agents.codex.max_subagents")
     claude_max_subagents = _positive_int(claude.get("max_subagents", 20), "agents.claude.max_subagents")
     codex_subagent_max_per_lens = _positive_int(
         codex.get("subagent_max_per_lens", min(review_subagent_max_per_lens, 3)),
         "agents.codex.subagent_max_per_lens",
     )
-    codex_subagent_max_per_lens_label = (
-        "agents.codex.subagent_max_per_lens"
-        if "subagent_max_per_lens" in codex
-        else "agents.codex.subagent_max_per_lens"
-    )
     claude_subagent_max_per_lens = _positive_int(
         claude.get("subagent_max_per_lens", 1),
         "agents.claude.subagent_max_per_lens",
-    )
-    claude_subagent_max_per_lens_label = (
-        "agents.claude.subagent_max_per_lens"
-        if "subagent_max_per_lens" in claude
-        else "agents.claude.subagent_max_per_lens"
     )
     provider_max_subagents = {
         "codex": codex_max_subagents,
         "claude": claude_max_subagents,
     }
-    provider_subagent_max_per_lens = {
-        "codex": codex_subagent_max_per_lens,
-        "claude": claude_subagent_max_per_lens,
-    }
-    provider_subagent_max_per_lens_label = {
-        "codex": codex_subagent_max_per_lens_label,
-        "claude": claude_subagent_max_per_lens_label,
-    }
     for provider in selected_providers:
         selected_max_subagents = provider_max_subagents[provider]
-        selected_subagent_max_per_lens = provider_subagent_max_per_lens[provider]
-        selected_subagent_max_per_lens_label = provider_subagent_max_per_lens_label[provider]
-        if selected_subagent_max_per_lens * REVIEW_LENS_COUNT > selected_max_subagents:
+        if selected_max_subagents < REVIEW_LENS_COUNT:
             raise ConfigError(
-                "{} permits {} total subagents, "
-                "which exceeds agents.{}.max_subagents={}".format(
-                    selected_subagent_max_per_lens_label,
-                    selected_subagent_max_per_lens * REVIEW_LENS_COUNT,
+                "agents.{}.max_subagents={} cannot schedule one reviewer for each of "
+                "the {} required review lenses".format(
                     provider,
                     selected_max_subagents,
+                    REVIEW_LENS_COUNT,
                 )
             )
     report_ids, report_titles = _parse_report_overrides(reports, selected_providers)

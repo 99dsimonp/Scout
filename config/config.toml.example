@@ -118,8 +118,9 @@ command = "codex"
 model = "gpt-5.5"
 reasoning_effort = "xhigh"
 fast_mode = true
-max_subagents = 15
+max_subagents = 18
 # Optional provider review sizing overrides. Defaults come from [review].
+# The effective per-lens cap is also limited by max_subagents / 6.
 subagent_small_loc_limit = 150
 subagent_medium_loc_limit = 600
 subagent_large_loc_limit = 1500

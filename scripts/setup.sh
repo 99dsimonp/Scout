@@ -24,11 +24,18 @@ BITBUCKET_SSH_KEY_FILE=""
 BITBUCKET_URL=""
 BITBUCKET_API_AUTH_MODE=""
 LOAD_SSH_CREDENTIAL=0
+DETECTED_CODEX_MAX_SUBAGENTS=""
+DETECTED_CODEX_CONFIG=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 CONFIG_SRC="${ROOT_DIR}/config/config.toml.example"
-SCHEMA_SRC="${ROOT_DIR}/config/review.schema.json"
+if [[ -f "${ROOT_DIR}/config/review.schema.json" ]]; then
+  DEFAULT_SCHEMA_SRC="${ROOT_DIR}/config/review.schema.json"
+else
+  DEFAULT_SCHEMA_SRC="/usr/share/scout/review.schema.json"
+fi
+SCHEMA_SRC="${SCOUT_SCHEMA_SRC:-${DEFAULT_SCHEMA_SRC}}"
 BINARY_PATH="$(command -v scout || true)"
 if [[ -z "${BINARY_PATH}" ]]; then
   BINARY_PATH="/usr/bin/scout"
@@ -388,7 +395,7 @@ command = "codex"
 model = "gpt-5.5"
 reasoning_effort = "xhigh"
 fast_mode = true
-max_subagents = 15
+max_subagents = 18
 subagent_small_loc_limit = 150
 subagent_medium_loc_limit = 600
 subagent_large_loc_limit = 1500
@@ -506,12 +513,10 @@ codex_max_subagents_from_config() {
   ' "${codex_config}"
 }
 
-write_detected_codex_max_subagents() {
+preflight_codex_max_subagents() {
   local home_dir
   local codex_config
   local max_subagents
-  local scout_max_subagents
-  local max_per_lens
   home_dir="$(service_home_dir)"
   if [[ -z "${home_dir}" ]]; then
     return
@@ -521,19 +526,34 @@ write_detected_codex_max_subagents() {
   if [[ -z "${max_subagents}" ]]; then
     return
   fi
+  if (( max_subagents < 6 )); then
+    echo "error: Codex max_subagents is ${max_subagents}; Scout requires at least 6 for its review lenses." >&2
+    return 1
+  fi
+  DETECTED_CODEX_MAX_SUBAGENTS="${max_subagents}"
+  DETECTED_CODEX_CONFIG="${codex_config}"
+}
+
+write_detected_codex_max_subagents() {
+  local max_subagents="${DETECTED_CODEX_MAX_SUBAGENTS}"
+  local scout_max_subagents
+  local max_per_lens
+  if [[ -z "${max_subagents}" ]]; then
+    return
+  fi
   scout_max_subagents="${max_subagents}"
-  if (( scout_max_subagents > 15 )); then
-    scout_max_subagents=15
+  if (( scout_max_subagents > 18 )); then
+    scout_max_subagents=18
   fi
   toml_set_integer_in_table "${CONFIG_PATH}" "agents.codex" "max_subagents" "${scout_max_subagents}"
-  max_per_lens=$(( scout_max_subagents / 5 ))
+  max_per_lens=$(( scout_max_subagents / 6 ))
   if (( max_per_lens < 1 )); then
     max_per_lens=1
   elif (( max_per_lens > 3 )); then
     max_per_lens=3
   fi
   toml_set_integer_in_table "${CONFIG_PATH}" "agents.codex" "subagent_max_per_lens" "${max_per_lens}"
-  echo "Detected Codex max_subagents=${max_subagents} from ${codex_config}; wrote agents.codex.max_subagents=${scout_max_subagents}."
+  echo "Detected Codex max_subagents=${max_subagents} from ${DETECTED_CODEX_CONFIG}; wrote agents.codex.max_subagents=${scout_max_subagents}."
   if (( max_subagents < 10 )); then
     echo "warning: Codex max_subagents is ${max_subagents}; set it to at least 10 for Scout reviewer fan-out." >&2
   fi
@@ -774,6 +794,8 @@ if [[ "$(id -u)" -ne 0 ]]; then
   die "run with sudo or as root"
 fi
 
+preflight_codex_max_subagents
+
 ensure_service_identity() {
   if [[ "${USE_CURRENT_USER}" -eq 1 ]]; then
     return
@@ -816,12 +838,12 @@ elif [[ ! -f "${CONFIG_PATH}" ]]; then
 elif [[ -n "${BITBUCKET_URL}" ]]; then
   append_bitbucket_repo_if_missing
 fi
-if [[ ! -f "${SCHEMA_PATH}" ]]; then
-  if [[ -f "${SCHEMA_SRC}" ]]; then
+if [[ -f "${SCHEMA_SRC}" ]]; then
+  if [[ "${SCHEMA_PATH}" == "${CONFIG_DIR}/review.schema.json" || ! -f "${SCHEMA_PATH}" ]]; then
     install -m 0644 "${SCHEMA_SRC}" "${SCHEMA_PATH}"
-  else
-    echo "warning: ${SCHEMA_PATH} does not exist and ${SCHEMA_SRC} was not found" >&2
   fi
+elif [[ ! -f "${SCHEMA_PATH}" ]]; then
+  echo "warning: ${SCHEMA_PATH} does not exist and ${SCHEMA_SRC} was not found" >&2
 fi
 if [[ -n "${BITBUCKET_API_AUTH_MODE}" ]]; then
   toml_set_string_in_table "${CONFIG_PATH}" "bitbucket" "api_auth" "${BITBUCKET_API_AUTH_MODE}"

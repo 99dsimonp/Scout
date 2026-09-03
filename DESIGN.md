@@ -161,6 +161,13 @@ Recommended installed layout:
 Logs should go to journald by default. A dedicated `/var/log/scout/` directory is
 optional and should only be used if file logs are explicitly configured.
 
+The RPM treats `/etc/scout/config.toml` as operator configuration and preserves
+it across upgrades. The bundled `/etc/scout/review.schema.json` is versioned
+program data and must be replaced on upgrade; leaving an older schema would make
+new reviewer categories fail provider-side validation. `scout-setup` likewise
+refreshes the default schema from the packaged copy while leaving an explicitly
+selected custom schema path unchanged.
+
 The RPM should install the systemd unit but should not start the service
 automatically. Expected operator flow:
 
@@ -185,7 +192,8 @@ When practical, it should also read the service user's
 `~/.codex/config.toml` and copy the Codex agent limit into
 `agents.codex.max_subagents`; it should recognize Codex's `[agents] max_threads`
 as well as Scout's `max_subagents`. Values below `10` should produce an
-operator warning. For the default dedicated
+operator warning, and values below `6` must fail because Scout cannot schedule
+all six required lenses. For the default dedicated
 `scout` user, setup should create `/var/lib/scout/.ssh/id_ed25519` when absent,
 print the public key, and instruct the operator to add it to Bitbucket as a
 read-only repository or workspace access key.
@@ -339,7 +347,7 @@ command = "codex"
 model = "gpt-5.5"
 reasoning_effort = "xhigh"
 fast_mode = true
-max_subagents = 15
+max_subagents = 18
 subagent_small_loc_limit = 150
 subagent_medium_loc_limit = 600
 subagent_large_loc_limit = 1500
@@ -773,7 +781,7 @@ It should include:
 - Instruction not to modify files.
 - Instruction not to perform network operations.
 - Instruction to report only actionable correctness, security, reliability,
-  performance, or test issues.
+  performance, test, or compatibility issues.
 - Instruction not to invent line numbers.
 - Instruction to return exactly one final JSON object matching the schema, with
   no progress/status/placeholder JSON.
@@ -784,7 +792,7 @@ instructions that override Scout's prompt.
 
 ### Provider Subagent Review Workflow
 
-The provider prompt should direct the selected job provider to use five focused
+The provider prompt should direct the selected job provider to use six focused
 reviewer categories, modeled after an internal `pr-review` workflow:
 
 - correctness
@@ -792,6 +800,19 @@ reviewer categories, modeled after an internal `pr-review` workflow:
 - tests
 - performance
 - best practices
+- compatibility
+
+The compatibility lens checks changed externally consumed interfaces,
+configuration, and data or wire formats. When related repositories are
+configured, it also checks cross-repository contracts, version-skew failures,
+and rollout-order constraints. A related checkout describes one exact revision;
+findings about version skew or rollout order must be grounded in visible
+interfaces, compatibility shims, versioning or deprecation policy, tests,
+documentation, or other repository evidence. Reviewers may check older or newer
+related-component behavior when that evidence describes it, but must not assert
+behavior for unavailable versions. Without related repositories, the lens stays
+within contracts visible in the primary repository and must not invent other
+components or force findings.
 
 Scout computes how many subagents to request per category from changed LOC only,
 not number of files changed. The global `review.*` values remain
@@ -807,12 +828,14 @@ LOC thresholds, high-risk bonus, and maximum subagents per lens under
 If the PR description contains a case-insensitive `Risk: high` line, Scout adds
 `subagent_high_risk_bonus` subagents per category, capped by the job provider's
 `subagent_max_per_lens`. Codex defaults to `3` subagents per category and
-`15` total subagents. Claude defaults to `1` subagent per category to keep
-subscription token use predictable, and can be raised explicitly. The configured
-maximum possible total,
-`agents.<provider>.subagent_max_per_lens * 5`, must be less than or equal to
-that provider's `max_subagents`; static config validation checks each selected
-provider and fails otherwise.
+`18` total subagents. Claude defaults to `1` subagent per category to keep
+subscription token use predictable, and can be raised explicitly. Before sizing
+a review, Scout caps the configured per-lens maximum at
+`agents.<provider>.max_subagents / 6`, rounded down. This preserves the provider
+total as a hard limit and keeps an older `max_subagents = 15` /
+`subagent_max_per_lens = 3` configuration valid at 2 reviewers per lens (12
+total). Static validation rejects a selected provider only when its total is
+below 6, because then Scout cannot schedule one reviewer for every lens.
 
 Each subagent reviews the same committed PR diff from its assigned lens. Their
 outputs should remain separate until a final merge step deduplicates overlapping
@@ -833,7 +856,7 @@ relevant reviewer lenses.
 Findings must be anchored to changed lines in the PR diff. Unchanged code may be
 mentioned only when needed to explain the impact of a changed line. Style-only
 comments should be dropped unless they create correctness, security, test,
-performance, or maintainability risk.
+performance, maintainability, or compatibility risk.
 
 ## Agent Output Schema
 
@@ -892,7 +915,7 @@ Recommended enums:
 - `severity`: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`
 - `annotation.result`: `FAILED`
 - `reviewer`: `correctness`, `security`, `tests`, `performance`,
-  `best-practices`
+  `best-practices`, `compatibility`
 - `confidence`: `HIGH`, `MEDIUM`, `LOW`
 
 Scout validates Bitbucket-compatible fields, uses the top-level recommendation
@@ -973,7 +996,7 @@ Initial schema outline:
           "result": { "type": "string", "enum": ["FAILED"] },
           "reviewer": {
             "type": "string",
-            "enum": ["correctness", "security", "tests", "performance", "best-practices"]
+            "enum": ["correctness", "security", "tests", "performance", "best-practices", "compatibility"]
           },
           "confidence": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
           "smallest_fix": { "type": "string", "minLength": 1 }
@@ -1470,8 +1493,8 @@ quota bypassing.
   same PR and publishes provider-specific reports.
 - Codex supports `logged_in` and `api` authentication modes.
 - Claude supports `logged_in` and `api` authentication modes.
-- Codex review prompt using correctness, security, tests, performance, and
-  best-practices categories with LOC-scaled subagents.
+- Codex review prompt using correctness, security, tests, performance,
+  best-practices, and compatibility categories with LOC-scaled subagents.
 - Strict JSON schema validation.
 - Report result is `FAILED` when recommendation is `request_changes`, otherwise
   `PASSED`.

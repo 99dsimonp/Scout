@@ -9,6 +9,8 @@ class PackagingTests(unittest.TestCase):
     def test_rpm_spec_uses_pyproject_build_macros(self):
         spec = (ROOT / "packaging" / "scout.spec").read_text(encoding="utf-8")
 
+        self.assertIn("Release:        2%{?dist}", spec)
+        self.assertIn("Scout contributors <noreply@github.com> - 0.1.0-2", spec)
         self.assertIn("BuildRequires:  pyproject-rpm-macros", spec)
         self.assertIn("%generate_buildrequires\n%pyproject_buildrequires -w", spec)
         self.assertIn("%pyproject_wheel", spec)
@@ -29,3 +31,11 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("[metadata]", setup_cfg)
         self.assertIn("name = scout", setup_cfg)
         self.assertIn("scout = scout.cli:main", setup_cfg)
+
+    def test_rpm_replaces_bundled_schema_but_preserves_user_config(self):
+        spec = (ROOT / "packaging/scout.spec").read_text(encoding="utf-8")
+
+        self.assertIn("%config(noreplace) %{_sysconfdir}/scout/config.toml", spec)
+        self.assertIn("%{_sysconfdir}/scout/review.schema.json", spec)
+        self.assertNotIn("%config(noreplace) %{_sysconfdir}/scout/review.schema.json", spec)
+        self.assertIn("%{_datadir}/scout/review.schema.json", spec)

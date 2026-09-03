@@ -804,7 +804,7 @@ class DaemonReviewLogTests(unittest.TestCase):
                     timeout_seconds=1800,
                     model="claude-opus-4-8",
                     effort="max",
-                    max_subagents=5,
+                    max_subagents=6,
                     subagent_small_loc_limit=150,
                     subagent_medium_loc_limit=600,
                     subagent_large_loc_limit=1500,
@@ -871,12 +871,12 @@ class DaemonReviewLogTests(unittest.TestCase):
                 "codex": SimpleNamespace(
                     max_parallel=2,
                     timeout_seconds=1200,
-                    max_subagents=20,
+                    max_subagents=18,
                     subagent_small_loc_limit=150,
                     subagent_medium_loc_limit=600,
                     subagent_large_loc_limit=1500,
                     subagent_high_risk_bonus=1,
-                    subagent_max_per_lens=4,
+                    subagent_max_per_lens=3,
                 ),
                 "claude": SimpleNamespace(
                     max_parallel=1,
@@ -913,6 +913,7 @@ class DaemonReviewLogTests(unittest.TestCase):
             )
             self.assertIn("- PR description risk: high", codex.runs[0]["prompt"])
             self.assertIn("- Subagents per review category: 3", codex.runs[0]["prompt"])
+            self.assertIn("- Total reviewer subagents: 18", codex.runs[0]["prompt"])
             self.assertIn("- PR description risk: high", claude.runs[0]["prompt"])
             self.assertIn("- Subagents per review category: 3", claude.runs[0]["prompt"])
 
@@ -1119,12 +1120,12 @@ class DaemonReviewLogTests(unittest.TestCase):
                     timeout_seconds=1200,
                     model="gpt-5.5",
                     reasoning_effort="high",
-                    max_subagents=20,
+                    max_subagents=15,
                     subagent_small_loc_limit=150,
                     subagent_medium_loc_limit=600,
                     subagent_large_loc_limit=1500,
                     subagent_high_risk_bonus=0,
-                    subagent_max_per_lens=2,
+                    subagent_max_per_lens=3,
                 ),
             }
             provider = _FakeProvider(
@@ -1162,6 +1163,8 @@ class DaemonReviewLogTests(unittest.TestCase):
 
             daemon.run_job(review_job(provider="codex", job_id=11))
 
+            self.assertIn("- Subagents per review category: 2", provider.runs[0]["prompt"])
+            self.assertIn("- Total reviewer subagents: 12", provider.runs[0]["prompt"])
             self.assertEqual(len(daemon.bitbucket.comments), 1)
             self.assertIn(
                 {"title": "Model", "type": "TEXT", "value": "gpt-5.5 / high"},

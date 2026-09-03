@@ -50,13 +50,15 @@ rpmbuild -ba packaging/scout.spec
 Install the built package:
 
 ```bash
-sudo dnf install -y ~/rpmbuild/RPMS/noarch/scout-0.1.0-1.el9.noarch.rpm
+sudo dnf install -y ~/rpmbuild/RPMS/noarch/scout-0.1.0-2.el9.noarch.rpm
 scout --config /etc/scout/config.toml --check-config
 ```
 
 The RPM installs `/usr/bin/scout`, `/usr/bin/scout-setup`,
 `/etc/scout/config.toml`, `/etc/scout/review.schema.json`, and the systemd unit
 at `/usr/lib/systemd/system/scout.service`.
+RPM upgrades preserve `config.toml` but replace the bundled review schema so new
+reviewer values cannot be rejected by a stale local copy.
 
 ## Development
 
@@ -94,7 +96,8 @@ PYTHONPATH=src python3 -m scout --config config/config.toml.example --check-conf
 
 The RPM installs the packaged unit and the `scout-setup` helper. For a source
 checkout, use `scripts/setup.sh`. The helper can install a systemd unit, create
-`/etc/scout`, copy the example config and schema if missing, create
+`/etc/scout`, copy the example config if missing, refresh the bundled default
+schema, create
 `/var/lib/scout` and `/var/log/scout`, and install Bitbucket credentials as
 systemd credential source files:
 
@@ -233,6 +236,17 @@ rerun an unchanged PR. Bump `review.policy_version` when enabling or changing
 related repository context so existing PR commits are reviewed under the new
 policy.
 
+Scout schedules six review lenses: correctness, security, tests, performance,
+best practices, and compatibility. The compatibility lens checks changed
+cross-repository contracts and rollout-order constraints against related code.
+Version-skew findings must be grounded in visible interfaces, compatibility
+shims, versioning or deprecation policy, tests, documentation, or other
+repository evidence. The configured related checkout represents one exact
+revision, so Scout does not assert behavior for unavailable older or newer
+versions. Without related repositories, this lens checks only externally
+consumed interfaces, configuration, and data formats visible in the primary
+repository.
+
 Workers claim the oldest eligible row from the global queue after filtering for
 provider capacity and cooldowns. A running or cooling-down provider does not
 force other eligible providers to sit idle behind an older PR.
@@ -327,7 +341,12 @@ uses LOC sizing: 1 reviewer per category up to 150 changed lines, 2 up to 600,
 3 up to 1500, and 4 above that. `high` risk adds
 `subagent_high_risk_bonus` per category before caps. Disabled or failed risk
 classification defaults to `medium`. Codex caps this at 3 reviewers per
-category by default, so large PRs use at most 15 Codex subagents.
+category by default, so large PRs use at most 18 Codex subagents.
+For each provider, Scout also caps reviewers per lens at
+`max_subagents / 6`, rounded down. This keeps configurations created before the
+compatibility lens valid: `max_subagents = 15` and
+`subagent_max_per_lens = 3` now run 2 reviewers per lens (12 total). At least 6
+total subagents are required so every lens has one reviewer.
 
 Risk classification is enabled by default and uses Codex unless configured
 otherwise:

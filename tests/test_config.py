@@ -29,7 +29,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.agents.codex.reasoning_effort, "xhigh")
         self.assertTrue(config.agents.codex.fast_mode)
         self.assertEqual(config.agents.codex.timeout_seconds, 1800)
-        self.assertEqual(config.agents.codex.max_subagents, 15)
+        self.assertEqual(config.agents.codex.max_subagents, 18)
         self.assertEqual(config.agents.codex.subagent_max_per_lens, 3)
         self.assertEqual(config.agents.codex.subagent_small_loc_limit, 150)
         self.assertEqual(config.agents.codex.subagent_medium_loc_limit, 600)
@@ -542,8 +542,8 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(config.bitbucket.ssh_key_credential, "deploy_key")
 
-    def test_rejects_subagent_plan_above_codex_limit(self):
-        with self.assertRaises(ConfigError):
+    def test_rejects_codex_limit_below_one_reviewer_per_lens(self):
+        with self.assertRaisesRegex(ConfigError, "cannot schedule one reviewer"):
             parse_config(
                 {
                     "bitbucket": {
@@ -551,12 +551,28 @@ class ConfigTests(unittest.TestCase):
                         "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                     },
                     "review": {"subagent_max_per_lens": 3},
-                    "agents": {"codex": {"max_subagents": 10}},
+                    "agents": {"codex": {"max_subagents": 5}},
                 }
             )
 
-    def test_rejects_subagent_plan_above_claude_limit(self):
-        with self.assertRaises(ConfigError):
+    def test_previous_fifteen_subagent_codex_capacity_remains_valid(self):
+        config = parse_config(
+            {
+                "bitbucket": {
+                    "workspace": "ws",
+                    "repositories": [
+                        {"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}
+                    ],
+                },
+                "agents": {"codex": {"max_subagents": 15, "subagent_max_per_lens": 3}},
+            }
+        )
+
+        self.assertEqual(config.agents.codex.max_subagents, 15)
+        self.assertEqual(config.agents.codex.subagent_max_per_lens, 3)
+
+    def test_rejects_claude_limit_below_one_reviewer_per_lens(self):
+        with self.assertRaisesRegex(ConfigError, "cannot schedule one reviewer"):
             parse_config(
                 {
                     "bitbucket": {
@@ -567,7 +583,7 @@ class ConfigTests(unittest.TestCase):
                     "agents": {
                         "strategy": "claude",
                         "codex": {"max_subagents": 20},
-                        "claude": {"enabled": True, "max_subagents": 10, "subagent_max_per_lens": 3},
+                        "claude": {"enabled": True, "max_subagents": 5, "subagent_max_per_lens": 3},
                     },
                 }
             )

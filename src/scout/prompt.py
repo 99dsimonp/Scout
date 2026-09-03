@@ -52,6 +52,9 @@ def _build_prompt(
     formatted_context["related_repositories"] = _format_related_repositories(
         context.get("related_repositories", [])
     )
+    formatted_context["compatibility_guidance"] = _format_compatibility_guidance(
+        context.get("related_repositories", [])
+    )
     return """{intro}
 
 Repository context:
@@ -84,6 +87,9 @@ primary repository and be anchored to a changed line listed in the primary PR
 diff. Never report findings against related-repository files. Do not modify
 files. Do not perform network operations. Do not invent line numbers.
 
+Compatibility lens:
+{compatibility_guidance}
+
 {review_plan_text}
 
 {subagent_instructions}
@@ -91,7 +97,8 @@ files. Do not perform network operations. Do not invent line numbers.
 Keep the reviewer outputs separate until every listed subagent has completed.
 Deduplicate overlapping findings, preserve the contributing reviewer lens in
 each final annotation, and drop weak or style-only findings unless they create
-correctness, security, test, performance, or maintainability risk. Do not stop
+correctness, security, test, performance, maintainability, or compatibility
+risk. Do not stop
 after finding one issue; continue until every changed file has been considered
 by the relevant reviewer lenses.
 
@@ -120,4 +127,25 @@ def _format_related_repositories(value: object) -> str:
     return "\n".join(
         "- {slug}: ref={ref}, commit={commit}, path={path}".format(**repo)
         for repo in repositories
+    )
+
+
+def _format_compatibility_guidance(related_repositories: object) -> str:
+    base = (
+        "- Compare changed externally consumed interfaces, configuration, and data or wire "
+        "formats with compatibility evidence visible in the repositories."
+    )
+    if not related_repositories:
+        return (
+            "{}\n- No related repositories are configured. Use only contracts visible in the "
+            "primary repository; do not infer other components or force a compatibility finding."
+        ).format(
+            base,
+        )
+    return """{}
+- Use the listed related revisions to identify cross-repository contract, version-skew, and rollout-order risks caused by changed primary-repository lines.
+- Ground compatibility findings in visible interfaces, compatibility shims, versioning or deprecation policy, tests, documentation, or other repository evidence.
+- When that evidence describes supported older or newer related-component versions, check their interoperability with the primary change.
+- Do not assert behavior for unavailable versions. Each related checkout proves only the listed revision, not every deployed version combination.""".format(
+        base
     )

@@ -65,7 +65,7 @@
           "result": { "type": "string", "enum": ["FAILED"] },
           "reviewer": {
             "type": "string",
-            "enum": ["correctness", "security", "tests", "performance", "best-practices"]
+            "enum": ["correctness", "security", "tests", "performance", "best-practices", "compatibility"]
           },
           "confidence": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
           "smallest_fix": { "type": "string", "minLength": 1 },
