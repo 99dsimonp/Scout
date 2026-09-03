@@ -35,6 +35,9 @@ sudo dnf install -y \
   git tar gzip openssh-clients shadow-utils systemd
 ```
 
+On Rocky Linux 10 / Enterprise Linux 10, omit `python3-tomli`; Scout uses
+Python's standard-library `tomllib` there.
+
 Build the RPM from a checkout:
 
 ```bash

@@ -10,7 +10,9 @@ BuildRequires:  python3-devel
 BuildRequires:  pyproject-rpm-macros
 BuildRequires:  systemd-rpm-macros
 Requires:       python3
+%if 0%{?rhel} && 0%{?rhel} < 10
 Requires:       python3-tomli
+%endif
 Requires:       git
 Requires:       systemd
 Requires:       openssh-clients
