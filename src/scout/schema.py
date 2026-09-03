@@ -27,9 +27,25 @@ REVIEWER_ORDER = [
 ]
 REVIEWERS = set(REVIEWER_ORDER)
 CONFIDENCE = {"HIGH", "MEDIUM", "LOW"}
+LINE_SIDES = {"NEW", "OLD"}
 INTERNAL_EXTERNAL_ID_PREFIX = "__scout_"
 BITBUCKET_REPORT_DETAILS_MAX_LENGTH = 2000
 BITBUCKET_COMMENT_MAX_LENGTH = 8000
+_NONCANONICAL_DIFF_ERROR = "primary PR diff is not canonical git diff output"
+_DIFF_METADATA_PREFIXES = (
+    "index ",
+    "old mode ",
+    "new mode ",
+    "deleted file mode ",
+    "new file mode ",
+    "similarity index ",
+    "dissimilarity index ",
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+    "Binary files ",
+)
 
 
 @dataclass(frozen=True)
@@ -65,56 +81,161 @@ def validate_review_output(obj: Dict[str, Any], max_findings: int = 100) -> Vali
     return ValidatedReview(recommendation=recommendation, report=report, annotations=annotations)
 
 
-def validate_annotation_locations(review: ValidatedReview, diff: str) -> None:
-    changed_lines = _changed_new_lines(diff)
+def filter_annotation_locations(
+    review: ValidatedReview,
+    diff: str,
+    allowed_line_sides: Iterable[str] = ("NEW",),
+) -> ValidatedReview:
+    """Return a review containing only annotations publishable in this mode.
+
+    Native inline comments can target either side of the PR diff. Code Insights
+    annotations are attached to the source commit and currently support only
+    new-side locations, so callers select which sides their output mode can
+    publish. If no findings remain, the recommendation must also become an
+    approval so every downstream summary is derived from the same state.
+    """
+    allowed_sides = set(allowed_line_sides)
+    if not allowed_sides or not allowed_sides.issubset(LINE_SIDES):
+        raise ReviewValidationError("allowed_line_sides must contain only NEW or OLD")
     for annotation in review.annotations:
-        location = (annotation["path"], annotation["line"])
-        if location not in changed_lines:
-            raise ReviewValidationError(
-                "annotation {} must target a changed line in the primary PR diff: {}:{}".format(
-                    annotation["external_id"],
-                    annotation["path"],
-                    annotation["line"],
-                )
-            )
+        if annotation.get("line_side") not in LINE_SIDES:
+            raise ReviewValidationError("annotation line_side must be NEW or OLD")
+    changed_lines = _changed_lines_by_side(diff)
+    annotations = [
+        annotation
+        for annotation in review.annotations
+        if annotation["line_side"] in allowed_sides
+        and (annotation["path"], annotation["line"])
+        in changed_lines[annotation["line_side"]]
+    ]
+    if len(annotations) == len(review.annotations):
+        return review
+    return ValidatedReview(
+        recommendation="request_changes" if annotations else "approve",
+        report=review.report,
+        annotations=annotations,
+    )
 
 
-def _changed_new_lines(diff: str) -> set:
-    changed = set()
-    path = None
+def _changed_lines_by_side(diff: str) -> Dict[str, set]:
+    if not diff:
+        return {"NEW": set(), "OLD": set()}
+
+    changed = {"NEW": set(), "OLD": set()}
+    old_path = None
+    new_path = None
+    old_line = None
     new_line = None
     expect_new_path = False
+    expect_hunk = False
+    saw_new_path = False
+    in_hunk = False
+    saw_file = False
+    section_has_structure = False
     for line in diff.splitlines():
         if line.startswith("diff --git "):
-            path = None
+            if (
+                expect_new_path
+                or expect_hunk
+                or (saw_file and not section_has_structure)
+                or not _is_canonical_diff_header(line)
+            ):
+                raise ReviewValidationError(_NONCANONICAL_DIFF_ERROR)
+            saw_file = True
+            section_has_structure = False
+            old_path = None
+            new_path = None
+            old_line = None
             new_line = None
             expect_new_path = False
+            expect_hunk = False
+            saw_new_path = False
+            in_hunk = False
             continue
-        if new_line is None and line.startswith("--- "):
+        if not saw_file:
+            if line:
+                raise ReviewValidationError(_NONCANONICAL_DIFF_ERROR)
+            continue
+        if not in_hunk and line.startswith("--- "):
+            if expect_new_path or not _is_canonical_diff_path(line[4:], "a/"):
+                raise ReviewValidationError(_NONCANONICAL_DIFF_ERROR)
+            old_path = _decode_diff_path(line[4:])
+            if old_path == "/dev/null":
+                old_path = None
+            elif old_path.startswith("a/"):
+                old_path = old_path[2:]
             expect_new_path = True
+            section_has_structure = True
             continue
-        if new_line is None and expect_new_path and line.startswith("+++ "):
-            path = _decode_diff_path(line[4:])
-            if path == "/dev/null":
-                path = None
-            elif path.startswith("b/"):
-                path = path[2:]
+        if not in_hunk and line.startswith("+++ "):
+            if not expect_new_path or not _is_canonical_diff_path(line[4:], "b/"):
+                raise ReviewValidationError(_NONCANONICAL_DIFF_ERROR)
+            new_path = _decode_diff_path(line[4:])
+            if new_path == "/dev/null":
+                new_path = None
+            elif new_path.startswith("b/"):
+                new_path = new_path[2:]
             expect_new_path = False
+            expect_hunk = True
+            saw_new_path = True
+            section_has_structure = True
             continue
         if line.startswith("@@ "):
-            match = re.search(r"\+(\d+)(?:,\d+)?", line)
-            new_line = int(match.group(1)) if match and path is not None else None
+            match = re.fullmatch(
+                r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(?: .*)?",
+                line,
+            )
+            if match is None or expect_new_path or not saw_new_path:
+                raise ReviewValidationError(_NONCANONICAL_DIFF_ERROR)
+            old_line = int(match.group(1)) if old_path is not None else None
+            new_line = int(match.group(2)) if new_path is not None else None
+            expect_hunk = False
+            in_hunk = True
+            section_has_structure = True
             continue
-        if new_line is None:
-            continue
+        if line.startswith("diff --git") or line.startswith("@@"):
+            raise ReviewValidationError(_NONCANONICAL_DIFF_ERROR)
+        if not in_hunk:
+            if not line:
+                continue
+            if line.startswith(_DIFF_METADATA_PREFIXES):
+                section_has_structure = True
+                continue
+            raise ReviewValidationError(_NONCANONICAL_DIFF_ERROR)
         if line.startswith("+"):
-            changed.add((path, new_line))
-            new_line += 1
-        elif line.startswith("-") or line.startswith("\\"):
+            if new_path is not None and new_line is not None:
+                changed["NEW"].add((new_path, new_line))
+                new_line += 1
+        elif line.startswith("-"):
+            if old_path is not None and old_line is not None:
+                changed["OLD"].add((old_path, old_line))
+                old_line += 1
+        elif line.startswith("\\"):
             continue
         else:
-            new_line += 1
+            if old_line is not None:
+                old_line += 1
+            if new_line is not None:
+                new_line += 1
+    if expect_new_path or expect_hunk or not saw_file or not section_has_structure:
+        raise ReviewValidationError(_NONCANONICAL_DIFF_ERROR)
     return changed
+
+
+def _is_canonical_diff_header(line: str) -> bool:
+    paths = line[len("diff --git ") :]
+    if paths.startswith('"a/'):
+        return '" "b/' in paths and paths.endswith('"')
+    return paths.startswith("a/") and " b/" in paths
+
+
+def _is_canonical_diff_path(value: str, prefix: str) -> bool:
+    path = value.split("\t", 1)[0]
+    if path == "/dev/null":
+        return True
+    if path.startswith('"'):
+        return path.startswith('"' + prefix) and path.endswith('"')
+    return path.startswith(prefix)
 
 
 def _decode_diff_path(value: str) -> str:
@@ -245,7 +366,11 @@ def to_pr_comment(
             [
                 "{}. **{}**".format(index, annotation["summary"]),
                 "   Severity: {}".format(_sentence_case(annotation["severity"])),
-                "   Location: `{}:{}`".format(annotation["path"], annotation["line"]),
+                "   Location: `{}:{}` ({})".format(
+                    annotation["path"],
+                    annotation["line"],
+                    annotation["line_side"].lower(),
+                ),
                 "   Reviewer: {} / {} confidence".format(
                     _reviewer_label(annotation["reviewer"]),
                     annotation["confidence"],
@@ -283,13 +408,19 @@ def to_inline_pr_comments(
     comments = []
     for annotation in sorted(
         review.annotations,
-        key=lambda item: (item["path"], item["line"], item["external_id"]),
+        key=lambda item: (
+            item["path"],
+            item["line"],
+            item["line_side"],
+            item["external_id"],
+        ),
     ):
         comments.append(
             {
                 "external_id": annotation["external_id"],
                 "path": annotation["path"],
                 "line": annotation["line"],
+                "line_side": annotation["line_side"],
                 "content": _format_inline_comment(annotation, provider_label, source_commit, review_run_id),
             }
         )
@@ -373,6 +504,7 @@ def _validate_annotations(value: Any, max_findings: int) -> List[Dict[str, Any]]
             "annotation_type",
             "path",
             "line",
+            "line_side",
             "summary",
             "details",
             "severity",
@@ -399,6 +531,7 @@ def _validate_annotations(value: Any, max_findings: int) -> List[Dict[str, Any]]
         line = item["line"]
         if not isinstance(line, int) or line < 1:
             raise ReviewValidationError("{}.line must be a positive integer".format(label))
+        _enum(item["line_side"], LINE_SIDES, "{}.line_side".format(label))
         _nonempty_string(item["summary"], "{}.summary".format(label))
         _nonempty_string(item["details"], "{}.details".format(label))
         _enum(item["severity"], SEVERITIES, "{}.severity".format(label))

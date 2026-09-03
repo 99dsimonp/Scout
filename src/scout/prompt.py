@@ -85,7 +85,13 @@ when needed to understand contracts, callers, schemas, or shared behavior. Do
 not recursively look for other repositories. Every finding must refer to the
 primary repository and be anchored to a changed line listed in the primary PR
 diff. Never report findings against related-repository files. Do not modify
-files. Do not perform network operations. Do not invent line numbers.
+files. Do not perform network operations. For every annotation, set line_side
+to NEW when line is the new-side number of a `+` line. Set line_side to OLD
+when line is the old-side number of a `-` line. Unchanged context lines are
+never valid annotation locations. For OLD, path must be the old-side path from
+the `--- a/...` header; for NEW, path must be the new-side path from the
+`+++ b/...` header. This distinction matters when a file is renamed or copied.
+Do not invent a side, path, or line number.
 
 Compatibility lens:
 {compatibility_guidance}

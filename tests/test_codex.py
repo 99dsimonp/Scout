@@ -27,7 +27,7 @@ def codex_config(**overrides):
 
 
 def valid_review_json():
-    return """{"recommendation":"request_changes","report":{"title":"Codex PR Review","details":"Found one issue.","report_type":"BUG","reporter":"scout","data":[{"title":"Findings","type":"NUMBER","value":1}]},"annotations":[{"external_id":"finding-001","annotation_type":"BUG","path":"src/app.py","line":12,"summary":"Missing error handling","details":"The changed call can fail.","severity":"HIGH","result":"FAILED","reviewer":"correctness","confidence":"HIGH","smallest_fix":"Handle the failure before updating state."}]}"""
+    return """{"recommendation":"request_changes","report":{"title":"Codex PR Review","details":"Found one issue.","report_type":"BUG","reporter":"scout","data":[{"title":"Findings","type":"NUMBER","value":1}]},"annotations":[{"external_id":"finding-001","annotation_type":"BUG","path":"src/app.py","line":12,"line_side":"NEW","summary":"Missing error handling","details":"The changed call can fail.","severity":"HIGH","result":"FAILED","reviewer":"correctness","confidence":"HIGH","smallest_fix":"Handle the failure before updating state."}]}"""
 
 
 class CodexRunnerTests(unittest.TestCase):

@@ -6,6 +6,7 @@ from pathlib import Path
 from scout.schema import (
     BITBUCKET_COMMENT_MAX_LENGTH,
     ReviewValidationError,
+    _changed_lines_by_side,
     summarize_findings,
     parse_review_json,
     report_result_for_recommendation,
@@ -15,7 +16,7 @@ from scout.schema import (
     to_no_findings_pr_comment,
     to_pr_comment,
     to_bitbucket_report,
-    validate_annotation_locations,
+    filter_annotation_locations,
     validate_review_output,
 )
 
@@ -39,6 +40,7 @@ def valid_review():
                 "annotation_type": "BUG",
                 "path": "src/app.py",
                 "line": 12,
+                "line_side": "NEW",
                 "summary": "Missing error handling",
                 "details": "The changed call can raise and leave state half-updated.",
                 "severity": "HIGH",
@@ -75,6 +77,7 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("Suggested fix:\n", annotations[0]["details"])
         self.assertIn("Reviewer: Codex / correctness / HIGH confidence", annotations[0]["details"])
         self.assertNotIn("smallest_fix", annotations[0])
+        self.assertNotIn("line_side", annotations[0])
 
     def test_report_data_can_include_model_metadata(self):
         review = validate_review_output(valid_review())
@@ -249,8 +252,8 @@ class SchemaTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            [(comment["path"], comment["line"]) for comment in comments],
-            [("src/app.py", 12), ("src/app.py", 14)],
+            [(comment["path"], comment["line"], comment["line_side"]) for comment in comments],
+            [("src/app.py", 12, "NEW"), ("src/app.py", 14, "NEW")],
         )
         self.assertEqual(
             "Scout: High issue found by Codex. Reviewer: Correctness / HIGH confidence",
@@ -387,6 +390,8 @@ class SchemaTests(unittest.TestCase):
             annotation_schema["properties"]["reviewer"]["enum"],
             ["correctness", "security", "tests", "performance", "best-practices", "compatibility"],
         )
+        self.assertIn("line_side", annotation_schema["required"])
+        self.assertEqual(annotation_schema["properties"]["line_side"]["enum"], ["NEW", "OLD"])
 
         self.assertIn("suggested_change", annotation_schema["required"])
         self.assertEqual(
@@ -459,8 +464,23 @@ class SchemaTests(unittest.TestCase):
         with self.assertRaises(ReviewValidationError):
             parse_review_json("[]")
 
-    def test_annotation_location_must_be_added_line_in_primary_diff(self):
+    def test_annotation_line_side_is_required_and_validated(self):
+        missing = valid_review()
+        del missing["annotations"][0]["line_side"]
+        with self.assertRaisesRegex(ReviewValidationError, "line_side"):
+            validate_review_output(missing)
+
+        invalid = valid_review()
+        invalid["annotations"][0]["line_side"] = "BOTH"
+        with self.assertRaisesRegex(ReviewValidationError, "line_side must be one of NEW, OLD"):
+            validate_review_output(invalid)
+
+    def test_annotation_location_filter_keeps_only_added_lines_in_primary_diff(self):
         review = validate_review_output(valid_review())
+        invalid_annotation = dict(review.annotations[0])
+        invalid_annotation["external_id"] = "finding-002"
+        invalid_annotation["line"] = 10
+        review.annotations.append(invalid_annotation)
         diff = """diff --git a/src/app.py b/src/app.py
 --- a/src/app.py
 +++ b/src/app.py
@@ -472,13 +492,281 @@ class SchemaTests(unittest.TestCase):
  unchanged
 """
         review.annotations[0]["line"] = 12
-        validate_annotation_locations(review, diff)
 
+        filtered = filter_annotation_locations(review, diff)
+
+        self.assertEqual(
+            [annotation["external_id"] for annotation in filtered.annotations],
+            ["finding-001"],
+        )
+        self.assertEqual(filtered.recommendation, "request_changes")
+
+    def test_all_invalid_annotation_locations_become_consistent_approval(self):
+        review = validate_review_output(valid_review())
         review.annotations[0]["line"] = 10
-        with self.assertRaisesRegex(ReviewValidationError, "changed line in the primary PR diff"):
-            validate_annotation_locations(review, diff)
+        diff = """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -10,2 +10,2 @@
+ unchanged
+-old
++new
+"""
 
-    def test_annotation_location_rejects_related_repository_path(self):
+        filtered = filter_annotation_locations(review, diff)
+        report = to_bitbucket_report(filtered, "Codex PR Review", provider="codex")
+
+        self.assertEqual(filtered.recommendation, "approve")
+        self.assertEqual(filtered.annotations, [])
+        self.assertEqual(report["result"], "PASSED")
+        self.assertEqual(
+            report["details"],
+            "Codex reviewed this pull request and found no material issues.",
+        )
+        self.assertIn(
+            {"title": "Findings", "type": "NUMBER", "value": 0},
+            report["data"],
+        )
+        self.assertIn(
+            {"title": "Recommendation", "type": "TEXT", "value": "Approve"},
+            report["data"],
+        )
+
+    def test_deleted_file_old_side_location_is_retained_for_inline_mode(self):
+        payload = valid_review()
+        payload["annotations"][0].update(
+            {"path": "removed.conf", "line": 2, "line_side": "OLD"}
+        )
+        review = validate_review_output(payload)
+        diff = """diff --git a/removed.conf b/removed.conf
+deleted file mode 100644
+index 1111111..0000000
+--- a/removed.conf
++++ /dev/null
+@@ -1,2 +0,0 @@
+-keep=true
+-release_scan=true
+"""
+
+        filtered = filter_annotation_locations(
+            review,
+            diff,
+            allowed_line_sides=("NEW", "OLD"),
+        )
+
+        self.assertEqual(len(filtered.annotations), 1)
+        self.assertEqual(filtered.annotations[0]["line_side"], "OLD")
+        self.assertEqual(filtered.recommendation, "request_changes")
+
+    def test_same_line_number_is_disambiguated_by_declared_side(self):
+        payload = valid_review()
+        payload["annotations"][0].update({"line": 5, "line_side": "NEW"})
+        old = dict(payload["annotations"][0])
+        old.update({"external_id": "finding-002", "line_side": "OLD"})
+        payload["annotations"].append(old)
+        review = validate_review_output(payload)
+        diff = """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -5 +5 @@
+-old
++new
+"""
+
+        inline_review = filter_annotation_locations(
+            review,
+            diff,
+            allowed_line_sides=("NEW", "OLD"),
+        )
+        report_review = filter_annotation_locations(review, diff)
+        comments = to_inline_pr_comments(inline_review, provider="codex")
+
+        self.assertEqual(
+            {annotation["line_side"] for annotation in inline_review.annotations},
+            {"NEW", "OLD"},
+        )
+        self.assertEqual(
+            [annotation["line_side"] for annotation in report_review.annotations],
+            ["NEW"],
+        )
+        self.assertEqual(
+            {(comment["line"], comment["line_side"]) for comment in comments},
+            {(5, "NEW"), (5, "OLD")},
+        )
+        self.assertEqual(report_review.recommendation, "request_changes")
+
+    def test_unchanged_context_is_invalid_on_both_sides(self):
+        payload = valid_review()
+        payload["annotations"][0].update({"line": 5, "line_side": "NEW"})
+        old = dict(payload["annotations"][0])
+        old.update({"external_id": "finding-002", "line_side": "OLD"})
+        payload["annotations"].append(old)
+        review = validate_review_output(payload)
+        diff = """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -5,2 +5,2 @@
+ unchanged
+-old
++new
+"""
+
+        filtered = filter_annotation_locations(
+            review,
+            diff,
+            allowed_line_sides=("NEW", "OLD"),
+        )
+
+        self.assertEqual(filtered.annotations, [])
+        self.assertEqual(filtered.recommendation, "approve")
+
+    def test_noncanonical_nonempty_diff_is_rejected_instead_of_approving(self):
+        review = validate_review_output(valid_review())
+        diffs = (
+            "external diff helper output\n",
+            "diff --git a/src/app.py b/src/app.py\nexternal helper output\n",
+            """diff --git old/src/app.py new/src/app.py
+--- old/src/app.py
++++ new/src/app.py
+@@ -11 +12 @@
+-old
++new
+""",
+            """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+content without a hunk header
+""",
+        )
+
+        for diff in diffs:
+            with self.subTest(diff=diff):
+                with self.assertRaisesRegex(ReviewValidationError, "not canonical"):
+                    filter_annotation_locations(review, diff)
+
+    def test_canonical_short_submodule_diff_preserves_unrelated_valid_finding(self):
+        review = validate_review_output(valid_review())
+        diff = """diff --git a/src/app.py b/src/app.py
+index 1111111..2222222 100644
+--- a/src/app.py
++++ b/src/app.py
+@@ -11 +12 @@
+-old
++new
+diff --git a/vendor/library b/vendor/library
+index 3333333..4444444 160000
+--- a/vendor/library
++++ b/vendor/library
+@@ -1 +1 @@
+-Subproject commit 3333333333333333333333333333333333333333
++Subproject commit 4444444444444444444444444444444444444444
+"""
+
+        filtered = filter_annotation_locations(review, diff)
+
+        self.assertEqual(
+            [annotation["external_id"] for annotation in filtered.annotations],
+            ["finding-001"],
+        )
+        self.assertEqual(filtered.recommendation, "request_changes")
+
+    def test_changed_lines_track_side_across_canonical_git_diff_forms(self):
+        cases = {
+            "rename": (
+                """diff --git a/old.py b/new.py
+similarity index 80%
+rename from old.py
+rename to new.py
+index 1111111..2222222 100644
+--- a/old.py
++++ b/new.py
+@@ -2,2 +2,2 @@
+ context
+-old name
++new name
+""",
+                {"OLD": {("old.py", 3)}, "NEW": {("new.py", 3)}},
+            ),
+            "copy": (
+                """diff --git a/source.py b/copied.py
+similarity index 75%
+copy from source.py
+copy to copied.py
+index 1111111..2222222 100644
+--- a/source.py
++++ b/copied.py
+@@ -1 +1 @@
+-old copy
++new copy
+""",
+                {"OLD": {("source.py", 1)}, "NEW": {("copied.py", 1)}},
+            ),
+            "multiple hunks": (
+                """diff --git a/app.py b/app.py
+index 1111111..2222222 100644
+--- a/app.py
++++ b/app.py
+@@ -2,2 +2,3 @@
+ context
+-old first
++new first
++new extra
+@@ -10,2 +11,2 @@
+-old second
++new second
+ context
+""",
+                {
+                    "OLD": {("app.py", 3), ("app.py", 10)},
+                    "NEW": {("app.py", 3), ("app.py", 4), ("app.py", 11)},
+                },
+            ),
+            "old quoted path": (
+                r'''diff --git "a/docs/\303\246\told.py" "b/docs/\303\246\told.py"
+--- "a/docs/\303\246\told.py"
++++ "b/docs/\303\246\told.py"
+@@ -7 +8 @@
+-old
++new
+''',
+                {
+                    "OLD": {("docs/æ\told.py", 7)},
+                    "NEW": {("docs/æ\told.py", 8)},
+                },
+            ),
+            "no newline marker": (
+                """diff --git a/value.txt b/value.txt
+--- a/value.txt
++++ b/value.txt
+@@ -1 +1 @@
+-old
+\\ No newline at end of file
++new
+\\ No newline at end of file
+""",
+                {"OLD": {("value.txt", 1)}, "NEW": {("value.txt", 1)}},
+            ),
+            "binary and text": (
+                """diff --git a/image.png b/image.png
+index 1111111..2222222 100644
+Binary files a/image.png and b/image.png differ
+diff --git a/app.py b/app.py
+index 3333333..4444444 100644
+--- a/app.py
++++ b/app.py
+@@ -4 +4 @@
+-old
++new
+""",
+                {"OLD": {("app.py", 4)}, "NEW": {("app.py", 4)}},
+            ),
+        }
+
+        for name, (diff, expected) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(_changed_lines_by_side(diff), expected)
+
+    def test_annotation_location_filter_discards_related_repository_path(self):
         review = validate_review_output(valid_review())
         review.annotations[0]["path"] = "contracts/schema.json"
         diff = """diff --git a/src/app.py b/src/app.py
@@ -488,8 +776,10 @@ class SchemaTests(unittest.TestCase):
 -old
 +new
 """
-        with self.assertRaisesRegex(ReviewValidationError, "contracts/schema.json:12"):
-            validate_annotation_locations(review, diff)
+        filtered = filter_annotation_locations(review, diff)
+
+        self.assertEqual(filtered.annotations, [])
+        self.assertEqual(filtered.recommendation, "approve")
 
     def test_annotation_location_decodes_git_c_quoted_path(self):
         review = validate_review_output(valid_review())
@@ -503,7 +793,13 @@ class SchemaTests(unittest.TestCase):
 +new
 '''
 
-        validate_annotation_locations(review, diff)
+        filtered = filter_annotation_locations(review, diff)
+
+        self.assertEqual(
+            [annotation["external_id"] for annotation in filtered.annotations],
+            ["finding-001"],
+        )
+        self.assertEqual(filtered.recommendation, "request_changes")
 
     def test_added_content_beginning_with_double_plus_is_not_a_file_header(self):
         review = validate_review_output(valid_review())
@@ -516,7 +812,13 @@ class SchemaTests(unittest.TestCase):
 +++ b/not-a-file-header
 """
 
-        validate_annotation_locations(review, diff)
+        filtered = filter_annotation_locations(review, diff)
+
+        self.assertEqual(
+            [annotation["external_id"] for annotation in filtered.annotations],
+            ["finding-001"],
+        )
+        self.assertEqual(filtered.recommendation, "request_changes")
 
 
 if __name__ == "__main__":

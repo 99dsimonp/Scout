@@ -135,7 +135,21 @@ class GitManager:
     ) -> Dict[str, object]:
         base_ref = pr.destination_commit_hash or pr.destination_branch
         merge_base = self._git_capture(["-C", str(worktree), "merge-base", "HEAD", base_ref]).strip()
-        diff = self._git_capture(["-C", str(worktree), "diff", "{}..HEAD".format(merge_base)])
+        diff = self._git_capture(
+            [
+                "-C",
+                str(worktree),
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--submodule=short",
+                "--ignore-submodules=none",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "{}..HEAD".format(merge_base),
+            ]
+        )
         files = self._git_capture(["-C", str(worktree), "diff", "--name-only", "{}..HEAD".format(merge_base)])
         changed_lines = count_changed_lines(diff)
         context_dir = worktree / ".scout-review"

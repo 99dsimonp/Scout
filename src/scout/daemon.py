@@ -38,7 +38,7 @@ from .schema import (
     to_bitbucket_report,
     to_inline_pr_comments,
     to_no_findings_pr_comment,
-    validate_annotation_locations,
+    filter_annotation_locations,
     validate_review_output,
 )
 from .state import ReviewJob, StateStore, utcnow
@@ -675,11 +675,43 @@ class ScoutDaemon:
                 raise ProviderSuperseded("review superseded before publish")
             parsed = parse_review_json(result.final_message)
             validated = validate_review_output(parsed, max_findings=self.config.review.max_findings)
+            output_mode = getattr(
+                job,
+                "output_mode",
+                getattr(self.config.review, "output_mode", "reports"),
+            )
             if validated.annotations:
                 diff = context.get("diff")
                 if not isinstance(diff, str):
                     diff = Path(str(context["diff_path"])).read_text(encoding="utf-8")
-                validate_annotation_locations(validated, diff)
+                original_annotations = validated.annotations
+                allowed_line_sides = (
+                    ("NEW", "OLD") if output_mode == "inline_comments" else ("NEW",)
+                )
+                validated = filter_annotation_locations(
+                    validated,
+                    diff,
+                    allowed_line_sides=allowed_line_sides,
+                )
+                retained_external_ids = {
+                    annotation["external_id"] for annotation in validated.annotations
+                }
+                discarded_annotations = [
+                    annotation
+                    for annotation in original_annotations
+                    if annotation["external_id"] not in retained_external_ids
+                ]
+                for annotation in discarded_annotations:
+                    LOG.warning(
+                        "discarded finding without publishable annotation location "
+                        "job=%s output_mode=%s external_id=%s path=%s line=%s side=%s",
+                        job.id,
+                        output_mode,
+                        annotation["external_id"],
+                        annotation["path"],
+                        annotation["line"],
+                        annotation["line_side"],
+                    )
             if not self.state.mark_publishing(job, self._lease_seconds(job.provider)):
                 raise ProviderSuperseded("review superseded before publish")
             review_log_path = _append_review_log_entry(
@@ -700,7 +732,6 @@ class ScoutDaemon:
                 job.repo_slug,
                 job.pr_id,
             )
-            output_mode = getattr(job, "output_mode", getattr(self.config.review, "output_mode", "reports"))
             if output_mode == "inline_comments":
                 report_id = "inline-comments"
                 review_run_id = job.running_review_run_id or job.target_review_run_id
@@ -744,6 +775,7 @@ class ScoutDaemon:
                         comment["path"],
                         comment["line"],
                         comment["content"],
+                        line_side=comment["line_side"],
                         before_request=lambda: self._renew_publish_or_superseded(job),
                     )
                     self.state.mark_inline_comment_published(job, external_id)

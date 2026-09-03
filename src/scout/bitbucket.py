@@ -216,10 +216,14 @@ class BitbucketClient:
         line: int,
         content: str,
         before_request: Optional[Callable[[], None]] = None,
+        line_side: str = "NEW",
     ) -> None:
+        line_key = {"NEW": "to", "OLD": "from"}.get(line_side)
+        if line_key is None:
+            raise BitbucketError("inline comment line_side must be NEW or OLD")
         body = {
             "content": {"raw": content},
-            "inline": {"path": path, "to": line},
+            "inline": {"path": path, line_key: line},
         }
         request_path = "/repositories/{}/{}/pullrequests/{}/comments".format(
             self.workspace, repo_slug, pr_id

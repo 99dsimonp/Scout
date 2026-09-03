@@ -422,6 +422,51 @@ class GitManagerTests(unittest.TestCase):
             self.assertEqual(manifest["related_repositories"], related)
             self.assertEqual(context["related_repositories"], related)
 
+    def test_prepare_context_forces_canonical_diff_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = GitManager(tmp)
+            worktree = Path(tmp) / "worktree"
+            worktree.mkdir()
+            pr = type(
+                "PR",
+                (),
+                {
+                    "workspace": "ws",
+                    "repo_slug": "app",
+                    "pr_id": 12,
+                    "title": "Change",
+                    "description": "Description",
+                    "source_branch": "feature",
+                    "source_commit_hash": "a" * 40,
+                    "destination_branch": "main",
+                    "destination_commit_hash": "b" * 40,
+                },
+            )()
+            merge_base = "d" * 40
+            with patch.object(
+                manager,
+                "_git_capture",
+                side_effect=[merge_base + "\n", "", ""],
+            ) as git_capture:
+                manager.prepare_context(Path(tmp) / "mirror.git", worktree, pr)
+
+            self.assertEqual(
+                git_capture.call_args_list[1].args[0],
+                [
+                    "-C",
+                    str(worktree),
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--submodule=short",
+                    "--ignore-submodules=none",
+                    "--src-prefix=a/",
+                    "--dst-prefix=b/",
+                    "{}..HEAD".format(merge_base),
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

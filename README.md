@@ -386,6 +386,15 @@ impact, suggested fix, and reviewer metadata. When a report is republished,
 Scout removes stale annotations whose `external_id` is no longer present in the
 latest validated review output.
 
+Every finding declares whether its line number belongs to the changed file
+(`NEW`) or the original file (`OLD`). Inline-comment mode supports both sides,
+including deletion-only findings. Code Insights reports are attached to the
+source commit and Scout's current annotation payload has no old-side anchor, so
+report mode publishes only valid `NEW` findings. Findings that do not identify
+a changed line on their declared side, and `OLD` findings in report mode, are
+discarded individually. Recommendations, details, and counts use only the
+remaining findings; if none remain, Scout publishes a passing no-findings result.
+
 Native PR comments are controlled by `[comments].severities`. The default is
 `["CRITICAL"]`; configure any subset of `CRITICAL`, `HIGH`, `MEDIUM`, and `LOW`,
 or an empty list to disable comments. The legacy
@@ -410,8 +419,9 @@ commits do not automatically trigger another review; a developer can request one
 by mentioning `@scout` or `@Scout` in a PR comment. Scout classifies tagged
 comments with `review.request_comments` before queueing a rerun. In this mode,
 `[comments].severities` and `[comments].critical_enabled` are ignored: every
-validated annotation is posted as its own inline code comment, and no PR-level
-fallback comment is posted.
+validated annotation with a valid changed-line location on its declared `NEW`
+or `OLD` side is posted as its own inline code comment, and no PR-level fallback
+comment is posted.
 
 ## Local Review Log
 

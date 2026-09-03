@@ -73,6 +73,7 @@ def valid_review():
                     "annotation_type": "BUG",
                     "path": "src/app.py",
                     "line": 12,
+                    "line_side": "NEW",
                     "summary": "Missing error handling",
                     "details": "The changed call can fail.",
                     "severity": "HIGH",
@@ -1144,6 +1145,7 @@ class DaemonReviewLogTests(unittest.TestCase):
                             "annotation_type": "BUG",
                             "path": "src/app.py",
                             "line": 12,
+                            "line_side": "NEW",
                             "summary": "Critical data loss",
                             "details": "The changed call can lose committed data.",
                             "severity": "CRITICAL",
@@ -1227,6 +1229,7 @@ class DaemonReviewLogTests(unittest.TestCase):
                             "annotation_type": "BUG",
                             "path": "src/app.py",
                             "line": 12,
+                            "line_side": "NEW",
                             "summary": "Important but not critical",
                             "details": "The changed call can fail.",
                             "severity": "HIGH",
@@ -1299,6 +1302,7 @@ class DaemonReviewLogTests(unittest.TestCase):
                             "annotation_type": "BUG",
                             "path": "src/app.py",
                             "line": 12,
+                            "line_side": "NEW",
                             "summary": "Important but not critical",
                             "details": "The changed call can fail.",
                             "severity": "HIGH",
@@ -1372,6 +1376,7 @@ class DaemonReviewLogTests(unittest.TestCase):
                             "annotation_type": "BUG",
                             "path": "src/app.py",
                             "line": 12,
+                            "line_side": "NEW",
                             "summary": "Critical data loss",
                             "details": "The changed call can lose committed data.",
                             "severity": "CRITICAL",
@@ -1445,6 +1450,7 @@ class DaemonReviewLogTests(unittest.TestCase):
                             "annotation_type": "BUG",
                             "path": "src/app.py",
                             "line": 12,
+                            "line_side": "NEW",
                             "summary": "High issue",
                             "details": "The changed call can fail.",
                             "severity": "HIGH",
@@ -1458,6 +1464,7 @@ class DaemonReviewLogTests(unittest.TestCase):
                             "annotation_type": "CODE_SMELL",
                             "path": "src/app.py",
                             "line": 20,
+                            "line_side": "NEW",
                             "summary": "Low issue",
                             "details": "The changed branch is confusing.",
                             "severity": "LOW",
@@ -1811,6 +1818,7 @@ class DaemonReviewLogTests(unittest.TestCase):
                             "annotation_type": "BUG",
                             "path": "src/app.py",
                             "line": 12,
+                            "line_side": "NEW",
                             "summary": "High issue",
                             "details": "The changed call can fail.",
                             "severity": "HIGH",
@@ -1885,6 +1893,7 @@ class DaemonReviewLogTests(unittest.TestCase):
                             "annotation_type": "BUG",
                             "path": "src/app.py",
                             "line": 12,
+                            "line_side": "NEW",
                             "summary": "High issue",
                             "details": "The changed call can fail.",
                             "severity": "HIGH",
@@ -1971,10 +1980,67 @@ class DaemonReviewLogTests(unittest.TestCase):
             )
             self.assertEqual(daemon.state.retryable_failures, [(32, 3, 300)])
 
-    def test_run_job_rejects_annotation_outside_primary_changed_lines(self):
+    def test_run_job_inline_mode_publishes_deleted_and_new_side_findings(self):
         with tempfile.TemporaryDirectory() as tmp:
             payload = valid_review()
-            payload.annotations[0]["path"] = "contracts/schema.json"
+            payload.annotations[0]["line_side"] = "NEW"
+            deleted_annotation = dict(payload.annotations[0])
+            deleted_annotation.update(
+                {
+                    "external_id": "finding-002",
+                    "line": 11,
+                    "line_side": "OLD",
+                    "summary": "Deleted release-candidate scan",
+                    "details": "The removed scan no longer protects release candidates.",
+                }
+            )
+            provider = _FakeProvider(
+                final_message={
+                    "recommendation": payload.recommendation,
+                    "report": payload.report,
+                    "annotations": payload.annotations + [deleted_annotation],
+                }
+            )
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+            daemon.git.diff = """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -10,5 +10,4 @@
+ unchanged
+-release-candidate scan
+ unchanged fallback
+-mutable production tag
++immutable production tag
+ unchanged
+"""
+
+            daemon.run_job(
+                review_job(provider="codex", job_id=33, output_mode="inline_comments")
+            )
+
+            self.assertEqual(daemon.bitbucket.reports, [])
+            self.assertEqual(daemon.bitbucket.annotations, [])
+            self.assertEqual(len(daemon.bitbucket.inline_comments), 2)
+            self.assertEqual(
+                [(item[2], item[3], item[5]) for item in daemon.bitbucket.inline_comments],
+                [("src/app.py", 11, "OLD"), ("src/app.py", 12, "NEW")],
+            )
+            self.assertIn("Deleted release-candidate scan", daemon.bitbucket.inline_comments[0][4])
+            self.assertIn("Missing error handling", daemon.bitbucket.inline_comments[1][4])
+            self.assertEqual(daemon.state.retryable_failures, [])
+            self.assertEqual(daemon.state.successes, [("codex", "inline-comments")])
+            review_log = json.loads(
+                Path(tmp, "review-log.jsonl").read_text(encoding="utf-8").strip()
+            )
+            self.assertEqual(review_log["recommendation"], "request_changes")
+            self.assertEqual(review_log["findings_count"], 2)
+            self.assertEqual(len(daemon.git.removed), 2)
+
+    def test_run_job_report_mode_discards_old_side_and_publishes_consistent_no_findings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = valid_review()
+            payload.annotations[0]["line"] = 11
+            payload.annotations[0]["line_side"] = "OLD"
             provider = _FakeProvider(
                 final_message={
                     "recommendation": payload.recommendation,
@@ -1983,13 +2049,37 @@ class DaemonReviewLogTests(unittest.TestCase):
                 }
             )
             daemon = _related_run_job_daemon(tmp, provider=provider)
+            daemon.git.diff = """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -11 +11,0 @@
+-release-candidate scan
+"""
 
-            daemon.run_job(review_job(provider="codex", job_id=33))
+            daemon.run_job(review_job(provider="codex", job_id=34))
 
-            self.assertEqual(daemon.bitbucket.reports, [])
-            self.assertEqual(daemon.bitbucket.annotations, [])
-            self.assertEqual(daemon.state.retryable_failures, [(33, 3, 300)])
-            self.assertEqual(len(daemon.git.removed), 2)
+            report = daemon.bitbucket.reports[0][3]
+            annotations = daemon.bitbucket.annotations[0][3]
+            self.assertEqual(report["result"], "PASSED")
+            self.assertEqual(
+                report["details"],
+                "Codex reviewed this pull request and found no material issues.",
+            )
+            self.assertIn(
+                {"title": "Findings", "type": "NUMBER", "value": 0},
+                report["data"],
+            )
+            self.assertIn(
+                {"title": "Recommendation", "type": "TEXT", "value": "Approve"},
+                report["data"],
+            )
+            self.assertEqual(annotations, [])
+            self.assertEqual(daemon.state.retryable_failures, [])
+            review_log = json.loads(
+                Path(tmp, "review-log.jsonl").read_text(encoding="utf-8").strip()
+            )
+            self.assertEqual(review_log["recommendation"], "approve")
+            self.assertEqual(review_log["findings_count"], 0)
 
     def test_git_failure_stays_retryable_after_max_attempts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2371,6 +2461,7 @@ class _RelatedFakeGit(_FakeGit):
         self.removed = []
         self.prepared_related = None
         self.ensured = []
+        self.diff = None
 
     def ensure_mirror(self, workspace, repo_slug, clone_url):
         self.ensured.append((workspace, repo_slug, clone_url))
@@ -2387,6 +2478,8 @@ class _RelatedFakeGit(_FakeGit):
     def prepare_context(self, mirror, worktree, pr, related_repositories=None):
         self.prepared_related = related_repositories
         context = super().prepare_context(mirror, worktree, pr)
+        if self.diff is not None:
+            context["diff"] = self.diff
         context["related_repositories"] = list(related_repositories or [])
         return context
 
@@ -2491,13 +2584,22 @@ class _FakeBitbucket:
             before_request()
         return list(self.existing_comments) + [
             {"content": {"raw": content}, "user": {"nickname": "scout-bot"}}
-            for _, _, _, _, content in self.inline_comments
+            for _, _, _, _, content, _ in self.inline_comments
         ]
 
-    def publish_inline_pull_request_comment(self, repo_slug, pr_id, path, line, content, before_request=None):
+    def publish_inline_pull_request_comment(
+        self,
+        repo_slug,
+        pr_id,
+        path,
+        line,
+        content,
+        before_request=None,
+        line_side="NEW",
+    ):
         if before_request is not None:
             before_request()
-        self.inline_comments.append((repo_slug, pr_id, path, line, content))
+        self.inline_comments.append((repo_slug, pr_id, path, line, content, line_side))
         self.operations.append("inline_comment")
 
 

@@ -6,7 +6,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs
 from urllib.error import HTTPError
 
-from scout.bitbucket import BitbucketClient, BitbucketCredentials
+from scout.bitbucket import BitbucketClient, BitbucketCredentials, BitbucketError
 
 
 class FakeResponse:
@@ -429,6 +429,50 @@ class BitbucketTests(unittest.TestCase):
             {"content": {"raw": "body"}, "inline": {"path": "src/app.py", "to": 12}},
         )
         self.assertEqual(heartbeats, ["renew"])
+
+    def test_publish_inline_pull_request_comment_targets_old_side(self):
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append(request.data)
+            return FakeResponse({"id": 12})
+
+        client = BitbucketClient(
+            "https://api.bitbucket.org/2.0",
+            "ws",
+            BitbucketCredentials("alice", "secret"),
+        )
+        with patch("scout.bitbucket.urlopen", fake_urlopen):
+            client.publish_inline_pull_request_comment(
+                "repo",
+                9,
+                "src/app.py",
+                11,
+                "body",
+                line_side="OLD",
+            )
+
+        self.assertEqual(
+            json.loads(requests[0].decode("utf-8")),
+            {"content": {"raw": "body"}, "inline": {"path": "src/app.py", "from": 11}},
+        )
+
+    def test_publish_inline_pull_request_comment_rejects_unknown_side(self):
+        client = BitbucketClient(
+            "https://api.bitbucket.org/2.0",
+            "ws",
+            BitbucketCredentials("alice", "secret"),
+        )
+
+        with self.assertRaisesRegex(BitbucketError, "line_side must be NEW or OLD"):
+            client.publish_inline_pull_request_comment(
+                "repo",
+                9,
+                "src/app.py",
+                12,
+                "body",
+                line_side="BOTH",
+            )
 
 
 if __name__ == "__main__":

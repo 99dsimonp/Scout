@@ -574,6 +574,10 @@ Scout should generate review context before invoking the provider:
 
 This context may be written into a temporary directory or a hidden worktree
 directory such as `.scout-review/`. The agent prompt should refer to these files.
+Scout generates `diff.patch` with color, external diff drivers, and textconv
+disabled, submodules included in short gitlink form, and explicit `a/` and `b/`
+prefixes. Location filtering relies on that canonical structure and rejects a
+non-empty patch that does not provide it.
 
 ## Git Authentication
 
@@ -896,6 +900,7 @@ Example shape:
       "annotation_type": "BUG",
       "path": "src/example.py",
       "line": 123,
+      "line_side": "NEW",
       "summary": "Possible null dereference",
       "details": "Detailed explanation.",
       "severity": "HIGH",
@@ -914,6 +919,7 @@ Recommended enums:
 - `annotation_type`: `BUG`, `VULNERABILITY`, `CODE_SMELL`
 - `severity`: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`
 - `annotation.result`: `FAILED`
+- `line_side`: `NEW`, `OLD`
 - `reviewer`: `correctness`, `security`, `tests`, `performance`,
   `best-practices`, `compatibility`
 - `confidence`: `HIGH`, `MEDIUM`, `LOW`
@@ -977,6 +983,7 @@ Initial schema outline:
           "annotation_type",
           "path",
           "line",
+          "line_side",
           "summary",
           "details",
           "severity",
@@ -990,6 +997,7 @@ Initial schema outline:
           "annotation_type": { "type": "string", "enum": ["BUG", "VULNERABILITY", "CODE_SMELL"] },
           "path": { "type": "string", "minLength": 1 },
           "line": { "type": "integer", "minimum": 1 },
+          "line_side": { "type": "string", "enum": ["NEW", "OLD"] },
           "summary": { "type": "string", "minLength": 1 },
           "details": { "type": "string", "minLength": 1 },
           "severity": { "type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"] },
@@ -1012,8 +1020,17 @@ Validation rules:
 - Parse final JSON only.
 - Enforce schema.
 - Reject invalid paths.
-- Reject impossible or missing line numbers where line-specific annotations are
-  required.
+- Require positive line numbers where line-specific annotations are required.
+- Require each annotation to declare `line_side`. `NEW` line numbers identify
+  `+` lines and `OLD` line numbers identify `-` lines; unchanged context is
+  invalid on both sides. For renames and copies, `OLD` uses the path from the
+  old-side `---` header and `NEW` uses the path from the new-side `+++` header.
+- After schema validation, discard annotations that do not target a changed line
+  on their declared side. Inline-comment mode retains both sides. Report mode
+  retains only `NEW` because Code Insights is attached to the source commit and
+  Scout's current payload has no old-side anchor. Derive the final
+  recommendation, report details, and finding counts from the retained set; an
+  empty retained set becomes an approval with no findings.
 - Reject invalid or incomplete provider output without salvaging partial stream
   output.
 - Never publish unvalidated agent output.
@@ -1112,10 +1129,13 @@ comment version is not handled repeatedly.
 
 Inline comment mode publishes no Code Insights report or annotation and ignores
 `[comments].severities` and `[comments].critical_enabled`. Every validated
-annotation is posted as one native Bitbucket inline code comment on
-`annotation.path` and `annotation.line`. If Bitbucket rejects the inline
-location, the job fails and follows normal retry handling; Scout does not fall
-back to a PR-level comment.
+annotation with a valid location on its declared side is posted as one native
+Bitbucket inline code comment on `annotation.path` and `annotation.line`.
+`line_side = "NEW"` uses Bitbucket's `inline.to`; `line_side = "OLD"` uses
+`inline.from`, including deletion-only changes. Invalid locations are discarded
+before publishing. If Bitbucket rejects a location that passed this check, the
+job fails and follows normal retry handling; Scout does not fall back to a
+PR-level comment.
 
 Scout enforces `review.max_findings` during output validation. If the provider
 returns too many annotations, the review is rejected rather than truncated and
@@ -1373,8 +1393,10 @@ Examples:
 - Provider quota/rate limit: mark provider cooldown.
 - Provider timeout: retryable with backoff.
 - Invalid JSON or schema-invalid output: retryable with backoff.
-- Invalid annotation location: reject the provider output. Scout does not
-  publish partially valid provider output.
+- Invalid annotation location, or an `OLD` annotation in report mode: discard
+  that annotation and publish any other valid findings. If no annotations
+  remain, publish an approval with no findings. A Bitbucket rejection after this
+  check follows normal retry handling.
 
 Retryable failures update the job timestamp and set a retry-after delay, which
 pushes that job behind other eligible queue work. Provider quota and rate-limit
