@@ -30,6 +30,8 @@ CONFIDENCE = {"HIGH", "MEDIUM", "LOW"}
 LINE_SIDES = {"NEW", "OLD"}
 INTERNAL_EXTERNAL_ID_PREFIX = "__scout_"
 BITBUCKET_REPORT_DETAILS_MAX_LENGTH = 2000
+BITBUCKET_ANNOTATION_SUMMARY_MAX_LENGTH = 450
+BITBUCKET_ANNOTATION_DETAILS_MAX_LENGTH = 2000
 BITBUCKET_COMMENT_MAX_LENGTH = 8000
 _NONCANONICAL_DIFF_ERROR = "primary PR diff is not canonical git diff output"
 _DIFF_METADATA_PREFIXES = (
@@ -132,7 +134,7 @@ def _changed_lines_by_side(diff: str) -> Dict[str, set]:
     in_hunk = False
     saw_file = False
     section_has_structure = False
-    for line in diff.splitlines():
+    for line in diff.split("\n"):
         if line.startswith("diff --git "):
             if (
                 expect_new_path
@@ -314,8 +316,10 @@ def to_bitbucket_annotations(review: ValidatedReview, provider: str = "codex") -
             "annotation_type": annotation["annotation_type"],
             "path": annotation["path"],
             "line": annotation["line"],
-            "summary": annotation["summary"],
-            "details": _format_details(annotation, provider_label),
+            "summary": _truncate(annotation["summary"], BITBUCKET_ANNOTATION_SUMMARY_MAX_LENGTH),
+            "details": _truncate(
+                _format_details(annotation, provider_label), BITBUCKET_ANNOTATION_DETAILS_MAX_LENGTH
+            ),
             "severity": annotation["severity"],
             "result": annotation["result"],
         }

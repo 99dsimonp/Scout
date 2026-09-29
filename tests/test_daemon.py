@@ -1,9 +1,12 @@
 import json
 import tempfile
+import threading
+import time
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from scout.bitbucket import BitbucketError
 from scout.daemon import (
@@ -20,7 +23,7 @@ from scout.daemon import (
 from scout.config import CredentialStore, parse_config
 from scout.gitops import GitError
 from scout.models import PullRequest
-from scout.provider import ProviderError, ProviderResult
+from scout.provider import ProviderError, ProviderResult, ProviderSuperseded
 from scout.schema import validate_review_output
 from scout.state import ReviewJob, StateStore
 
@@ -88,6 +91,109 @@ def valid_review():
 
 
 class DaemonReviewLogTests(unittest.TestCase):
+    def test_run_job_renews_lease_while_fetch_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = _related_run_job_daemon(tmp)
+            renewed = threading.Event()
+            fetching = threading.Event()
+            original_renew = daemon.state.renew_job_lease
+
+            def renew(job, seconds):
+                if fetching.is_set():
+                    renewed.set()
+                return original_renew(job, seconds)
+
+            def fetch(*args):
+                fetching.set()
+                self.assertTrue(renewed.wait(2), "lease was not renewed during the fetch")
+                raise GitError("stop after blocked fetch")
+
+            daemon.state.renew_job_lease = renew
+            daemon.git.ensure_mirror = fetch
+            with patch("scout.daemon._lease_renewal_interval", return_value=0.01, create=True):
+                daemon.run_job(review_job(provider="codex"))
+            self.assertTrue(renewed.is_set())
+            self.assertEqual(daemon.providers["codex"].runs, [])
+
+    def test_run_job_renews_lease_during_provider_wait_and_execution(self):
+        for phase in ("slot", "provider"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                daemon = _related_run_job_daemon(tmp)
+                blocked = threading.Event()
+                renewed = threading.Event()
+
+                def renew(job, seconds):
+                    if blocked.is_set():
+                        renewed.set()
+                    return True
+
+                def wait_for_heartbeat():
+                    blocked.set()
+                    self.assertTrue(renewed.wait(2), "lease was not renewed while waiting for " + phase)
+
+                daemon.state.renew_job_lease = renew
+                if phase == "slot":
+                    original = daemon._acquire_provider_slot
+
+                    def acquire(*args, **kwargs):
+                        wait_for_heartbeat()
+                        return original(*args, **kwargs)
+
+                    daemon._acquire_provider_slot = acquire
+                else:
+                    original = daemon.providers["codex"].run
+
+                    def run(*args, **kwargs):
+                        wait_for_heartbeat()
+                        return original(*args, **kwargs)
+
+                    daemon.providers["codex"].run = run
+                with patch("scout.daemon._lease_renewal_interval", return_value=0.01):
+                    daemon.run_job(review_job(provider="codex"))
+                self.assertTrue(renewed.is_set())
+                self.assertEqual(daemon.state.successes, [("codex", "scout-codex-v1")])
+
+    def test_failed_heartbeat_cancels_provider_and_cleans_worktrees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = _related_run_job_daemon(tmp)
+            provider_started = threading.Event()
+
+            def renew(job, seconds):
+                if provider_started.is_set():
+                    raise RuntimeError("database unavailable")
+                return True
+
+            def run(**kwargs):
+                provider_started.set()
+                deadline = time.monotonic() + 2
+                while not kwargs["is_superseded"]() and time.monotonic() < deadline:
+                    threading.Event().wait(0.01)
+                self.assertTrue(kwargs["is_superseded"]())
+                raise ProviderSuperseded("lease renewal failed")
+
+            daemon.state.renew_job_lease = renew
+            daemon.providers["codex"].run = run
+            with patch("scout.daemon._lease_renewal_interval", return_value=0.01):
+                with self.assertLogs("scout.daemon", level="ERROR") as captured:
+                    daemon.run_job(review_job(provider="codex"))
+            self.assertIn("failed to renew review job lease", captured.output[0])
+            self.assertEqual(daemon.state.successes, [])
+            self.assertEqual(len(daemon.git.removed), 2)
+            self.assertFalse(any(thread.name == "review-lease-7" for thread in threading.enumerate()))
+
+    def test_schedule_does_not_reclaim_job_with_an_active_worker(self):
+        daemon = ScoutDaemon.__new__(ScoutDaemon)
+        daemon.config = SimpleNamespace(queue=SimpleNamespace(job_timeout_seconds=1200))
+        daemon.provider_names = ["codex"]
+        daemon.provider_configs = {"codex": SimpleNamespace(max_parallel=2, timeout_seconds=1200)}
+        daemon.run_job = lambda job: None
+        daemon.state = _FakeClaimingState([review_job(provider="codex", job_id=1), review_job(provider="codex", job_id=2)])
+        daemon.max_parallel_reviews = 2
+        futures = {Future(): {"id": 1, "provider": "codex"}}
+        pool = _RecordingPool()
+        daemon._schedule(pool, futures)
+        self.assertEqual([job.id for job in pool.submitted], [2])
+
     def test_model_metadata_uses_cli_default_when_model_is_empty(self):
         self.assertEqual(_format_provider_model_metadata("", "max"), "CLI default / max")
         self.assertEqual(_format_provider_model_metadata("claude-opus-4-8", ""), "claude-opus-4-8 / CLI default")
@@ -2150,10 +2256,10 @@ class _FakeClaimingState:
         self.jobs = jobs
         self.claims = []
 
-    def claim_next_pending_job(self, lease_seconds_by_provider):
+    def claim_next_pending_job(self, lease_seconds_by_provider, excluded_job_ids=()):
         self.claims.append(dict(lease_seconds_by_provider))
         for index, job in enumerate(self.jobs):
-            if job.provider in lease_seconds_by_provider:
+            if job.provider in lease_seconds_by_provider and job.id not in excluded_job_ids:
                 return self.jobs.pop(index)
         return None
 
@@ -2381,6 +2487,9 @@ class _FakeRunJobState:
 
     def is_job_superseded(self, job_id, lease_token=None):
         return False
+
+    def renew_job_lease(self, job, lease_seconds):
+        return True
 
     def mark_publishing(self, job, lease_seconds):
         self.publishing_leases.append((job.provider, lease_seconds))

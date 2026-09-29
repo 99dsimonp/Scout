@@ -75,6 +75,7 @@ class CodexRunner:
     ) -> ProviderResult:
         Path(run_dir).mkdir(parents=True, exist_ok=True)
         output_file = Path(run_dir) / "codex-final-message.json"
+        output_file.unlink(missing_ok=True)
         stdout_file = Path(run_dir) / "codex-stdout.log"
         stderr_file = Path(run_dir) / "codex-stderr.log"
         prompt_file = Path(run_dir) / "codex-prompt.txt"
@@ -170,6 +171,7 @@ class CodexRunner:
     ) -> str:
         Path(run_dir).mkdir(parents=True, exist_ok=True)
         output_file = Path(run_dir) / "codex-risk-final-message.json"
+        output_file.unlink(missing_ok=True)
         stdout_file = Path(run_dir) / "codex-risk-stdout.log"
         stderr_file = Path(run_dir) / "codex-risk-stderr.log"
         prompt_file = Path(run_dir) / "codex-risk-prompt.txt"
@@ -261,6 +263,7 @@ class CodexRunner:
     ) -> CommentRequestClassification:
         Path(run_dir).mkdir(parents=True, exist_ok=True)
         output_file = Path(run_dir) / "codex-comment-request-final-message.json"
+        output_file.unlink(missing_ok=True)
         stdout_file = Path(run_dir) / "codex-comment-request-stdout.log"
         stderr_file = Path(run_dir) / "codex-comment-request-stderr.log"
         prompt_file = Path(run_dir) / "codex-comment-request-prompt.txt"

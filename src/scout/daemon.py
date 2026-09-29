@@ -9,7 +9,7 @@ import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .bitbucket import BitbucketClient, BitbucketCredentials, BitbucketError
 from .claude import ClaudeRunner
@@ -523,6 +523,43 @@ class ScoutDaemon:
         return True
 
     def run_job(self, job: ReviewJob) -> None:
+        stop = threading.Event()
+        lease_lost = threading.Event()
+        lease_seconds = self._lease_seconds(job.provider)
+
+        def renew() -> bool:
+            try:
+                renewed = self.state.renew_job_lease(job, lease_seconds)
+            except Exception:
+                LOG.exception("failed to renew review job lease id=%s", job.id)
+                renewed = False
+            if not renewed:
+                lease_lost.set()
+            return renewed
+
+        if not renew():
+            self.state.return_superseded_to_pending(job.id, job.lease_token)
+            return
+
+        def heartbeat() -> None:
+            while not stop.wait(_lease_renewal_interval(lease_seconds)):
+                if not renew():
+                    return
+
+        # Fetches and provider-slot waits can outlast the original lease before
+        # a provider starts polling for supersession.
+        worker = threading.Thread(target=heartbeat, name="review-lease-{}".format(job.id), daemon=True)
+        worker.start()
+        try:
+            self._run_job(job, lease_lost)
+        finally:
+            stop.set()
+            worker.join()
+
+    def _run_job(self, job: ReviewJob, lease_lost: threading.Event) -> None:
+        def is_superseded() -> bool:
+            return lease_lost.is_set() or self.state.is_job_superseded(job.id, job.lease_token)
+
         LOG.info("starting review job id=%s repo=%s pr=%s commit=%s", job.id, job.repo_slug, job.pr_id, job.running_source_commit_hash)
         provider_config = self.provider_configs[job.provider]
         provider_runner = self.providers[job.provider]
@@ -560,6 +597,8 @@ class ScoutDaemon:
             )
             clone_url = self.clone_urls[job.repo_slug]
             mirror = self.git.ensure_mirror(job.workspace, job.repo_slug, clone_url)
+            if is_superseded():
+                raise ProviderSuperseded("review superseded during fetch")
             worktree = self.git.create_worktree(mirror, pr, suffix="job-{}".format(job.id))
             repository_configs = getattr(self, "repository_configs", {})
             repo_config = repository_configs.get(job.repo_slug)
@@ -608,7 +647,9 @@ class ScoutDaemon:
                 )
             else:
                 context = self.git.prepare_context(mirror, worktree, pr)
-            risk = self._risk_for_job(job, source_commit)
+            if is_superseded():
+                raise ProviderSuperseded("review superseded during context preparation")
+            risk = self._risk_for_job(job, source_commit, is_superseded)
             effective_max_per_lens = effective_subagent_max_per_lens(
                 provider_config.subagent_max_per_lens,
                 provider_config.max_subagents,
@@ -645,12 +686,14 @@ class ScoutDaemon:
             run_dir = str(Path(self.config.service.state_dir) / "runs" / str(job.id))
             self._acquire_provider_slot(job.provider, blocking=True)
             try:
+                if is_superseded():
+                    raise ProviderSuperseded("review superseded while waiting for provider capacity")
                 provider_run_args = dict(
                     worktree=str(worktree),
                     prompt=prompt,
                     schema_path=self.config.review.schema_path,
                     run_dir=run_dir,
-                    is_superseded=lambda: self.state.is_job_superseded(job.id, job.lease_token),
+                    is_superseded=is_superseded,
                 )
                 if related_context:
                     provider_run_args["additional_dirs"] = [
@@ -671,7 +714,7 @@ class ScoutDaemon:
                 ),
             )
             usage_logged = True
-            if self.state.is_job_superseded(job.id, job.lease_token):
+            if is_superseded():
                 raise ProviderSuperseded("review superseded before publish")
             parsed = parse_review_json(result.final_message)
             validated = validate_review_output(parsed, max_findings=self.config.review.max_findings)
@@ -875,15 +918,6 @@ class ScoutDaemon:
                     job.lease_token,
                     job.running_review_key,
                 )
-            elif retryable:
-                marked = self.state.mark_retryable_failure(
-                    job.id,
-                    str(exc),
-                    self.config.queue.max_attempts,
-                    job.lease_token,
-                    job.running_review_key,
-                    _retry_backoff_seconds(self.config),
-                )
             else:
                 marked = self.state.mark_retryable_failure(
                     job.id,
@@ -937,7 +971,12 @@ class ScoutDaemon:
                     lease_seconds_by_provider[provider] = self._lease_seconds(provider)
             if not lease_seconds_by_provider:
                 return
-            job = self.state.claim_next_pending_job(lease_seconds_by_provider)
+            # A worker can still be cleaning up after its row becomes pending,
+            # or after a failed heartbeat. Keep its workspace exclusive until it exits.
+            job = self.state.claim_next_pending_job(
+                lease_seconds_by_provider,
+                excluded_job_ids=[_future_job_id(metadata) for metadata in futures.values()],
+            )
             if job is None:
                 return
             futures[pool.submit(self.run_job, job)] = {
@@ -951,7 +990,7 @@ class ScoutDaemon:
         if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
             raise ProviderSuperseded("review superseded during publish")
 
-    def _risk_for_job(self, job: ReviewJob, source_commit: str) -> str:
+    def _risk_for_job(self, job: ReviewJob, source_commit: str, is_superseded: Callable[[], bool]) -> str:
         risk_config = getattr(self.config.review, "risk", None)
         if risk_config is None or not getattr(risk_config, "enabled", True):
             return DEFAULT_RISK
@@ -971,7 +1010,7 @@ class ScoutDaemon:
                 if cached is not None:
                     return cached
             try:
-                risk = self._assess_risk(job, source_commit, risk_config)
+                risk = self._assess_risk(job, source_commit, risk_config, is_superseded)
             except Exception:
                 with self._risk_cache_guard:
                     self._risk_cache_locks.pop(key, None)
@@ -989,7 +1028,7 @@ class ScoutDaemon:
         if not hasattr(self, "_risk_cache_guard"):
             self._risk_cache_guard = threading.Lock()
 
-    def _assess_risk(self, job: ReviewJob, source_commit: str, risk_config) -> str:
+    def _assess_risk(self, job: ReviewJob, source_commit: str, risk_config, is_superseded: Callable[[], bool]) -> str:
         provider = getattr(risk_config, "provider", "codex")
         runner = self.providers.get(provider)
         if runner is None:
@@ -1011,7 +1050,7 @@ class ScoutDaemon:
                     reasoning_effort=risk_config.effort,
                     timeout_seconds=risk_config.timeout_seconds,
                     run_dir=run_dir,
-                    is_superseded=lambda: self.state.is_job_superseded(job.id, job.lease_token),
+                    is_superseded=is_superseded,
                 )
             elif provider == "claude":
                 risk = runner.assess_risk(
@@ -1020,7 +1059,7 @@ class ScoutDaemon:
                     effort=risk_config.effort,
                     timeout_seconds=risk_config.timeout_seconds,
                     run_dir=run_dir,
-                    is_superseded=lambda: self.state.is_job_superseded(job.id, job.lease_token),
+                    is_superseded=is_superseded,
                 )
             else:
                 LOG.warning("unsupported risk provider provider=%s job=%s", provider, job.id)
@@ -1163,6 +1202,10 @@ def _selected_provider_config(config: AppConfig):
 
 def _selected_provider_runner(config: AppConfig, credentials: CredentialStore):
     return _provider_runner(config, credentials, config.agents.strategy)
+
+
+def _lease_renewal_interval(lease_seconds: int) -> float:
+    return min(30.0, lease_seconds / 3)
 
 
 def _lease_seconds(

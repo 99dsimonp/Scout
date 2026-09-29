@@ -8,6 +8,32 @@ from scout.review_plan import (
 
 
 class ReviewPlanTests(unittest.TestCase):
+    def test_count_changed_lines_counts_header_like_hunk_content(self):
+        diff = """diff --git a/a.sql b/a.sql
+--- a/a.sql
++++ b/a.sql
+@@ -1 +1 @@
+--- removed comment
++++ added content
+diff --git a/b.sql b/b.sql
+--- a/b.sql
++++ b/b.sql
+@@ -1 +1 @@
+-old
++new
+"""
+        self.assertEqual(count_changed_lines(diff), 4)
+
+    def test_count_changed_lines_does_not_split_content_at_other_separators(self):
+        for separator in ("\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"):
+            with self.subTest(separator=repr(separator)):
+                diff = (
+                    "diff --git a/a.py b/a.py\n"
+                    "--- a/a.py\n+++ b/a.py\n"
+                    "@@ -1 +1 @@\n-old{0}-content\n+new{0}+content\n"
+                ).format(separator)
+                self.assertEqual(count_changed_lines(diff), 2)
+
     def test_count_changed_lines_ignores_diff_headers(self):
         diff = """diff --git a/a.py b/a.py
 --- a/a.py

@@ -33,6 +33,18 @@ def review_key(
     return hashlib.sha256(encoded).hexdigest()
 
 
+def legacy_report_review_key(
+    pr: PullRequest,
+    policy_version: str,
+    schema_version: str,
+    provider: str,
+) -> str:
+    payload = _review_identity_payload(pr, policy_version, schema_version, provider, "reports")
+    del payload["output_mode"]
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _review_identity_payload(
     pr: PullRequest,
     policy_version: str,

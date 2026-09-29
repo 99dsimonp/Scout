@@ -1,3 +1,5 @@
+import hashlib
+import json
 import tempfile
 import threading
 import unittest
@@ -5,11 +7,117 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import scout.state as state_module
-from scout.models import PullRequest
+from scout.models import PullRequest, review_key
 from scout.state import StateStore
 
 
 class StateTests(unittest.TestCase):
+    def test_legacy_report_history_survives_repeated_upgrades(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            pr = PullRequest("ws", "repo", 1, "PR", "", "feature", "a" * 40, "main")
+            jobs = []
+            for provider in ("codex", "claude"):
+                store.enqueue_or_update_pr(pr, "v1", "v1", provider)
+                job = store.claim_next_pending_job({provider: 1200})
+                store.mark_publishing(job, 1200)
+                store.mark_success(job, "scout-" + provider)
+                # This is the exact identity payload from the report-only release.
+                payload = {
+                    "workspace": "ws", "repo_slug": "repo", "pr_id": 1,
+                    "source_commit_hash": "a" * 40, "destination_branch": "main",
+                    "destination_commit_hash": "", "merge_base_hash": "",
+                    "policy_version": "v1", "schema_version": "v1", "provider": provider,
+                }
+                legacy_key = hashlib.sha256(
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                with store.connect() as conn:
+                    conn.execute(
+                        "update review_jobs set target_review_key=?, running_review_key=? where id=?",
+                        (legacy_key, legacy_key, job.id),
+                    )
+                    conn.execute("update pull_request_state set last_review_key=?", (legacy_key,))
+                jobs.append(job)
+
+            for _ in range(2):
+                store = StateStore(tmp + "/state.db")
+                store.initialize()
+                self.assertEqual(store.recover_abandoned_jobs(), 0)
+                for job in jobs:
+                    self.assertFalse(store.enqueue_or_update_pr(pr, "v1", "v1", job.provider))
+                    current = store.get_job(job.id)
+                    self.assertEqual(current.status, "succeeded")
+                    self.assertEqual(current.target_review_run_id, job.target_review_run_id)
+                    self.assertEqual(current.target_review_key, review_key(pr, "v1", "v1", job.provider))
+                    self.assertEqual(current.running_review_key, current.target_review_key)
+                self.assertIsNone(store.claim_next_pending_job({"codex": 1200, "claude": 1200}))
+                with store.connect() as conn:
+                    history = conn.execute("select * from pull_request_state").fetchone()
+                    self.assertEqual(history["last_report_id"], "scout-claude")
+                    self.assertEqual(history["last_review_key"], review_key(pr, "v1", "v1", "claude"))
+
+            changed = PullRequest("ws", "repo", 1, "PR", "", "feature", "b" * 40, "main")
+            for provider in ("codex", "claude"):
+                self.assertTrue(store.enqueue_or_update_pr(changed, "v1", "v1", provider))
+
+    def test_upgrade_preserves_current_report_and_inline_review_identities(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            pr = PullRequest("ws", "repo", 1, "PR", "", "feature", "a" * 40, "main")
+            for output_mode in ("reports", "inline_comments"):
+                for provider in ("codex", "claude"):
+                    store.enqueue_or_update_pr(pr, "v1", "v1", provider, output_mode=output_mode)
+                    job = store.claim_next_pending_job({provider: 1200})
+                    store.mark_publishing(job, 1200)
+                    store.mark_success(job, "scout-" + provider)
+            with store.connect() as conn:
+                before = [dict(row) for row in conn.execute("select * from review_jobs order by id")]
+                history = [dict(row) for row in conn.execute("select * from pull_request_state")]
+            store.initialize()
+            store.initialize()
+            with store.connect() as conn:
+                self.assertEqual(before, [dict(row) for row in conn.execute("select * from review_jobs order by id")])
+                self.assertEqual(history, [dict(row) for row in conn.execute("select * from pull_request_state")])
+            for output_mode in ("reports", "inline_comments"):
+                for provider in ("codex", "claude"):
+                    self.assertFalse(store.enqueue_or_update_pr(pr, "v1", "v1", provider, output_mode=output_mode))
+
+    def test_running_lease_renewal_preserves_ownership(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            pr = PullRequest("ws", "repo", 1, "PR", "", "feature", "a" * 40, "main")
+            store.enqueue_or_update_pr(pr, "v1", "v1", "codex")
+            job = store.claim_next_pending_job({"codex": 1})
+            self.assertTrue(store.renew_job_lease(job, 1200))
+            self.assertGreater(store.get_job(job.id).leased_until, job.leased_until)
+            self.assertIsNone(store.claim_next_pending_job({"codex": 1200}))
+            with store.connect() as conn:
+                conn.execute("update review_jobs set leased_until='2000-01-01T00:00:00+00:00'")
+            replacement = store.claim_next_pending_job({"codex": 1200})
+            self.assertFalse(store.renew_job_lease(job, 1200))
+            self.assertEqual(store.get_job(job.id).lease_token, replacement.lease_token)
+            changed = PullRequest("ws", "repo", 1, "PR", "", "feature", "b" * 40, "main")
+            store.enqueue_or_update_pr(changed, "v1", "v1", "codex")
+            self.assertFalse(store.renew_job_lease(replacement, 1200))
+
+    def test_claim_next_pending_job_excludes_active_workers_even_after_expiry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            for pr_id in (1, 2):
+                pr = PullRequest("ws", "repo", pr_id, "PR", "", "feature", "a" * 40, "main")
+                store.enqueue_or_update_pr(pr, "v1", "v1", "codex")
+            active = store.claim_next_pending_job({"codex": 1200})
+            with store.connect() as conn:
+                conn.execute("update review_jobs set leased_until='2000-01-01T00:00:00+00:00' where id=?", (active.id,))
+            other = store.claim_next_pending_job({"codex": 1200}, excluded_job_ids=[active.id])
+            self.assertNotEqual(other.id, active.id)
+            self.assertEqual(store.get_job(active.id).lease_token, active.lease_token)
+
     def test_disabling_repository_cancels_queued_failed_and_active_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(tmp + "/state.db")

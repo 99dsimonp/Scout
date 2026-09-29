@@ -50,7 +50,7 @@ rpmbuild -ba packaging/scout.spec
 Install the built package:
 
 ```bash
-sudo dnf install -y ~/rpmbuild/RPMS/noarch/scout-0.1.0-2.el9.noarch.rpm
+sudo dnf install -y ~/rpmbuild/RPMS/noarch/scout-0.1.0-3.el9.noarch.rpm
 scout --config /etc/scout/config.toml --check-config
 ```
 
@@ -59,6 +59,38 @@ The RPM installs `/usr/bin/scout`, `/usr/bin/scout-setup`,
 at `/usr/lib/systemd/system/scout.service`.
 RPM upgrades preserve `config.toml` but replace the bundled review schema so new
 reviewer values cannot be rejected by a stale local copy.
+
+### Upgrading a running instance
+
+Upgrade the installed package with `dnf upgrade /path/to/scout-<version>-<release>.rpm`.
+The RPM preserves `/etc/scout/config.toml` and does not replace the SQLite
+database at `service.state_db` (default `/var/lib/scout/state.db`). Keep the same
+`service.state_db` and `service.state_dir` paths when upgrading. Completed
+reviews and processed review-request comments remain in that database, so an
+ordinary package upgrade does not queue fresh reviews of unchanged open PRs.
+
+Startup migrates older databases in place, including report identities written
+before inline-comment mode was introduced. It returns interrupted running or
+publishing jobs to the queue and keeps completed jobs completed. Package and
+bundled schema updates do not automatically change `review.policy_version`.
+Changing the configured policy, provider, or output mode is a separate review
+decision; report mode also reacts to changes in the PR's commits and target.
+
+Before upgrading, stop the service and back up the configured database and
+config. Copy any SQLite `-wal` and `-shm` sidecars together with the database
+while the service is stopped. Upgrade the RPM, then start the service again:
+
+```bash
+sudo systemctl stop scout
+# Back up the configured database, its sidecars, and /etc/scout/config.toml.
+sudo dnf upgrade -y /path/to/scout-0.1.0-3.el9.noarch.rpm
+sudo systemctl start scout
+```
+
+`scout-setup` is not required for an ordinary RPM upgrade. Do not use
+`--reset-state-db` during deployment: it deliberately deletes review history.
+Audit logs and provider run files still follow the configured retention window;
+that cleanup does not remove completed-review records for open PRs.
 
 ## Development
 
@@ -382,7 +414,10 @@ custom report IDs or titles. If a configured title omits the provider, Scout
 prefixes it before publishing. Report details summarize the validated findings
 without commit hashes by category and severity counts instead of enumerating
 every finding. Annotation details are reformatted into readable sections for
-impact, suggested fix, and reviewer metadata. When a report is republished,
+impact, suggested fix, and reviewer metadata. Code Insights annotation summaries
+are capped at 450 characters and details at 2,000 characters after formatting.
+Longer text ends with `...`; native inline comments use their separate comment
+limit. When a report is republished,
 Scout removes stale annotations whose `external_id` is no longer present in the
 latest validated review output.
 

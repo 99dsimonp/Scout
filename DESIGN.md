@@ -1018,6 +1018,9 @@ Initial schema outline:
 Validation rules:
 
 - Parse final JSON only.
+- Before each Codex invocation, remove that operation's previous final-message
+  file. A successful exit without a new file must fail validation; otherwise a
+  reused job directory can supply the previous commit's review or classification.
 - Enforce schema.
 - Reject invalid paths.
 - Require positive line numbers where line-specific annotations are required.
@@ -1025,6 +1028,10 @@ Validation rules:
   `+` lines and `OLD` line numbers identify `-` lines; unchanged context is
   invalid on both sides. For renames and copies, `OLD` uses the path from the
   old-side `---` header and `NEW` uses the path from the new-side `+++` header.
+- Split canonical Git diffs only at LF characters. Form feeds and Unicode line
+  separators inside source text must not advance either side's line number.
+  Count additions and deletions within hunks so a removed SQL `--` comment is
+  counted even though its diff line starts with `---`.
 - After schema validation, discard annotations that do not target a changed line
   on their declared side. Inline-comment mode retains both sides. Report mode
   retains only `NEW` because Code Insights is attached to the source commit and
@@ -1085,6 +1092,11 @@ recommendation:
 
 Annotation translation should mostly pass through each validated annotation,
 dropping or embedding Scout-only helper fields that Bitbucket does not accept:
+
+Code Insights summaries are capped at 450 characters. Details are capped at
+2,000 characters after adding the suggested fix and reviewer text, so formatting
+cannot push an otherwise bounded finding over Scout's publishing limit. These
+limits do not alter the validated review or native inline comments.
 
 ```json
 {
@@ -1213,6 +1225,20 @@ Scout holds a nonblocking advisory runtime lock under `state_dir` while the
 daemon is running. Startup recovery and the stop-time recovery command only
 reset `running` or `publishing` rows after acquiring that lock, so a second
 manual Scout process cannot clear live leases from the active daemon.
+
+While a worker is active, a heartbeat renews its lease through repository
+preparation, provider waits, execution, and publishing. Renewal checks the lease
+token and review identity, so an old worker cannot extend another attempt's
+lease. The scheduler also excludes job IDs with active worker futures until
+their cleanup finishes; an expired lease must not start a second worker that
+removes the first worker's worktree.
+
+RPM upgrades preserve the configured SQLite database and user configuration.
+Startup migrates report identities written before output modes existed to the
+current report identity without queuing completed reviews again. This migration
+also repairs databases whose table layout was already upgraded. Current report
+and inline-comment identities remain unchanged. Recovery requeues interrupted
+work; a package upgrade alone does not invalidate completed reviews.
 
 For explicit test runs, `scout --once --reset-state-db` deletes the configured
 SQLite database and WAL/SHM sidecars after acquiring the same runtime lock. This

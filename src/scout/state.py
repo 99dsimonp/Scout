@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence
 
-from .models import PullRequest, review_key
+from .models import PullRequest, legacy_report_review_key, review_key
 
 
 def utcnow() -> str:
@@ -168,6 +168,7 @@ class StateStore:
             self._backfill_review_job_run_ids(conn)
             self._migrate_review_jobs_output_mode_unique(conn)
             self._migrate_failed_permanent_jobs(conn)
+            self._migrate_legacy_report_review_keys(conn)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -1281,11 +1282,17 @@ class StateStore:
                     jobs.append(_job_from_row(updated))
         return jobs
 
-    def claim_next_pending_job(self, lease_seconds_by_provider: Dict[str, int]) -> Optional[ReviewJob]:
+    def claim_next_pending_job(
+        self,
+        lease_seconds_by_provider: Dict[str, int],
+        excluded_job_ids: Sequence[int] = (),
+    ) -> Optional[ReviewJob]:
         if not lease_seconds_by_provider:
             return None
         providers = tuple(lease_seconds_by_provider.keys())
         placeholders = ",".join("?" for _ in providers)
+        excluded_placeholders = ",".join("?" for _ in excluded_job_ids)
+        excluded_filter = "and review_jobs.id not in ({})".format(excluded_placeholders) if excluded_job_ids else ""
         now = utcnow()
         with self.connect() as conn:
             conn.execute("begin immediate")
@@ -1318,6 +1325,7 @@ class StateStore:
                     and provider_state.cooldown_until is not null
                     and provider_state.cooldown_until > ?
                 )
+                {}
                 order by
                   case when review_jobs.status='failed_retryable' then 1 else 0 end asc,
                   case
@@ -1326,8 +1334,8 @@ class StateStore:
                   end asc,
                   review_jobs.id asc
                 limit 1
-                """.format(placeholders),
-                (*providers, now, now, now),
+                """.format(placeholders, excluded_filter),
+                (*providers, now, now, now, *excluded_job_ids),
             ).fetchone()
             if row is None:
                 return None
@@ -1433,7 +1441,13 @@ class StateStore:
             )
             return result.rowcount == 1
 
+    def renew_job_lease(self, job: ReviewJob, lease_seconds: int) -> bool:
+        return self._renew_lease(job, lease_seconds, ("running", "publishing"))
+
     def renew_publishing_lease(self, job: ReviewJob, lease_seconds: int) -> bool:
+        return self._renew_lease(job, lease_seconds, ("publishing",))
+
+    def _renew_lease(self, job: ReviewJob, lease_seconds: int, statuses: Sequence[str]) -> bool:
         now = utcnow()
         leased_until = (
             datetime.now(timezone.utc).replace(microsecond=0) + timedelta(seconds=lease_seconds)
@@ -1445,18 +1459,19 @@ class StateStore:
                   leased_until=?,
                   updated_at=?
                 where id=?
-                  and status='publishing'
+                  and status in ({})
                   and superseded=0
                   and lease_token=?
                   and running_review_key=?
                   and target_review_key=?
                   and running_review_run_id=?
                   and target_review_run_id=?
-                """,
+                """.format(",".join("?" for _ in statuses)),
                 (
                     leased_until,
                     now,
                     job.id,
+                    *statuses,
                     job.lease_token,
                     job.running_review_key,
                     job.running_review_key,
@@ -1714,6 +1729,44 @@ class StateStore:
             alter table review_jobs_new rename to review_jobs;
             """
         )
+
+    def _migrate_legacy_report_review_keys(self, conn: sqlite3.Connection) -> None:
+        # Report-only releases omitted output_mode from the review identity.
+        # Translate only matching legacy hashes so an upgrade does not requeue
+        # a completed review of the same commit.
+        for row in conn.execute("select * from review_jobs where output_mode='reports'").fetchall():
+            pr = PullRequest(
+                workspace=row["workspace"],
+                repo_slug=row["repo_slug"],
+                pr_id=row["pr_id"],
+                title=row["title"],
+                description=row["description"],
+                source_branch=row["source_branch"],
+                source_commit_hash=row["target_source_commit_hash"],
+                destination_branch=row["destination_branch"],
+                destination_commit_hash=row["destination_commit_hash"],
+                merge_base_hash=row["merge_base_hash"],
+            )
+            identity = (pr, row["reviewer_policy_version"], row["schema_version"], row["provider"])
+            legacy_key = legacy_report_review_key(*identity)
+            if row["target_review_key"] != legacy_key:
+                continue
+            key = review_key(*identity)
+            conn.execute(
+                """
+                update review_jobs set target_review_key=?,
+                  running_review_key=case when running_review_key=? then ? else running_review_key end
+                where id=?
+                """,
+                (key, legacy_key, key, row["id"]),
+            )
+            conn.execute(
+                """
+                update pull_request_state set last_review_key=?
+                where workspace=? and repo_slug=? and pr_id=? and last_review_key=?
+                """,
+                (key, pr.workspace, pr.repo_slug, pr.pr_id, legacy_key),
+            )
 
     def _migrate_failed_permanent_jobs(self, conn: sqlite3.Connection) -> None:
         now = utcnow()

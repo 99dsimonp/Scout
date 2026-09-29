@@ -54,6 +54,46 @@ def valid_review():
 
 
 class SchemaTests(unittest.TestCase):
+    def test_changed_lines_use_physical_lines_on_both_sides(self):
+        for separator in ("\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"):
+            with self.subTest(separator=repr(separator)):
+                diff = (
+                    "diff --git a/app.py b/app.py\n"
+                    "--- a/app.py\n+++ b/app.py\n"
+                    "@@ -1,4 +1,4 @@\n"
+                    " context\n"
+                    "-old{0}content\n-old again\n-old last\n"
+                    "+new{0}content\n+new again\n+new last\n"
+                ).format(separator)
+
+                self.assertEqual(
+                    _changed_lines_by_side(diff),
+                    {
+                        "OLD": {("app.py", 2), ("app.py", 3), ("app.py", 4)},
+                        "NEW": {("app.py", 2), ("app.py", 3), ("app.py", 4)},
+                    },
+                )
+
+    def test_code_insights_annotations_bound_final_text_without_changing_inline_comments(self):
+        payload = valid_review()
+        annotation = payload["annotations"][0]
+        annotation["summary"] = "s" * 451
+        annotation["details"] = "d" * 1950
+        annotation["smallest_fix"] = "f" * 100
+        review = validate_review_output(payload)
+
+        converted = to_bitbucket_annotations(review)[0]
+        inline = to_inline_pr_comments(review)[0]["content"]
+
+        self.assertEqual(len(converted["summary"]), 450)
+        self.assertEqual(len(converted["details"]), 2000)
+        self.assertTrue(converted["summary"].endswith("..."))
+        self.assertTrue(converted["details"].endswith("..."))
+        self.assertIn(annotation["summary"], inline)
+        self.assertIn(annotation["details"], inline)
+        self.assertIn(annotation["smallest_fix"], inline)
+        self.assertEqual(review.annotations[0], annotation)
+
     def test_validate_and_convert_review(self):
         review = validate_review_output(valid_review())
         self.assertEqual(report_result_for_recommendation(review.recommendation), "FAILED")

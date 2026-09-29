@@ -31,6 +31,44 @@ def valid_review_json():
 
 
 class CodexRunnerTests(unittest.TestCase):
+    def test_successful_process_without_output_cannot_reuse_previous_final_message(self):
+        cases = (
+            (
+                "run",
+                "codex-final-message.json",
+                valid_review_json(),
+                {"worktree": "/repo", "prompt": "review", "schema_path": "/schema.json"},
+            ),
+            (
+                "assess_risk",
+                "codex-risk-final-message.json",
+                '{"risk":"high"}',
+                {"description": "change", "model": "gpt-5.4", "reasoning_effort": "low", "timeout_seconds": 5},
+            ),
+            (
+                "classify_review_request",
+                "codex-comment-request-final-message.json",
+                '{"review_requested":true,"reason":"explicit request"}',
+                {"comment": "review", "model": "gpt-5.4", "reasoning_effort": "low", "timeout_seconds": 5},
+            ),
+        )
+        for method, filename, previous_message, kwargs in cases:
+            with self.subTest(method=method), tempfile.TemporaryDirectory() as tmp:
+                command = Path(tmp) / "fake-codex"
+                command.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                command.chmod(0o755)
+                output_file = Path(tmp) / filename
+                output_file.write_text(previous_message, encoding="utf-8")
+                runner = CodexRunner(
+                    codex_config(command=str(command), timeout_seconds=5),
+                    CredentialStore("/tmp/unused"),
+                )
+
+                with self.assertRaisesRegex(ProviderError, "did not write a final message"):
+                    getattr(runner, method)(run_dir=tmp, is_superseded=lambda: False, **kwargs)
+
+                self.assertFalse(output_file.exists())
+
     def test_build_command_includes_model_reasoning_and_fast_mode(self):
         config = codex_config()
         runner = CodexRunner(config, CredentialStore("/tmp/unused"))

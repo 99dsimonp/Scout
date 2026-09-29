@@ -72,10 +72,13 @@ def build_review_plan(
 
 def count_changed_lines(diff: str) -> int:
     changed = 0
-    for line in diff.splitlines():
-        if line.startswith("+++") or line.startswith("---"):
-            continue
-        if line.startswith("+") or line.startswith("-"):
+    in_hunk = False
+    for line in diff.split("\n"):
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@ "):
+            in_hunk = True
+        elif in_hunk and (line.startswith("+") or line.startswith("-")):
             changed += 1
     return changed
 

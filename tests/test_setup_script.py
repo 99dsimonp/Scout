@@ -7,6 +7,10 @@ import textwrap
 import unittest
 from pathlib import Path
 
+from scout.config import load_config
+from scout.models import PullRequest
+from scout.state import StateStore
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SETUP = ROOT / "scripts" / "setup.sh"
@@ -363,6 +367,43 @@ class SetupScriptTests(unittest.TestCase):
             self.assertIn("Codex max_subagents is 6", result.stderr)
             self.assertIn('"compatibility"', schema_path.read_text(encoding="utf-8"))
 
+            # An upgrade must retain the configured review identity and database;
+            # replacing either would queue these unchanged PRs for another review.
+            state_db = state_dir / "existing-history.db"
+            config = config.replace(str(state_dir / "state.db"), str(state_db))
+            config = config.replace('policy_version = "v1"', 'policy_version = "deployed-policy"')
+            config = config.replace("[review]\n", '[review]\noutput_mode = "inline_comments"\n')
+            config_path.write_text(config, encoding="utf-8")
+            before_upgrade = load_config(str(config_path))
+            store = StateStore(before_upgrade.service.state_db)
+            store.initialize()
+            completed = []
+            comment_updated_on = "2026-09-28T12:00:00Z"
+            for pr_id in (1148, 1149):
+                pr = PullRequest(
+                    "example-workspace", "example-repo", pr_id, "Reviewed PR", "",
+                    "feature", str(pr_id) * 10, "main",
+                )
+                store.enqueue_or_update_pr(
+                    pr, before_upgrade.review.policy_version, "v1", "codex",
+                    output_mode=before_upgrade.review.output_mode,
+                )
+                job = store.claim_next_pending_job({"codex": 1200})
+                self.assertTrue(store.mark_publishing(job, 1200))
+                self.assertTrue(store.mark_success(job, "scout-{}".format(pr_id)))
+                completed.append((pr, store.get_job(job.id)))
+                store.mark_pull_request_comment_processed(
+                    pr.workspace, pr.repo_slug, pr.pr_id, "1", comment_updated_on, True,
+                )
+            database_before_upgrade = state_db.read_bytes()
+            history_logs = {
+                state_dir / "review-log.jsonl": '{"pr_id":1148,"status":"succeeded"}\n',
+                state_dir / "provider-usage.jsonl": '{"pr_id":1148,"usage":{"total_tokens":1234}}\n',
+                log_dir / "scout.log": "Completed review for PR 1148\n",
+            }
+            for path, contents in history_logs.items():
+                path.write_text(contents, encoding="utf-8")
+
             custom_schema_path = config_dir / "custom-review.schema.json"
             custom_schema_path.write_text('{"custom":true}', encoding="utf-8")
             custom_schema_env = dict(env)
@@ -377,6 +418,26 @@ class SetupScriptTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(custom_schema_path.read_text(encoding="utf-8"), '{"custom":true}')
+            after_upgrade = load_config(str(config_path))
+            self.assertEqual(after_upgrade.service.state_db, before_upgrade.service.state_db)
+            self.assertEqual(after_upgrade.service.state_dir, before_upgrade.service.state_dir)
+            self.assertEqual(after_upgrade.review.policy_version, before_upgrade.review.policy_version)
+            self.assertEqual(after_upgrade.review.output_mode, before_upgrade.review.output_mode)
+            self.assertEqual(state_db.read_bytes(), database_before_upgrade)
+            for path, contents in history_logs.items():
+                self.assertEqual(path.read_text(encoding="utf-8"), contents)
+            store = StateStore(after_upgrade.service.state_db)
+            store.initialize()
+            for pr, job in completed:
+                self.assertEqual(store.get_job(job.id), job)
+                self.assertFalse(store.enqueue_or_update_pr(
+                    pr, after_upgrade.review.policy_version, "v1", "codex",
+                    output_mode=after_upgrade.review.output_mode,
+                ))
+                self.assertTrue(store.processed_pull_request_comment_review_requested(
+                    pr.workspace, pr.repo_slug, pr.pr_id, "1", comment_updated_on,
+                ))
+            self.assertIsNone(store.claim_next_pending_job({"codex": 1200}))
 
     def test_setup_ignores_noisy_login_output_when_detecting_provider_paths(self):
         if shutil.which("bash") is None:

@@ -1,6 +1,6 @@
 Name:           scout
 Version:        0.1.0
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Scout Bitbucket Cloud PR AI review service
 License:        Apache-2.0
 BuildArch:      noarch
@@ -67,6 +67,11 @@ exit 0
 %{_unitdir}/scout.service
 
 %changelog
+* Tue Sep 29 2026 Scout contributors <noreply@github.com> - 0.1.0-3
+- Renew active review leases and exclude active jobs from reclamation
+- Fix diff line tracking, stale Codex output, and Code Insights annotation limits
+- Migrate legacy review identities so upgrades preserve completed review history
+
 * Thu Sep 03 2026 Scout contributors <noreply@github.com> - 0.1.0-2
 - Add the compatibility review lens and replace the bundled schema on upgrade
 
