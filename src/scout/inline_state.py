@@ -130,6 +130,21 @@ class InlineState:
                 on p.round_id=r.id where p.run_id=?""", (run_id,)).fetchone()
             return self._round(conn, row)
 
+    def has_pre_round_review(self, pr: PullRequest) -> bool:
+        with self.store.connect() as conn:
+            return self._has_pre_round_review(conn, (pr.workspace, pr.repo_slug, pr.pr_id))
+
+    @staticmethod
+    def _has_pre_round_review(conn, scope) -> bool:
+        # The pre-round publisher owns these frozen payloads and its existing
+        # publication ledger. Replacing their run IDs would delete snapshots.
+        if conn.execute("""select 1 from review_publication_snapshots s join review_jobs j on j.id=s.job_id
+            where j.workspace=? and j.repo_slug=? and j.pr_id=? and j.output_mode='inline_comments'
+            and s.review_run_id=j.target_review_run_id and j.status!='cancelled'""", scope).fetchone():
+            return True
+        return conn.execute("""select 1 from review_jobs where workspace=? and repo_slug=?
+            and pr_id=? and output_mode='inline_comments' and status='succeeded'""", scope).fetchone() is not None
+
     def create_round(self, pr: PullRequest, providers: Sequence[str], policy_version: str,
                      schema_version: str, trigger: str = "initial", request_comment=None,
                      replace_round_id=None, expected_version=None) -> Optional[dict]:
@@ -143,16 +158,8 @@ class InlineState:
             if conn.execute("select 1 from repositories where workspace=? and repo_slug=? and enabled=0", scope[:2]).fetchone():
                 return None
             previous = conn.execute("select * from inline_rounds where workspace=? and repo_slug=? and pr_id=? order by created_at desc", scope).fetchall()
-            if trigger == "initial":
-                # The pre-round publisher owns these frozen payloads and its existing
-                # publication ledger. Replacing their run IDs would delete snapshots.
-                if conn.execute("""select 1 from review_publication_snapshots s join review_jobs j on j.id=s.job_id
-                    where j.workspace=? and j.repo_slug=? and j.pr_id=? and j.output_mode='inline_comments'
-                    and s.review_run_id=j.target_review_run_id and j.status!='cancelled'""", scope).fetchone():
-                    return None
-                if previous or conn.execute("""select 1 from review_jobs where workspace=? and repo_slug=?
-                    and pr_id=? and output_mode='inline_comments' and status='succeeded'""", scope).fetchone():
-                    return None
+            if trigger == "initial" and (previous or self._has_pre_round_review(conn, scope)):
+                return None
             if request_comment is not None:
                 if conn.execute("""select 1 from processed_pr_comments where workspace=? and repo_slug=?
                     and pr_id=? and comment_id=? and updated_on=?""", (*scope, str(request_comment[0]), request_comment[1])).fetchone():
@@ -260,6 +267,27 @@ class InlineState:
                 (_after(utcnow(), seconds), round_id, provider, round_id))
             row = conn.execute("select recovery_deadline_at from inline_round_providers where round_id=? and provider=?", (round_id, provider)).fetchone()
             return row[0] if row else None
+
+    def fail_or_recover_for_cooldown(self, round_id: str, provider: str, reason: str, seconds: int) -> bool:
+        """Drop a cooled-down provider when another one can still review the round.
+
+        The last provider able to review waits within its recovery deadline instead,
+        so a round is not left without any review. Returns True if it was dropped.
+        """
+        now = utcnow()
+        with self.store.connect() as conn:
+            conn.execute("begin immediate")
+            other_can_review = conn.execute("""select 1 from inline_round_providers p where p.round_id=?
+                and p.provider!=? and (p.status='succeeded' or (p.status='pending' and not exists
+                (select 1 from provider_state s where s.provider=p.provider and s.cooldown_until>?)))""",
+                (round_id, provider, now)).fetchone()
+            if other_can_review:
+                return self._fail_provider(conn, round_id, provider, reason, now)
+            conn.execute("""update inline_round_providers set recovery_deadline_at=coalesce(recovery_deadline_at,?)
+                where round_id=? and provider=? and status='pending' and exists
+                (select 1 from inline_rounds where id=? and status='reviewing')""",
+                (_after(now, seconds), round_id, provider, round_id))
+            return False
 
     def expire_provider_recovery(self) -> int:
         now = utcnow()

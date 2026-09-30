@@ -48,6 +48,7 @@ from .usage import parse_provider_usage_from_logs
 LOG = logging.getLogger(__name__)
 _REVIEW_LOG_LOCK = threading.Lock()
 _NO_FINDINGS_INLINE_COMMENT_ID = "__scout_no_findings__"
+_RISK_CAPACITY_POLL_SECONDS = 1.0
 
 
 class ScoutDaemon:
@@ -416,7 +417,7 @@ class ScoutDaemon:
                     expected_version=reviewing["version"],
                 )
             return
-        if rounds:
+        if rounds or self.state.inline.has_pre_round_review(pr):
             return
         self.state.inline.create_round(self._resolve_inline_snapshot(pr), self.provider_names, policy_version, schema_version)
 
@@ -647,7 +648,8 @@ class ScoutDaemon:
             if snapshot is None:
                 cooldown_until = self.state.get_active_provider_cooldown(job.provider)
                 if cooldown_until is not None:
-                    self._record_inline_failure(job, ProviderError("provider cooldown"))
+                    if self._record_inline_failure(job, ProviderError("provider cooldown"), cooldown=True):
+                        return
                     LOG.info("provider cooldown active provider=%s until=%s job=%s", job.provider, cooldown_until, job.id)
                     deferred = self.state.defer_job_for_provider_cooldown(
                         job.id,
@@ -731,10 +733,10 @@ class ScoutDaemon:
                 )
                 if is_superseded():
                     raise ProviderSuperseded("review superseded during context preparation")
-                if reservation["held"]:
-                    self._release_provider_slot(job.provider)
-                    reservation["held"] = False
-                risk = self._risk_for_job(job, source_commit, is_superseded)
+                risk = self._risk_for_job(
+                    job, source_commit, is_superseded,
+                    reserved_provider=job.provider if reservation["held"] else None,
+                )
                 effective_max_per_lens = effective_subagent_max_per_lens(
                     provider_config.subagent_max_per_lens,
                     provider_config.max_subagents,
@@ -769,10 +771,9 @@ class ScoutDaemon:
                     )
                 prompt = build_provider_prompt(job.provider, context, self.config.review.schema_path, review_plan)
                 run_dir = str(Path(self.config.service.state_dir) / "runs" / str(job.id))
-                if not self._acquire_provider_slot(job.provider, blocking=False):
-                    self.state.release_unstarted_job(job)
-                    return
-                reservation["held"] = True
+                if not reservation["held"]:
+                    self._acquire_provider_slot(job.provider, blocking=True)
+                    reservation["held"] = True
                 try:
                     if is_superseded():
                         raise ProviderSuperseded("review superseded while waiting for provider capacity")
@@ -940,9 +941,10 @@ class ScoutDaemon:
             if self.state.is_job_superseded(job.id, job.lease_token):
                 self.state.return_superseded_to_pending(job.id, job.lease_token)
                 return
-            if self._record_inline_failure(job, exc):
+            cooldown = bool(isinstance(exc, ProviderError) and provider_cooldown_seconds)
+            if self._record_inline_failure(job, exc, cooldown=cooldown):
                 return
-            if isinstance(exc, ProviderError) and provider_cooldown_seconds:
+            if cooldown:
                 marked = self.state.defer_job_for_provider_cooldown(
                     job.id,
                     str(exc),
@@ -1102,16 +1104,19 @@ class ScoutDaemon:
             self.state.mark_inline_comment_published(job, comment_id)
         return report_id
 
-    def _record_inline_failure(self, job: ReviewJob, error: Exception) -> bool:
+    def _record_inline_failure(self, job: ReviewJob, error: Exception, cooldown: bool = False) -> bool:
         if job.output_mode != "inline_comments":
             return False
         round_ = self.state.inline.round_for_job(job)
         if round_ is None:
             return False
-        self.state.inline.start_provider_recovery(
-            round_["id"], job.provider,
-            getattr(self.config.queue, "max_provider_recovery_seconds", 3600),
-        )
+        recovery_seconds = getattr(self.config.queue, "max_provider_recovery_seconds", 3600)
+        if cooldown:
+            # Cooldown deferral does not consume an attempt, so skip the attempt limit.
+            return self.state.inline.fail_or_recover_for_cooldown(
+                round_["id"], job.provider, str(error), recovery_seconds,
+            )
+        self.state.inline.start_provider_recovery(round_["id"], job.provider, recovery_seconds)
         if not getattr(error, "retryable", True) or job.attempts >= self.config.queue.max_attempts:
             self.state.inline.fail_provider(round_["id"], job.provider, str(error))
             return True
@@ -1166,12 +1171,10 @@ class ScoutDaemon:
                 reservations,
                 excluded_job_ids=[_future_job_id(item) for item in futures.values() if _future_job_id(item) is not None],
                 exclude_saved_publications=True,
+                # Inline jobs run only as round members; poll_once adopts old ones.
+                require_inline_round=True,
             )
             if job is None:
-                return False
-            # Old pending inline jobs are adopted by poll_once before execution.
-            if job.output_mode == "inline_comments" and self.state.inline.round_for_job(job) is None:
-                self.state.release_unstarted_job(job)
                 return False
             futures[pool.submit(self._run_reserved_job, job)] = {"id": job.id, "provider": job.provider, "pr": (job.workspace, job.repo_slug, job.pr_id)}
             dispatched = True
@@ -1185,39 +1188,64 @@ class ScoutDaemon:
         if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
             raise ProviderSuperseded("review superseded during publish")
 
-    def _risk_for_job(self, job: ReviewJob, source_commit: str, is_superseded: Callable[[], bool]) -> str:
+    def _risk_for_job(
+        self,
+        job: ReviewJob,
+        source_commit: str,
+        is_superseded: Callable[[], bool],
+        reserved_provider: Optional[str] = None,
+    ) -> str:
         risk_config = getattr(self.config.review, "risk", None)
         if risk_config is None or not getattr(risk_config, "enabled", True):
             return DEFAULT_RISK
         self._ensure_risk_cache()
         key = _risk_cache_key(job, source_commit)
-        with self._risk_cache_guard:
-            cached = self._risk_cache.get(key)
+        provider = getattr(risk_config, "provider", "codex")
+        # Take the risk provider slot before the per-snapshot lock. A job waiting
+        # on the lock may hold that provider's slot, so the lock holder must not
+        # wait for one. Jobs of the risk provider reuse their own slot.
+        slot_held = provider == reserved_provider
+        acquired = False
+        while not slot_held:
+            with self._risk_cache_guard:
+                cached = self._risk_cache.get(key)
             if cached is not None:
                 return cached
-            lock = self._risk_cache_locks.get(key)
-            if lock is None:
-                lock = threading.Lock()
-                self._risk_cache_locks[key] = lock
-        if not lock.acquire(blocking=False):
-            return DEFAULT_RISK
+            if self.providers.get(provider) is None or self.state.get_active_provider_cooldown(provider) is not None:
+                break  # _assess_risk falls back without a provider call.
+            if self._acquire_provider_slot(provider, blocking=False):
+                slot_held = acquired = True
+                break
+            if is_superseded():
+                raise ProviderSuperseded("review superseded while waiting for risk provider capacity")
+            time.sleep(_RISK_CAPACITY_POLL_SECONDS)
         try:
             with self._risk_cache_guard:
                 cached = self._risk_cache.get(key)
                 if cached is not None:
                     return cached
-            try:
-                risk = self._assess_risk(job, source_commit, risk_config, is_superseded)
-            except Exception:
+                lock = self._risk_cache_locks.get(key)
+                if lock is None:
+                    lock = threading.Lock()
+                    self._risk_cache_locks[key] = lock
+            with lock:
                 with self._risk_cache_guard:
+                    cached = self._risk_cache.get(key)
+                    if cached is not None:
+                        return cached
+                try:
+                    risk = self._assess_risk(job, source_commit, risk_config, is_superseded)
+                except Exception:
+                    with self._risk_cache_guard:
+                        self._risk_cache_locks.pop(key, None)
+                    raise
+                with self._risk_cache_guard:
+                    self._risk_cache[key] = risk
                     self._risk_cache_locks.pop(key, None)
-                raise
-            with self._risk_cache_guard:
-                self._risk_cache[key] = risk
-                self._risk_cache_locks.pop(key, None)
-            return risk
+                return risk
         finally:
-            lock.release()
+            if acquired:
+                self._release_provider_slot(provider)
 
     def _ensure_risk_cache(self) -> None:
         if not hasattr(self, "_risk_cache"):
@@ -1236,9 +1264,6 @@ class ScoutDaemon:
         cooldown_until = self.state.get_active_provider_cooldown(provider)
         if cooldown_until is not None:
             LOG.info("risk provider cooldown active provider=%s until=%s job=%s", provider, cooldown_until, job.id)
-            return DEFAULT_RISK
-        if not self._acquire_provider_slot(provider, blocking=False):
-            LOG.info("risk provider capacity unavailable provider=%s job=%s", provider, job.id)
             return DEFAULT_RISK
         run_dir = str(Path(self.config.service.state_dir) / "runs" / str(job.id) / "risk")
         try:
@@ -1287,8 +1312,6 @@ class ScoutDaemon:
         except Exception as exc:
             LOG.warning("risk classification failed provider=%s job=%s error=%s", provider, job.id, exc)
             return DEFAULT_RISK
-        finally:
-            self._release_provider_slot(provider)
         normalized = normalize_risk(risk)
         LOG.info("risk classification job=%s provider=%s risk=%s", job.id, provider, normalized)
         return normalized

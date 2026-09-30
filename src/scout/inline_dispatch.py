@@ -61,7 +61,9 @@ class InlineDispatch:
                 if provider not in self.daemon.provider_names:
                     self.state.fail_provider(round_["id"], provider, "provider disabled")
                 elif self.daemon.state.get_active_provider_cooldown(provider) is not None:
-                    self.state.start_provider_recovery(round_["id"], provider, self.config.queue.max_provider_recovery_seconds)
+                    self.state.fail_or_recover_for_cooldown(
+                        round_["id"], provider, "provider cooldown", self.config.queue.max_provider_recovery_seconds,
+                    )
         self.state.expire_provider_recovery()
 
     def schedule(self, pool, futures):

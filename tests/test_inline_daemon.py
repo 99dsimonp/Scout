@@ -114,14 +114,46 @@ class InlineDaemonTests(unittest.TestCase):
         for round_ in rounds:
             outcomes = {item["provider"]: item for item in round_["outcomes"]}
             self.assertEqual(outcomes["claude"]["status"], "succeeded")
-            self.assertEqual(outcomes["codex"]["status"], "pending")
-            self.assertIsNotNone(outcomes["codex"]["recovery_deadline_at"])
-        with daemon.state.connect() as conn:
-            conn.execute("update inline_round_providers set recovery_deadline_at='2000-01-01T00:00:00+00:00' where provider='codex'")
-        daemon.run_pending_jobs()
-        self.assertEqual([r["status"] for r in daemon.state.inline.list_rounds()], ["completed", "completed"])
+            # Claude can review, so the round does not wait out Codex's cooldown.
+            self.assertEqual(outcomes["codex"]["status"], "failed")
+        self.assertEqual([r["status"] for r in rounds], ["completed", "completed"])
         self.assertEqual(len(daemon.bitbucket.posts), 4)  # Coverage notice and finding for each PR.
         self.assertTrue(any("Codex" in post and "did not" in post for post in daemon.bitbucket.posts))
+
+    def test_last_provider_able_to_review_waits_out_cooldown(self):
+        daemon = self.daemon
+        daemon.poll_once()
+        for provider in ("codex", "claude"):
+            daemon.state.mark_provider_cooldown(provider, "offline", 7200, "quota_exhausted")
+        daemon._inline_dispatch().maintain()
+        outcomes = self.round()["outcomes"]
+        self.assertEqual([item["status"] for item in outcomes], ["pending", "pending"])
+        self.assertTrue(all(item["recovery_deadline_at"] for item in outcomes))
+
+    def test_cooldown_error_drops_provider_while_another_can_review(self):
+        daemon = self.daemon
+        daemon.poll_once()
+        daemon.providers["codex"].run = lambda **kwargs: (_ for _ in ()).throw(
+            ProviderError("quota", cooldown_seconds=7200, provider_status="quota_exhausted"))
+        job = self.daemon.state.claim_next_pending_job({"codex": 1200})
+        job = replace(job, attempts=daemon.config.queue.max_attempts)
+        daemon.run_job(job)
+        self.assertEqual(self.round()["outcomes"][0]["status"], "failed")
+        self.run_provider("claude")
+        self.assertEqual(self.round()["status"], "ready_for_selection")
+
+    def test_cooldown_error_on_last_attempt_defers_last_provider(self):
+        daemon = self.daemon
+        daemon.poll_once()
+        self.assertTrue(daemon.state.inline.fail_provider(self.round()["id"], "claude", "unavailable"))
+        daemon.providers["codex"].run = lambda **kwargs: (_ for _ in ()).throw(
+            ProviderError("quota", cooldown_seconds=7200, provider_status="quota_exhausted"))
+        job = self.daemon.state.claim_next_pending_job({"codex": 1200})
+        job = replace(job, attempts=daemon.config.queue.max_attempts)
+        daemon.run_job(job)
+        codex = self.round()["outcomes"][0]
+        self.assertEqual(codex["status"], "pending")
+        self.assertIsNotNone(codex["recovery_deadline_at"])
 
     def test_healthy_shared_capacity_wait_has_no_failure_clock(self):
         daemon = self.daemon
@@ -423,6 +455,31 @@ class InlineDaemonTests(unittest.TestCase):
         self.assertEqual(daemon.state.get_job(job.id).status, "succeeded")
         self.assertEqual(daemon.bitbucket.posts, ["Immutable saved comment"])
         self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [0, 0])
+
+    def test_old_pending_inline_job_without_round_does_not_block_scheduling(self):
+        daemon = self.daemon
+        old_pr = daemon.bitbucket.prs[0]
+        for provider in ("codex", "claude"):
+            daemon.state.enqueue_or_update_pr(old_pr, "v1", "v1", provider, output_mode="inline_comments")
+        with daemon.state.connect() as conn:
+            conn.execute("update review_jobs set status='succeeded' where provider='claude'")
+        daemon.bitbucket.prs.append(replace(old_pr, pr_id=14))
+        daemon.poll_once()
+        self.assertEqual([r["pr_id"] for r in daemon.state.inline.list_rounds()], [14])
+        pool = RecordingPool()
+        daemon._schedule(pool, {})
+        self.assertEqual({args[0].pr_id for _, args in pool.tasks}, {14})
+
+    def test_poll_skips_fetch_for_pr_reviewed_before_rounds(self):
+        daemon = self.daemon
+        daemon.state.enqueue_or_update_pr(daemon.bitbucket.prs[0], "v1", "v1", "codex", output_mode="inline_comments")
+        with daemon.state.connect() as conn:
+            conn.execute("update review_jobs set status='succeeded'")
+        fetches = []
+        daemon.git.ensure_mirror = lambda *args: fetches.append(args) or "/mirror"
+        daemon.poll_once()
+        self.assertEqual(fetches, [])
+        self.assertEqual(daemon.state.inline.list_rounds(), [])
 
     def test_startup_unavailable_provider_does_not_abort_inline_reviews(self):
         daemon = self.daemon

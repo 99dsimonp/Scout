@@ -106,9 +106,19 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.queue.max_provider_recovery_seconds, 1200)
         self.assertEqual(config.bitbucket.bot_account_id, "{bot-uuid}")
 
+    def test_inline_deduplication_uses_request_comments_provider(self):
+        config = parse_config({
+            "bitbucket": {"workspace": "ws", "repositories": [{"slug": "repo", "clone_url": "/tmp/repo"}]},
+            "agents": {"claude": {"enabled": True}},
+            "review": {"output_mode": "inline_comments", "request_comments": {"provider": "claude"}},
+        })
+        self.assertEqual(config.review.deduplication.provider, "claude")
+        self.assertEqual(config.review.deduplication.model, config.review.request_comments.model)
+        self.assertEqual(config.review.deduplication.effort, config.review.request_comments.effort)
+
     def test_inline_deduplication_rejects_invalid_configuration(self):
         invalid_sections = [
-            {"enabled": "false"}, {"provider": "invalid"}, {"provider": "claude"},
+            {"enabled": "false"}, {"provider": "invalid"}, {"provider": "claude"}, {"provider": "codex"},
             {"effort": "impossible"}, {"timeout_seconds": 0},
             {"max_input_findings": 0}, {"max_input_bytes": -1}, [],
         ]

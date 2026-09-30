@@ -706,13 +706,17 @@ def _parse_deduplication_config(
     if not isinstance(section, dict):
         raise ConfigError("review.deduplication must be a table")
     enabled = _bool_value(section.get("enabled", True), "review.deduplication.enabled")
+    if "provider" in section:
+        raise ConfigError(
+            "review.deduplication.provider is not supported; deduplication uses review.request_comments.provider"
+        )
     settings = {
-        "provider": defaults.provider,
         "model": defaults.model,
         "effort": defaults.effort,
         "timeout_seconds": defaults.timeout_seconds,
     }
     settings.update(section)
+    settings["provider"] = defaults.provider
     try:
         parsed = _parse_request_comments_config(
             {"request_comments": settings}, codex, claude,

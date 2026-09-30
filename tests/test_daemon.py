@@ -1173,7 +1173,7 @@ class DaemonReviewLogTests(unittest.TestCase):
             self.assertIn("- PR description risk: medium", claude.runs[0]["prompt"])
             self.assertIn("- Subagents per review category: 2", claude.runs[0]["prompt"])
 
-    def test_run_job_skips_risk_classification_when_risk_provider_capacity_is_busy(self):
+    def test_run_job_waits_for_busy_risk_provider_instead_of_defaulting_risk(self):
         with tempfile.TemporaryDirectory() as tmp:
             daemon = ScoutDaemon.__new__(ScoutDaemon)
             daemon.config = SimpleNamespace(
@@ -1228,15 +1228,89 @@ class DaemonReviewLogTests(unittest.TestCase):
             daemon.bitbucket = _FakeBitbucket()
             daemon.clone_urls = {"repo": "git@bitbucket.org:ws/repo.git"}
 
+            claude_slot_free_during_risk = []
+            assess = codex.assess_risk
+
+            def assess_while_checking_claude_slot(*args, **kwargs):
+                free = daemon._acquire_provider_slot("claude", blocking=False)
+                if free:
+                    daemon._release_provider_slot("claude")
+                claude_slot_free_during_risk.append(free)
+                return assess(*args, **kwargs)
+
+            codex.assess_risk = assess_while_checking_claude_slot
+            self.assertTrue(daemon._acquire_provider_slot("codex", blocking=False))
+            self.assertTrue(daemon._acquire_provider_slot("claude", blocking=False))
+            release = threading.Timer(0.05, daemon._release_provider_slot, args=("codex",))
+            release.start()
+            try:
+                with patch("scout.daemon._RISK_CAPACITY_POLL_SECONDS", 0.01):
+                    daemon.run_job(review_job(provider="claude", job_id=25, description="Touches auth."), provider_reserved=True)
+            finally:
+                release.join()
+
+            self.assertEqual(len(codex.risk_calls), 1)
+            self.assertEqual(claude_slot_free_during_risk, [False])
+            self.assertIn("- PR description risk: high", claude.runs[0]["prompt"])
+            self.assertTrue(daemon._acquire_provider_slot("codex", blocking=False))
+            self.assertTrue(daemon._acquire_provider_slot("claude", blocking=False))
+
+    def _risk_daemon(self, tmp, codex):
+        daemon = ScoutDaemon.__new__(ScoutDaemon)
+        daemon.config = SimpleNamespace(
+            review=SimpleNamespace(
+                risk=SimpleNamespace(enabled=True, provider="codex", model="gpt-5.4", effort="low", timeout_seconds=12),
+            ),
+            service=SimpleNamespace(state_dir=tmp),
+        )
+        daemon.provider_configs = {"codex": SimpleNamespace(max_parallel=1), "claude": SimpleNamespace(max_parallel=1)}
+        daemon.providers = {"codex": codex, "claude": _FakeProvider()}
+        daemon.state = _FakeRunJobState()
+        return daemon
+
+    def test_concurrent_providers_share_one_risk_assessment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            started, finish = threading.Event(), threading.Event()
+            codex = _FakeProvider(risk="high")
+            assess = codex.assess_risk
+
+            def slow_assess(*args, **kwargs):
+                started.set()
+                finish.wait(2)
+                return assess(*args, **kwargs)
+
+            codex.assess_risk = slow_assess
+            daemon = self._risk_daemon(tmp, codex)
+            results = {}
+            self.assertTrue(daemon._acquire_provider_slot("codex", blocking=False))
+            first = threading.Thread(target=lambda: results.setdefault("codex", daemon._risk_for_job(
+                review_job(provider="codex", job_id=1), "abc", lambda: False, reserved_provider="codex")))
+            first.start()
+            self.assertTrue(started.wait(2))
+            second = threading.Thread(target=lambda: results.setdefault("claude", daemon._risk_for_job(
+                review_job(provider="claude", job_id=2), "abc", lambda: False, reserved_provider="claude")))
+            with patch("scout.daemon._RISK_CAPACITY_POLL_SECONDS", 0.01):
+                second.start()
+                finish.set()
+                first.join(2)
+                daemon._release_provider_slot("codex")
+                second.join(2)
+
+            self.assertEqual(results, {"codex": "high", "claude": "high"})
+            self.assertEqual(len(codex.risk_calls), 1)
+
+    def test_risk_provider_job_classifies_risk_in_its_own_slot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex = _FakeProvider(risk="high")
+            daemon = self._risk_daemon(tmp, codex)
             self.assertTrue(daemon._acquire_provider_slot("codex", blocking=False))
             try:
-                daemon.run_job(review_job(provider="claude", job_id=25, description="Touches auth."))
+                risk = daemon._risk_for_job(review_job(provider="codex"), "abc", lambda: False, reserved_provider="codex")
             finally:
                 daemon._release_provider_slot("codex")
 
-            self.assertEqual(codex.risk_calls, [])
-            self.assertIn("- PR description risk: medium", claude.runs[0]["prompt"])
-            self.assertIn("- Subagents per review category: 2", claude.runs[0]["prompt"])
+            self.assertEqual(risk, "high")
+            self.assertEqual(len(codex.risk_calls), 1)
 
     def test_run_job_comments_on_critical_findings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2077,7 +2151,7 @@ class _FakeClaimingState:
         self.jobs = jobs
         self.claims = []
 
-    def claim_next_pending_job(self, lease_seconds_by_provider, excluded_job_ids=(), exclude_saved_publications=False):
+    def claim_next_pending_job(self, lease_seconds_by_provider, excluded_job_ids=(), exclude_saved_publications=False, require_inline_round=False):
         self.claims.append(dict(lease_seconds_by_provider))
         for index, job in enumerate(self.jobs):
             if job.provider in lease_seconds_by_provider and job.id not in excluded_job_ids:

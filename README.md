@@ -513,7 +513,9 @@ are never used to suppress a finding.
 
 Workers are shared across providers. A busy provider does not reserve idle
 threads, and waiting for a worker or provider slot has no failure deadline. A
-retryable error or cooldown starts a fixed recovery deadline instead. If a
+retryable error starts a fixed recovery deadline instead. A provider in
+cooldown is dropped from the round at once while another provider can still
+review it; only the last such provider waits for its recovery deadline. If a
 provider cannot recover, Scout publishes the successful providers' results and
 names the missing providers on the PR. If all providers fail, nothing is posted.
 The selector also has a recovery deadline: if it fails, Scout uses exact matching
@@ -523,7 +525,7 @@ reviews are not discarded.
 ```toml
 [review.deduplication]
 enabled = true
-# Provider/model/effort/timeout default to review.request_comments.
+# Runs on the review.request_comments provider; model/effort/timeout default to it.
 # enabled = false retains every finding, including exact duplicates.
 
 [queue]

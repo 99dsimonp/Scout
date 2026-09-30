@@ -114,8 +114,7 @@ timeout_seconds = 120
 # Inline mode waits for all providers to succeed/fail before selecting comments.
 # False retains every candidate; selector failure falls back to exact matching.
 enabled = true
-# Omitted model settings inherit review.request_comments.
-# provider = "codex"
+# Runs on the review.request_comments provider; omitted model settings inherit it too.
 # model = "gpt-5.4"
 # effort = "low"
 # timeout_seconds = 120

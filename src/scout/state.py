@@ -1397,6 +1397,7 @@ class StateStore:
         excluded_job_ids: Sequence[int] = (),
         publication_only: bool = False,
         exclude_saved_publications: bool = False,
+        require_inline_round: bool = False,
     ) -> Optional[ReviewJob]:
         if not lease_seconds_by_provider:
             return None
@@ -1446,6 +1447,10 @@ class StateStore:
                   where s.job_id=review_jobs.id and s.review_run_id=review_jobs.target_review_run_id
                     and s.review_key=review_jobs.target_review_key
                 ))
+                and (?=0 or review_jobs.output_mode!='inline_comments' or exists (
+                  select 1 from inline_round_providers p
+                  where p.run_id in (review_jobs.running_review_run_id, review_jobs.target_review_run_id)
+                ))
                 {}
                 order by
                   case when review_jobs.status='failed_retryable' then 1 else 0 end asc,
@@ -1456,7 +1461,7 @@ class StateStore:
                   review_jobs.id asc
                 limit 1
                 """.format(placeholders, excluded_filter),
-                (*providers, now, now, int(publication_only), now, int(publication_only), int(exclude_saved_publications), *excluded_job_ids),
+                (*providers, now, now, int(publication_only), now, int(publication_only), int(exclude_saved_publications), int(require_inline_round), *excluded_job_ids),
             ).fetchone()
             if row is None:
                 return None
@@ -1541,17 +1546,6 @@ class StateStore:
             or job.running_review_key != job.target_review_key
             or job.running_review_run_id != job.target_review_run_id
         )
-
-    def release_unstarted_job(self, job: ReviewJob) -> bool:
-        with self.connect() as conn:
-            return conn.execute(
-                """update review_jobs set status='pending',attempts=max(0,attempts-1),
-                  lease_token=null,leased_until=null,running_review_run_id=null,
-                  running_review_key=null,running_source_commit_hash=null,updated_at=?
-                where id=? and status='running' and lease_token=? and superseded=0
-                  and target_review_run_id=? and running_review_run_id=?""",
-                (utcnow(), job.id, job.lease_token, job.running_review_run_id, job.running_review_run_id),
-            ).rowcount == 1
 
     def mark_publishing(self, job: ReviewJob, lease_seconds: int) -> bool:
         now = utcnow()
