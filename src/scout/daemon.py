@@ -40,10 +40,11 @@ from .schema import (
     to_bitbucket_report,
     to_inline_pr_comments,
     to_no_findings_pr_comment,
+    to_outdated_pr_comment,
     filter_annotation_locations,
     validate_review_output,
 )
-from .state import ReviewJob, StateStore, utcnow
+from .state import ReviewJob, ReviewSnapshotError, StateStore, utcnow
 from .usage import parse_provider_usage_from_logs
 
 LOG = logging.getLogger(__name__)
@@ -589,18 +590,6 @@ class ScoutDaemon:
         LOG.info("starting review job id=%s repo=%s pr=%s commit=%s", job.id, job.repo_slug, job.pr_id, job.running_source_commit_hash)
         provider_config = self.provider_configs[job.provider]
         provider_runner = self.providers[job.provider]
-        cooldown_until = self.state.get_active_provider_cooldown(job.provider)
-        if cooldown_until is not None:
-            LOG.info("provider cooldown active provider=%s until=%s job=%s", job.provider, cooldown_until, job.id)
-            deferred = self.state.defer_job_for_provider_cooldown(
-                job.id,
-                "provider {} is in cooldown until {}".format(job.provider, cooldown_until),
-                job.lease_token,
-                job.running_review_key,
-            )
-            if not deferred and self.state.is_job_superseded(job.id, job.lease_token):
-                self.state.return_superseded_to_pending(job.id, job.lease_token)
-            return
         mirror = None
         worktree = None
         related_worktrees: List[Tuple[object, object]] = []
@@ -608,297 +597,239 @@ class ScoutDaemon:
         run_dir = None
         source_commit = job.running_source_commit_hash or job.target_source_commit_hash
         usage_logged = False
+        output_mode = job.output_mode
+        replaying = False
         try:
-            pr = PullRequest(
-                workspace=job.workspace,
-                repo_slug=job.repo_slug,
-                pr_id=job.pr_id,
-                title=job.title,
-                description=job.description,
-                source_branch=job.source_branch,
-                source_commit_hash=source_commit,
-                destination_branch=job.destination_branch,
-                destination_commit_hash=job.destination_commit_hash,
-                merge_base_hash=job.merge_base_hash,
-            )
-            clone_url = self.clone_urls[job.repo_slug]
-            mirror = self.git.ensure_mirror(job.workspace, job.repo_slug, clone_url)
-            if is_superseded():
-                raise ProviderSuperseded("review superseded during fetch")
-            worktree = self.git.create_worktree(mirror, pr, suffix="job-{}".format(job.id))
-            repository_configs = getattr(self, "repository_configs", {})
-            repo_config = repository_configs.get(job.repo_slug)
-            for related_slug in getattr(repo_config, "related_repositories", ()):
-                related_config = repository_configs[related_slug]
-                related_mirror = self.git.ensure_mirror(
-                    job.workspace,
-                    related_slug,
-                    related_config.clone_url,
-                )
-                resolved_ref, related_commit = self.git.resolve_context_revision(
-                    related_mirror,
-                    getattr(related_config, "context_ref", None),
-                )
-                related_worktree = self.git.create_context_worktree(
-                    related_mirror,
-                    job.workspace,
-                    job.repo_slug,
-                    related_slug,
-                    related_commit,
-                    job.id,
-                )
-                related_worktrees.append((related_mirror, related_worktree))
-                related_entry = {
-                    "slug": related_slug,
-                    "ref": resolved_ref,
-                    "commit": related_commit,
-                    "path": str(related_worktree),
-                }
-                related_context.append(related_entry)
-                LOG.info(
-                    "prepared related repository context job=%s primary_repo=%s related_repo=%s ref=%s commit=%s path=%s",
-                    job.id,
-                    job.repo_slug,
-                    related_slug,
-                    resolved_ref,
-                    related_commit,
-                    related_worktree,
-                )
-            def before_comments_request():
-                if is_superseded():
-                    raise ProviderSuperseded("review superseded while loading PR comments")
-
-            pull_request_comments = self.bitbucket.list_pull_request_comments(
-                job.repo_slug,
-                job.pr_id,
-                before_request=before_comments_request,
-            )
-            context = self.git.prepare_context(
-                mirror,
-                worktree,
-                pr,
-                related_repositories=related_context,
-                pull_request_comments=pull_request_comments,
-            )
-            if is_superseded():
-                raise ProviderSuperseded("review superseded during context preparation")
-            risk = self._risk_for_job(job, source_commit, is_superseded)
-            effective_max_per_lens = effective_subagent_max_per_lens(
-                provider_config.subagent_max_per_lens,
-                provider_config.max_subagents,
-            )
-            review_plan = build_review_plan(
-                changed_lines=int(context["changed_lines"]),
-                description=pr.description,
-                small_loc_limit=provider_config.subagent_small_loc_limit,
-                medium_loc_limit=provider_config.subagent_medium_loc_limit,
-                large_loc_limit=provider_config.subagent_large_loc_limit,
-                high_risk_bonus=provider_config.subagent_high_risk_bonus,
-                max_subagents_per_lens=effective_max_per_lens,
-                risk=risk,
-            )
-            LOG.info(
-                "review plan job=%s changed_lines=%s risk=%s high_risk=%s subagents_per_lens=%s total_subagents=%s",
-                job.id,
-                review_plan.changed_lines,
-                review_plan.risk,
-                review_plan.high_risk,
-                review_plan.subagents_per_lens,
-                review_plan.total_subagents,
-            )
-            if review_plan.total_subagents > provider_config.max_subagents:
-                raise ProviderError(
-                    "review plan requests {} subagents, exceeding agents.{}.max_subagents={}".format(
-                        review_plan.total_subagents,
-                        job.provider,
-                        provider_config.max_subagents,
-                    ),
-                    retryable=False,
-                )
-            prompt = build_provider_prompt(job.provider, context, self.config.review.schema_path, review_plan)
-            run_dir = str(Path(self.config.service.state_dir) / "runs" / str(job.id))
-            self._acquire_provider_slot(job.provider, blocking=True)
-            try:
-                if is_superseded():
-                    raise ProviderSuperseded("review superseded while waiting for provider capacity")
-                provider_run_args = dict(
-                    worktree=str(worktree),
-                    prompt=prompt,
-                    schema_path=self.config.review.schema_path,
-                    run_dir=run_dir,
-                    is_superseded=is_superseded,
-                )
-                if related_context:
-                    provider_run_args["additional_dirs"] = [
-                        entry["path"] for entry in related_context
-                    ]
-                result = provider_runner.run(**provider_run_args)
-            finally:
-                self._release_provider_slot(job.provider)
-            _append_provider_usage_log_entry(
-                self.config.service.state_dir,
-                _provider_usage_log_entry(
-                    job,
-                    source_commit,
-                    run_dir,
-                    "provider_completed",
-                    result.usage,
-                    related_repositories=related_context,
-                ),
-            )
-            usage_logged = True
-            if is_superseded():
-                raise ProviderSuperseded("review superseded before publish")
-            parsed = parse_review_json(result.final_message)
-            validated = validate_review_output(parsed, max_findings=self.config.review.max_findings)
-            output_mode = getattr(
-                job,
-                "output_mode",
-                getattr(self.config.review, "output_mode", "reports"),
-            )
-            if validated.annotations:
-                diff = context.get("diff")
-                if not isinstance(diff, str):
-                    diff = Path(str(context["diff_path"])).read_text(encoding="utf-8")
-                original_annotations = validated.annotations
-                allowed_line_sides = (
-                    ("NEW", "OLD") if output_mode == "inline_comments" else ("NEW",)
-                )
-                validated = filter_annotation_locations(
-                    validated,
-                    diff,
-                    allowed_line_sides=allowed_line_sides,
-                    allow_old_dead_code=output_mode == "reports",
-                )
-                retained_external_ids = {
-                    annotation["external_id"] for annotation in validated.annotations
-                }
-                discarded_annotations = [
-                    annotation
-                    for annotation in original_annotations
-                    if annotation["external_id"] not in retained_external_ids
-                ]
-                for annotation in discarded_annotations:
-                    LOG.warning(
-                        "discarded finding without publishable annotation location "
-                        "job=%s output_mode=%s external_id=%s path=%s line=%s side=%s",
+            snapshot = self.state.load_review_snapshot(job)
+            if snapshot is None:
+                cooldown_until = self.state.get_active_provider_cooldown(job.provider)
+                if cooldown_until is not None:
+                    LOG.info("provider cooldown active provider=%s until=%s job=%s", job.provider, cooldown_until, job.id)
+                    deferred = self.state.defer_job_for_provider_cooldown(
                         job.id,
-                        output_mode,
-                        annotation["external_id"],
-                        annotation["path"],
-                        annotation["line"],
-                        annotation["line_side"],
+                        "provider {} is in cooldown until {}".format(job.provider, cooldown_until),
+                        job.lease_token,
+                        job.running_review_key,
                     )
-            if not self.state.mark_publishing(job, self._lease_seconds(job.provider)):
-                raise ProviderSuperseded("review superseded before publish")
-            review_log_path = _append_review_log_entry(
-                self.config.service.state_dir,
-                _review_log_entry(
-                    job,
-                    source_commit,
-                    validated,
-                    run_dir,
-                    result.usage,
-                    related_repositories=related_context,
-                ),
-            )
-            LOG.info(
-                "appended review log path=%s job=%s repo=%s pr=%s",
-                review_log_path,
-                job.id,
-                job.repo_slug,
-                job.pr_id,
-            )
-            if output_mode == "inline_comments":
-                report_id = "inline-comments"
-                review_run_id = job.running_review_run_id or job.target_review_run_id
-                no_findings_comment = to_no_findings_pr_comment(validated, provider=job.provider)
-                if no_findings_comment and not self.state.inline_comment_published(
-                    job,
-                    _NO_FINDINGS_INLINE_COMMENT_ID,
-                ):
-                    if _pull_request_comment_exists(
-                        self.bitbucket,
-                        job.repo_slug,
-                        job.pr_id,
-                        no_findings_comment,
-                        before_request=lambda: self._renew_publish_or_superseded(job),
-                    ):
-                        self.state.mark_inline_comment_published(job, _NO_FINDINGS_INLINE_COMMENT_ID)
-                    else:
-                        if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
-                            raise ProviderSuperseded("review superseded before no-findings comment publish")
-                        self.bitbucket.publish_pull_request_comment(
-                            job.repo_slug,
-                            job.pr_id,
-                            no_findings_comment,
-                            before_request=lambda: self._renew_publish_or_superseded(job),
-                        )
-                        self.state.mark_inline_comment_published(job, _NO_FINDINGS_INLINE_COMMENT_ID)
-                for comment in to_inline_pr_comments(
-                    validated,
-                    provider=job.provider,
-                    source_commit=source_commit,
-                    review_run_id=review_run_id,
-                ):
-                    external_id = comment["external_id"]
-                    if self.state.inline_comment_published(job, external_id):
-                        continue
-                    if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
-                        raise ProviderSuperseded("review superseded before inline comment publish")
-                    self.bitbucket.publish_inline_pull_request_comment(
-                        job.repo_slug,
-                        job.pr_id,
-                        comment["path"],
-                        comment["line"],
-                        comment["content"],
-                        line_side=comment["line_side"],
-                        before_request=lambda: self._renew_publish_or_superseded(job),
-                    )
-                    self.state.mark_inline_comment_published(job, external_id)
-            else:
-                report_id = self.config.reports.report_id_for(job.provider)
-                report_title = self.config.reports.title_for(job.provider)
-                report = to_bitbucket_report(
-                    validated,
-                    report_title,
-                    provider=job.provider,
-                    model_metadata=_provider_model_metadata(job.provider, provider_config),
+                    if not deferred and self.state.is_job_superseded(job.id, job.lease_token):
+                        self.state.return_superseded_to_pending(job.id, job.lease_token)
+                    return
+                pr = PullRequest(
+                    workspace=job.workspace,
+                    repo_slug=job.repo_slug,
+                    pr_id=job.pr_id,
+                    title=job.title,
+                    description=job.description,
+                    source_branch=job.source_branch,
+                    source_commit_hash=source_commit,
+                    destination_branch=job.destination_branch,
+                    destination_commit_hash=job.destination_commit_hash,
+                    merge_base_hash=job.merge_base_hash,
                 )
-                annotations = to_bitbucket_annotations(validated, provider=job.provider)
-                if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
-                    raise ProviderSuperseded("review superseded before report publish")
-                self.bitbucket.publish_report(job.repo_slug, source_commit, report_id, report)
-                if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
-                    raise ProviderSuperseded("review superseded before annotation publish")
-                self.bitbucket.publish_annotations(
+                clone_url = self.clone_urls[job.repo_slug]
+                mirror = self.git.ensure_mirror(job.workspace, job.repo_slug, clone_url)
+                if is_superseded():
+                    raise ProviderSuperseded("review superseded during fetch")
+                worktree = self.git.create_worktree(mirror, pr, suffix="job-{}".format(job.id))
+                repository_configs = getattr(self, "repository_configs", {})
+                repo_config = repository_configs.get(job.repo_slug)
+                for related_slug in getattr(repo_config, "related_repositories", ()):
+                    related_config = repository_configs[related_slug]
+                    related_mirror = self.git.ensure_mirror(
+                        job.workspace,
+                        related_slug,
+                        related_config.clone_url,
+                    )
+                    resolved_ref, related_commit = self.git.resolve_context_revision(
+                        related_mirror,
+                        getattr(related_config, "context_ref", None),
+                    )
+                    related_worktree = self.git.create_context_worktree(
+                        related_mirror,
+                        job.workspace,
+                        job.repo_slug,
+                        related_slug,
+                        related_commit,
+                        job.id,
+                    )
+                    related_worktrees.append((related_mirror, related_worktree))
+                    related_entry = {
+                        "slug": related_slug,
+                        "ref": resolved_ref,
+                        "commit": related_commit,
+                        "path": str(related_worktree),
+                    }
+                    related_context.append(related_entry)
+                    LOG.info(
+                        "prepared related repository context job=%s primary_repo=%s related_repo=%s ref=%s commit=%s path=%s",
+                        job.id,
+                        job.repo_slug,
+                        related_slug,
+                        resolved_ref,
+                        related_commit,
+                        related_worktree,
+                    )
+                def before_comments_request():
+                    if is_superseded():
+                        raise ProviderSuperseded("review superseded while loading PR comments")
+
+                pull_request_comments = self.bitbucket.list_pull_request_comments(
                     job.repo_slug,
-                    source_commit,
-                    report_id,
-                    annotations,
-                    before_request=lambda: self._renew_publish_or_superseded(job),
+                    job.pr_id,
+                    before_request=before_comments_request,
                 )
-                for pr_comment in to_pr_comments(
-                    validated,
-                    provider=job.provider,
-                    source_commit=source_commit,
-                    severities=_comment_severities(config=self.config),
-                ):
-                    # The publication ledger includes output_mode and review_run_id.
-                    # Hash the body because a retry can reuse a finding ID for
-                    # different evidence; a fresh review run may repeat any comment.
-                    comment_id = "report-comment-" + hashlib.sha256(pr_comment.encode("utf-8")).hexdigest()
-                    if self.state.inline_comment_published(job, comment_id):
-                        continue
-                    if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
-                        raise ProviderSuperseded("review superseded before PR comment publish")
-                    self.bitbucket.publish_pull_request_comment(
-                        job.repo_slug,
-                        job.pr_id,
-                        pr_comment,
-                        before_request=lambda: self._renew_publish_or_superseded(job),
+                context = self.git.prepare_context(
+                    mirror,
+                    worktree,
+                    pr,
+                    related_repositories=related_context,
+                    pull_request_comments=pull_request_comments,
+                )
+                if is_superseded():
+                    raise ProviderSuperseded("review superseded during context preparation")
+                risk = self._risk_for_job(job, source_commit, is_superseded)
+                effective_max_per_lens = effective_subagent_max_per_lens(
+                    provider_config.subagent_max_per_lens,
+                    provider_config.max_subagents,
+                )
+                review_plan = build_review_plan(
+                    changed_lines=int(context["changed_lines"]),
+                    description=pr.description,
+                    small_loc_limit=provider_config.subagent_small_loc_limit,
+                    medium_loc_limit=provider_config.subagent_medium_loc_limit,
+                    large_loc_limit=provider_config.subagent_large_loc_limit,
+                    high_risk_bonus=provider_config.subagent_high_risk_bonus,
+                    max_subagents_per_lens=effective_max_per_lens,
+                    risk=risk,
+                )
+                LOG.info(
+                    "review plan job=%s changed_lines=%s risk=%s high_risk=%s subagents_per_lens=%s total_subagents=%s",
+                    job.id,
+                    review_plan.changed_lines,
+                    review_plan.risk,
+                    review_plan.high_risk,
+                    review_plan.subagents_per_lens,
+                    review_plan.total_subagents,
+                )
+                if review_plan.total_subagents > provider_config.max_subagents:
+                    raise ProviderError(
+                        "review plan requests {} subagents, exceeding agents.{}.max_subagents={}".format(
+                            review_plan.total_subagents,
+                            job.provider,
+                            provider_config.max_subagents,
+                        ),
+                        retryable=False,
                     )
-                    self.state.mark_inline_comment_published(job, comment_id)
+                prompt = build_provider_prompt(job.provider, context, self.config.review.schema_path, review_plan)
+                run_dir = str(Path(self.config.service.state_dir) / "runs" / str(job.id))
+                self._acquire_provider_slot(job.provider, blocking=True)
+                try:
+                    if is_superseded():
+                        raise ProviderSuperseded("review superseded while waiting for provider capacity")
+                    provider_run_args = dict(
+                        worktree=str(worktree),
+                        prompt=prompt,
+                        schema_path=self.config.review.schema_path,
+                        run_dir=run_dir,
+                        is_superseded=is_superseded,
+                    )
+                    if related_context:
+                        provider_run_args["additional_dirs"] = [
+                            entry["path"] for entry in related_context
+                        ]
+                    result = provider_runner.run(**provider_run_args)
+                finally:
+                    self._release_provider_slot(job.provider)
+                _append_provider_usage_log_entry(
+                    self.config.service.state_dir,
+                    _provider_usage_log_entry(
+                        job,
+                        source_commit,
+                        run_dir,
+                        "provider_completed",
+                        result.usage,
+                        related_repositories=related_context,
+                    ),
+                )
+                usage_logged = True
+                if is_superseded():
+                    raise ProviderSuperseded("review superseded before publish")
+                parsed = parse_review_json(result.final_message)
+                validated = validate_review_output(parsed, max_findings=self.config.review.max_findings)
+                if validated.annotations:
+                    diff = context.get("diff")
+                    if not isinstance(diff, str):
+                        diff = Path(str(context["diff_path"])).read_text(encoding="utf-8")
+                    original_annotations = validated.annotations
+                    allowed_line_sides = (
+                        ("NEW", "OLD") if output_mode == "inline_comments" else ("NEW",)
+                    )
+                    validated = filter_annotation_locations(
+                        validated,
+                        diff,
+                        allowed_line_sides=allowed_line_sides,
+                        allow_old_dead_code=output_mode == "reports",
+                    )
+                    retained_external_ids = {
+                        annotation["external_id"] for annotation in validated.annotations
+                    }
+                    discarded_annotations = [
+                        annotation
+                        for annotation in original_annotations
+                        if annotation["external_id"] not in retained_external_ids
+                    ]
+                    for annotation in discarded_annotations:
+                        LOG.warning(
+                            "discarded finding without publishable annotation location "
+                            "job=%s output_mode=%s external_id=%s path=%s line=%s side=%s",
+                            job.id,
+                            output_mode,
+                            annotation["external_id"],
+                            annotation["path"],
+                            annotation["line"],
+                            annotation["line_side"],
+                        )
+                snapshot = {
+                    "version": 1,
+                    "source_commit": source_commit,
+                    "review": {
+                        "recommendation": validated.recommendation,
+                        "report": validated.report,
+                        "annotations": validated.annotations,
+                    },
+                    "publication": self._review_publication(job, validated, source_commit),
+                    "review_log": _review_log_entry(
+                        job, source_commit, validated, run_dir, result.usage,
+                        related_repositories=related_context,
+                    ),
+                }
+                if not self.state.save_review_snapshot(job, snapshot):
+                    raise ProviderSuperseded("review superseded before saving publication snapshot")
+                review_log_path = _append_review_log_entry(
+                    self.config.service.state_dir,
+                    snapshot["review_log"],
+                )
+                LOG.info(
+                    "appended review log path=%s job=%s repo=%s pr=%s",
+                    review_log_path,
+                    job.id,
+                    job.repo_slug,
+                    job.pr_id,
+                )
+            else:
+                # Never regenerate a saved run, including when loading it fails.
+                # The frozen payloads also preserve wording across config upgrades.
+                if snapshot.get("version") != 1 or not isinstance(snapshot.get("publication"), dict):
+                    raise ReviewSnapshotError("unsupported saved review snapshot for job {}".format(job.id))
+                stored_review = snapshot["review"]
+                validate_review_output(stored_review, max_findings=len(stored_review["annotations"]))
+                source_commit = snapshot["source_commit"]
+                usage_logged = True
+                replaying = True
+                LOG.info("resuming saved publication job=%s review_run=%s", job.id, job.running_review_run_id)
+            if is_superseded() or not self.state.mark_publishing(job, self._lease_seconds(job.provider)):
+                raise ProviderSuperseded("review superseded before publish")
+            report_id = self._publish_review(job, snapshot["publication"], source_commit, replaying=replaying)
             if not self.state.mark_success(job, report_id):
                 raise ProviderSuperseded("review superseded before success mark")
             LOG.info("review job succeeded id=%s repo=%s pr=%s", job.id, job.repo_slug, job.pr_id)
@@ -917,7 +848,7 @@ class ScoutDaemon:
                     ),
                 )
             self.state.return_superseded_to_pending(job.id, job.lease_token)
-        except (BitbucketError, GitError, ProviderError, ReviewValidationError) as exc:
+        except (BitbucketError, GitError, ProviderError, ReviewValidationError, ReviewSnapshotError) as exc:
             retryable = getattr(exc, "retryable", True)
             LOG.error("review job failed id=%s retryable=%s error=%s", job.id, retryable, exc)
             if run_dir is not None and not usage_logged:
@@ -999,6 +930,135 @@ class ScoutDaemon:
                     self.git.remove_worktree(mirror, worktree)
                 except Exception as exc:
                     LOG.warning("failed to remove worktree path=%s error=%s", worktree, exc)
+
+    def _review_publication(self, job: ReviewJob, validated: ValidatedReview, source_commit: str) -> Dict[str, object]:
+        if job.output_mode == "inline_comments":
+            comments = to_inline_pr_comments(
+                validated, provider=job.provider, source_commit=source_commit,
+                review_run_id=job.running_review_run_id or job.target_review_run_id,
+            )
+            annotations = {annotation["external_id"]: annotation for annotation in validated.annotations}
+            for comment in comments:
+                comment["outdated_content"] = to_outdated_pr_comment(
+                    annotations[comment["external_id"]], job.provider, source_commit,
+                )
+            return {
+                "report_id": "inline-comments",
+                "destination_commit": job.destination_commit_hash,
+                "no_findings_comment": to_no_findings_pr_comment(validated, provider=job.provider),
+                "outdated_no_findings_comment": (
+                    "Scout reviewed original commit `{}` and found no material issues. "
+                    "The PR revision has changed since that review."
+                ).format(source_commit),
+                "comments": comments,
+            }
+        return {
+            "report_id": self.config.reports.report_id_for(job.provider),
+            "report": to_bitbucket_report(
+                validated, self.config.reports.title_for(job.provider), provider=job.provider,
+                model_metadata=_provider_model_metadata(job.provider, self.provider_configs[job.provider]),
+            ),
+            "annotations": to_bitbucket_annotations(validated, provider=job.provider),
+            "comments": to_pr_comments(
+                validated, provider=job.provider, source_commit=source_commit,
+                severities=_comment_severities(config=self.config),
+            ),
+        }
+
+    def _publish_review(
+        self, job: ReviewJob, publication: Dict[str, object], source_commit: str, replaying: bool = False,
+    ) -> str:
+        report_id = publication["report_id"]
+        if job.output_mode == "inline_comments":
+            outdated = False
+            if replaying:
+                current_pr = self.bitbucket.get_pull_request(
+                    job.repo_slug, job.pr_id,
+                    before_request=lambda: self._renew_publish_or_superseded(job),
+                )
+                destination_commit = publication["destination_commit"]
+                outdated = (
+                    current_pr.source_commit_hash != source_commit
+                    or not destination_commit
+                    or current_pr.destination_commit_hash != destination_commit
+                )
+            no_findings_comment = publication["no_findings_comment"]
+            if no_findings_comment and outdated:
+                no_findings_comment = publication["outdated_no_findings_comment"]
+            if no_findings_comment and not self.state.inline_comment_published(
+                job,
+                _NO_FINDINGS_INLINE_COMMENT_ID,
+            ):
+                if _pull_request_comment_exists(
+                    self.bitbucket,
+                    job.repo_slug,
+                    job.pr_id,
+                    no_findings_comment,
+                    before_request=lambda: self._renew_publish_or_superseded(job),
+                ):
+                    self.state.mark_inline_comment_published(job, _NO_FINDINGS_INLINE_COMMENT_ID)
+                else:
+                    if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
+                        raise ProviderSuperseded("review superseded before no-findings comment publish")
+                    self.bitbucket.publish_pull_request_comment(
+                        job.repo_slug,
+                        job.pr_id,
+                        no_findings_comment,
+                        before_request=lambda: self._renew_publish_or_superseded(job),
+                    )
+                    self.state.mark_inline_comment_published(job, _NO_FINDINGS_INLINE_COMMENT_ID)
+            for comment in publication["comments"]:
+                external_id = comment["external_id"]
+                if self.state.inline_comment_published(job, external_id):
+                    continue
+                if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
+                    raise ProviderSuperseded("review superseded before inline comment publish")
+                if outdated:
+                    self.bitbucket.publish_pull_request_comment(
+                        job.repo_slug, job.pr_id, comment["outdated_content"],
+                        before_request=lambda: self._renew_publish_or_superseded(job),
+                    )
+                    self.state.mark_inline_comment_published(job, external_id)
+                    continue
+                self.bitbucket.publish_inline_pull_request_comment(
+                    job.repo_slug,
+                    job.pr_id,
+                    comment["path"],
+                    comment["line"],
+                    comment["content"],
+                    line_side=comment["line_side"],
+                    before_request=lambda: self._renew_publish_or_superseded(job),
+                )
+                self.state.mark_inline_comment_published(job, external_id)
+        else:
+            if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
+                raise ProviderSuperseded("review superseded before report publish")
+            self.bitbucket.publish_report(job.repo_slug, source_commit, report_id, publication["report"])
+            if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
+                raise ProviderSuperseded("review superseded before annotation publish")
+            self.bitbucket.publish_annotations(
+                job.repo_slug,
+                source_commit,
+                report_id,
+                publication["annotations"],
+                before_request=lambda: self._renew_publish_or_superseded(job),
+            )
+            for pr_comment in publication["comments"]:
+                # The publication ledger includes output_mode and review_run_id.
+                # Fingerprint the frozen body; a fresh review run may repeat it.
+                comment_id = "report-comment-" + hashlib.sha256(pr_comment.encode("utf-8")).hexdigest()
+                if self.state.inline_comment_published(job, comment_id):
+                    continue
+                if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
+                    raise ProviderSuperseded("review superseded before PR comment publish")
+                self.bitbucket.publish_pull_request_comment(
+                    job.repo_slug,
+                    job.pr_id,
+                    pr_comment,
+                    before_request=lambda: self._renew_publish_or_superseded(job),
+                )
+                self.state.mark_inline_comment_published(job, comment_id)
+        return report_id
 
     def _schedule(self, pool: ThreadPoolExecutor, futures: dict) -> None:
         capacity = self.max_parallel_reviews - len(futures)

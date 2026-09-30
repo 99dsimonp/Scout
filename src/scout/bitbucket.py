@@ -79,6 +79,18 @@ class BitbucketClient:
         url = "{}/repositories/{}/{}?{}".format(self.base_url, self.workspace, repo_slug, query)
         self._request_json("GET", url)
 
+    def get_pull_request(
+        self,
+        repo_slug: str,
+        pr_id: int,
+        before_request: Optional[Callable[[], None]] = None,
+    ) -> PullRequest:
+        query = urlencode({"fields": "id,source.commit.hash,destination.commit.hash"})
+        path = "/repositories/{}/{}/pullrequests/{}?{}".format(self.workspace, repo_slug, pr_id, query)
+        if before_request is not None:
+            before_request()
+        return self._parse_pr(repo_slug, self._request_json("GET", self.base_url + path))
+
     def publish_report(self, repo_slug: str, commit_hash: str, report_id: str, report: Dict[str, Any]) -> None:
         path = "/repositories/{}/{}/commit/{}/reports/{}".format(
             self.workspace, repo_slug, commit_hash, report_id

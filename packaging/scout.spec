@@ -71,7 +71,7 @@ exit 0
 - Review PR-caused dead code, duplicate implementations, and low-value tests
 - Include PR discussion threads and respect explicit out-of-scope replies
 - Publish dead-code warnings as comments in both review output modes
-- Preserve report-mode comment publication progress across retries and restarts
+- Persist validated reviews so publication retries resume without rerunning the model
 
 * Tue Sep 29 2026 Scout contributors <noreply@github.com> - 0.1.0-3
 - Renew active review leases and exclude active jobs from reclamation

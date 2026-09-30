@@ -24,6 +24,23 @@ class FakeResponse:
 
 
 class BitbucketTests(unittest.TestCase):
+    def test_get_pull_request_reads_both_revisions_after_lease_callback(self):
+        client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+        callbacks = []
+
+        def request(method, url):
+            self.assertEqual(callbacks, ["checked"])
+            self.assertEqual(method, "GET")
+            self.assertIn("/repositories/ws/repo/pullrequests/13?", url)
+            self.assertIn("source.commit.hash", url)
+            self.assertIn("destination.commit.hash", url)
+            return {"id": 13, "source": {"commit": {"hash": "a" * 40}}, "destination": {"commit": {"hash": "b" * 40}}}
+
+        with patch.object(client, "_request_json", side_effect=request):
+            pr = client.get_pull_request("repo", 13, before_request=lambda: callbacks.append("checked"))
+        self.assertEqual(pr.source_commit_hash, "a" * 40)
+        self.assertEqual(pr.destination_commit_hash, "b" * 40)
+
     def test_basic_auth_header_is_sent(self):
         seen = {}
 

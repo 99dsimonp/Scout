@@ -483,10 +483,16 @@ normal inline finding comments. The legacy
 `[comments].critical_enabled = false` setting is still accepted when
 `severities` is omitted.
 
-In report mode, Scout records each successfully posted comment by its exact
-rendered content and review run. If a later comment fails, retries and restarts
-skip those recorded comments. A separate review run may post the same text again;
-this retry protection does not suppress issues from earlier discussions.
+Before publishing in either output mode, Scout saves the validated review in
+SQLite under its review-run identity. If publication fails, retries and restarts
+reuse that review without calling the model again and skip comments already
+recorded as posted. A fresh review run generates a new review and may repeat
+findings from earlier runs; this retry protection does not suppress issues from
+earlier discussions. If a PR changes before an inline publication retry, remaining
+findings are posted as regular PR comments with the original commit and location;
+old line numbers cannot safely anchor comments in the new diff. An ambiguous
+HTTP response or a crash between posting a comment and recording success can
+still cause a duplicate.
 
 To use native inline comments instead of Code Insights reports, set:
 
@@ -536,7 +542,9 @@ scout --config /etc/scout/config.toml --usage-summary --repo repo-a --pr 1166
 Scout keeps local review log entries and raw provider run directories under
 `state_dir/runs` for at most `service.retention_days`, which defaults to 7 and
 cannot be configured above 7. Provider usage records follow the same retention
-window.
+window. Saved publication snapshots live in SQLite outside this retention
+window, so a delayed retry still uses the original review. They are removed when
+the job is removed, cancelled, or replaced by a new review run.
 
 After each successful unfiltered poll of open Bitbucket PRs, Scout prunes SQLite
 state for PRs that are no longer open. It keeps closed PR rows while they still

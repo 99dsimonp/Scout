@@ -1173,12 +1173,14 @@ severity the comment starts with `Scout: {Severity} issue found by {provider}:`;
 for multiple actual severities it starts with `Scout: Issues found by
 {provider}:`. After each successful report-mode comment POST, Scout records a
 content fingerprint in the existing publication ledger, scoped by repository,
-PR, provider, output mode, and review run. A retry of that run skips recorded
-comments even after restart. The fingerprint uses the rendered body rather than
-its position in the list, so reordered or changed provider output cannot cause
-a different comment to be skipped. Separate review runs may post identical
-comments again. This transport retry protection is separate from the review
-model's out-of-scope discussion rule. As with inline publication, an ambiguous
+PR, provider, output mode, and review run. Before any publication, Scout saves
+the validated, location-filtered review in SQLite. Both output modes reuse that
+review on a publication retry, including after restart, without running the
+provider again. The saved output keeps finding identities and wording stable,
+so the publication ledger can skip comments already posted by that run. A fresh
+review run generates new output and may post identical comments again. This
+transport retry protection is separate from the review model's out-of-scope
+discussion rule. As with inline publication, an ambiguous
 POST result or a crash before its success is recorded can still require manual
 reconciliation; local state alone cannot guarantee exactly-once HTTP delivery.
 
@@ -1296,6 +1298,31 @@ current report identity without queuing completed reviews again. This migration
 also repairs databases whose table layout was already upgraded. Current report
 and inline-comment identities remain unchanged. Recovery requeues interrupted
 work; a package upgrade alone does not invalidate completed reviews.
+
+Publication snapshots are stored in SQLite rather than the expiring provider run
+directory. Each snapshot retains the validated review, original source commit,
+rendered publication payloads, and audit metadata. Saving requires the current
+lease and review-run identity; an existing snapshot cannot be overwritten.
+A retry uses the saved payloads even if comment configuration or PR metadata has
+changed, so findings cannot acquire new wording or a newer commit label halfway
+through publication. Invalid saved data fails the job instead of regenerating
+output that could duplicate comments already posted. Snapshots are retained
+until the job is removed, cancelled, or moves to a new review run; ordinary
+artifact retention does not remove them. Provider cooldown and queue scheduling
+still apply to publication retries.
+
+Before replaying inline findings, Scout reads the current PR revision. If the
+source or destination revision differs from the saved review, or the destination
+revision cannot be confirmed, pending findings use saved regular-comment bodies
+naming the reviewed commit and original path/line/side. Bitbucket's inline comment API does not accept a commit anchor,
+so replaying old coordinates could otherwise attach a finding to unrelated code
+or fail repeatedly. These comments use the same publication IDs, preserving
+progress even when the delivery form changes. Failure to read the PR revision
+retries publication without rerunning the provider.
+
+The snapshot also retains the audit entry. A crash after saving the snapshot but
+before appending the JSONL log can omit that file entry; the review remains in
+SQLite. Publication replay does not append another provider-usage record.
 
 For explicit test runs, `scout --once --reset-state-db` deletes the configured
 SQLite database and WAL/SHM sidecars after acquiring the same runtime lock. This
