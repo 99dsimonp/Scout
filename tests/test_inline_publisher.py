@@ -182,3 +182,148 @@ class PublisherIntegrationTests(unittest.TestCase):
                     else:
                         publisher.initialize_identity()
                         self.assertEqual(publisher.identity, configured or discovered)
+
+    def test_negative_reconciliation_waits_then_resends_same_marker(self):
+        record = self.ready_round()
+        self.bitbucket.fail = True
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        original = self.bitbucket.posts[0]
+        self.bitbucket.comments.clear()
+        self.bitbucket.fail = False
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr), "publishing")
+        self.assertEqual(len(self.bitbucket.posts), 1)
+        with self.store.connect() as conn:
+            conn.execute("update inline_publication_intents set last_attempt_at='2000-01-01T00:00:00+00:00'")
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr), "completed")
+        self.assertEqual(self.bitbucket.posts, [original, original])
+
+    def test_negative_lookup_does_not_settle_unknown_when_anchor_changed(self):
+        record = self.ready_round()
+        self.bitbucket.fail = True
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        self.bitbucket.comments.clear()
+        self.bitbucket.fail = False
+        with self.store.connect() as conn:
+            conn.execute("update inline_publication_intents set last_attempt_at='2000-01-01T00:00:00+00:00'")
+        moved = replace(self.pr, source_commit_hash="changed")
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved), "publishing")
+        intent = self.store.inline.list_intents()[0]
+        self.assertEqual(intent["status"], "unknown")
+        self.assertTrue(intent["stale"])
+        self.assertEqual(len(self.bitbucket.posts), 1)
+
+    def test_push_after_negative_lookup_keeps_resend_uncertain(self):
+        record = self.ready_round()
+        self.bitbucket.fail = True
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        self.bitbucket.comments.clear()
+        self.bitbucket.fail = False
+        with self.store.connect() as conn:
+            conn.execute("update inline_publication_intents set last_attempt_at='2000-01-01T00:00:00+00:00'")
+        snapshots = iter([self.pr, replace(self.pr, source_commit_hash="changed")])
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: next(snapshots)), "publishing")
+        intent = self.store.inline.list_intents()[0]
+        self.assertEqual(intent["status"], "unknown")
+        self.assertTrue(intent["uncertain"])
+        self.assertTrue(intent["stale"])
+        self.assertEqual(len(self.bitbucket.posts), 1)
+
+    def test_closed_pr_blocks_even_unanchored_coverage_notice(self):
+        record = self.ready_round({"codex": valid_review()}, failed=("claude",))
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: replace(self.pr, state="MERGED")), "cancelled")
+        self.assertEqual(self.bitbucket.posts, [])
+
+    def test_author_halt_during_preflight_prevents_next_post(self):
+        record = self.ready_round()
+        def snapshot():
+            self.publisher.halted = True
+            return self.pr
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], snapshot), "publication_failed")
+        self.assertEqual(self.bitbucket.posts, [])
+
+    def test_late_duplicate_ids_are_recorded_without_another_post(self):
+        record = self.ready_round()
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        duplicate = dict(self.bitbucket.comments[0], id=23)
+        self.bitbucket.comments.append(duplicate)
+        self.publisher.history(record)
+        intent = self.store.inline.list_intents()[0]
+        self.assertEqual(set(intent["comment_ids"]), {"1", "23"})
+        self.assertEqual(intent["status"], "published")
+        self.assertEqual(len(self.bitbucket.posts), 1)
+
+    def test_failed_listing_never_counts_as_negative_reconciliation(self):
+        record = self.ready_round()
+        self.bitbucket.fail = True
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        with self.store.connect() as conn:
+            conn.execute("update inline_publication_intents set last_attempt_at='2000-01-01T00:00:00+00:00'")
+        with patch.object(self.bitbucket, "list_pull_request_comments", side_effect=BitbucketError("unavailable")):
+            self.assertFalse(self.publisher.reconcile(record))
+        self.assertEqual(len(self.bitbucket.posts), 1)
+        self.assertEqual(self.store.inline.list_intents()[0]["status"], "unknown")
+
+    def test_resolved_history_is_excluded_without_hiding_older_eligible_roots(self):
+        record = self.ready_round()
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        self.assertEqual(len(self.publisher.history(record)), 1)
+        self.bitbucket.comments[0]["resolved"] = True
+        self.assertEqual(self.publisher.history(record), [])
+
+    def test_historical_target_disappearing_adds_original_comment_to_saved_plan(self):
+        record = self.ready_round()
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        history = self.publisher.history(record)
+        self.store.inline.release_round(record["id"], record["lease_token"], status="completed")
+        later = self.store.inline.create_round(self.pr, ("codex",), "v1", "v1", trigger="request")
+        job = self.store.claim_next_pending_job({"codex": 120})
+        self.store.inline.save_result(job, valid_review())
+        later = self.store.inline.claim_round(later["id"], 120)
+        plan = exact_selection(make_candidates(later), history).to_dict()
+        self.assertEqual(plan["retained_ids"], [])
+        self.store.inline.save_plan(later["id"], later["lease_token"], plan)
+        self.bitbucket.comments[0]["deleted"] = True
+        self.assertEqual(self.publisher.publish_round(later["id"], later["lease_token"], lambda: self.pr), "completed")
+        self.assertEqual(len(self.bitbucket.posts), 2)
+        self.assertEqual(self.store.inline.get_plan(later["id"]), plan)
+        self.assertNotIn("no material issues", self.bitbucket.posts[-1])
+
+    def test_unknown_operator_absence_cannot_resend_stale_anchor(self):
+        record = self.ready_round()
+        self.bitbucket.fail = True
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        intent = self.store.inline.list_intents()[0]
+        self.assertTrue(self.store.inline.resolve_publication(intent["id"], intent["version"], "absent"))
+        self.bitbucket.fail = False
+        self.bitbucket.comments.clear()
+        moved = replace(self.pr, source_commit_hash="moved")
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved), "completed_with_stale_findings")
+        self.assertEqual(len(self.bitbucket.posts), 2)
+        self.assertIn("not posted", self.bitbucket.posts[1])
+        self.assertEqual(self.store.inline.get_intent(intent["id"])["status"], "cancelled")
+
+    def test_author_aliases_from_discovery_are_accepted(self):
+        with patch.object(self.bitbucket, "current_user", return_value={"account_id": "bot", "uuid": "{bot-uuid}"}):
+            self.publisher.initialize_identity()
+        record = self.ready_round()
+        self.bitbucket.account = "{bot-uuid}"
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr), "completed")
+
+    def test_author_mismatch_remains_halted_after_restart(self):
+        record = self.ready_round()
+        self.bitbucket.account = "unexpected"
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        self.bitbucket.account = "bot"
+        with self.assertRaisesRegex(ConfigError, "POST author mismatch"):
+            InlinePublisher(self.store, self.bitbucket, config()).initialize_identity()
+
+    def test_closed_pr_only_reconciles_and_never_resends(self):
+        record = self.ready_round()
+        self.bitbucket.fail = True
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        self.bitbucket.comments.clear()
+        with self.store.connect() as conn:
+            conn.execute("update inline_publication_intents set last_attempt_at='2000-01-01T00:00:00+00:00'")
+        self.publisher.close_pr("ws", "repo", 1)
+        self.assertEqual(len(self.bitbucket.posts), 1)
+        self.assertEqual(self.store.inline.list_intents(), [])

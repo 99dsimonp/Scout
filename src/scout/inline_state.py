@@ -62,7 +62,7 @@ class InlineState:
               status text not null default 'ready', version integer not null default 0,
               attempts integer not null default 0, last_attempt_at text,
               comment_ids text not null default '[]', author_id text, error text,
-              stale integer not null default 0, lease_token text,
+              stale integer not null default 0, uncertain integer not null default 0, lease_token text,
               created_at text not null, updated_at text not null,
               unique(round_id,intent_key)
             );
@@ -84,6 +84,7 @@ class InlineState:
             );
         """)
         self.store._ensure_column(conn, "inline_rounds", "selection_attempts", "integer not null default 0")
+        self.store._ensure_column(conn, "inline_publication_intents", "uncertain", "integer not null default 0")
 
     def _round(self, conn, row):
         if row is None:
@@ -143,6 +144,12 @@ class InlineState:
                 return None
             previous = conn.execute("select * from inline_rounds where workspace=? and repo_slug=? and pr_id=? order by created_at desc", scope).fetchall()
             if trigger == "initial":
+                # The pre-round publisher owns these frozen payloads and its existing
+                # publication ledger. Replacing their run IDs would delete snapshots.
+                if conn.execute("""select 1 from review_publication_snapshots s join review_jobs j on j.id=s.job_id
+                    where j.workspace=? and j.repo_slug=? and j.pr_id=? and j.output_mode='inline_comments'
+                    and s.review_run_id=j.target_review_run_id and j.status!='cancelled'""", scope).fetchone():
+                    return None
                 if previous or conn.execute("""select 1 from review_jobs where workspace=? and repo_slug=?
                     and pr_id=? and output_mode='inline_comments' and status='succeeded'""", scope).fetchone():
                     return None
@@ -267,7 +274,7 @@ class InlineState:
         conn.execute("""update review_jobs set status='cancelled',superseded=1,lease_token=null,leased_until=null,
             error_message=?,updated_at=? where target_review_run_id in
             (select run_id from inline_round_providers where round_id=?) and status!='succeeded'""", (reason, now, round_id))
-        conn.execute("""update inline_publication_intents set status=case when status='sending' then 'unknown' else 'cancelled' end,
+        conn.execute("""update inline_publication_intents set status=case when status='sending' or uncertain=1 then 'unknown' else 'cancelled' end,
             version=version+1,error=?,updated_at=? where round_id=? and status in ('ready','sending')""", (reason, now, round_id))
 
     def cancel_round(self, round_id: str, reason: str) -> bool:
@@ -374,6 +381,7 @@ class InlineState:
         item = dict(row)
         item["payload"], item["comment_ids"] = json.loads(item["payload"]), json.loads(item["comment_ids"])
         item["stale"] = bool(item["stale"])
+        item["uncertain"] = bool(item["uncertain"])
         return item
 
     def reserve_intent(self, round_id: str, key: str, payload: dict, kind: str = "finding") -> Optional[dict]:
@@ -411,13 +419,15 @@ class InlineState:
             return [self._intent(row) for row in conn.execute(sql + " order by i.created_at,i.id", params).fetchall()]
 
     def transition_intent(self, intent_id: str, expected_version: int, status: str, **changes) -> Optional[dict]:
-        allowed = {"ready": ("sending", "cancelled"), "sending": ("published", "unknown"),
-                   "unknown": ("ready", "published", "cancelled"), "published": ("published",), "cancelled": ("cancelled",)}
+        allowed = {"ready": ("sending", "cancelled", "unknown"), "sending": ("published", "unknown"),
+                   "unknown": ("ready", "published", "cancelled", "unknown"), "published": ("published",), "cancelled": ("cancelled",)}
         now = utcnow()
         with self.store.connect() as conn:
             conn.execute("begin immediate")
             row = conn.execute("select * from inline_publication_intents where id=? and version=?", (intent_id, expected_version)).fetchone()
             if row is None or status not in allowed[row["status"]]:
+                return None
+            if status == "cancelled" and row["uncertain"]:
                 return None
             if status in ("ready", "sending"):
                 round_ = conn.execute("select * from inline_rounds where id=?", (row["round_id"],)).fetchone()
@@ -433,7 +443,9 @@ class InlineState:
                     raise ValueError("Unsupported intent field: " + key)
                 fields[key] = _json([str(i) for i in value]) if key == "comment_ids" else value
             if status == "sending":
-                fields.update(attempts=row["attempts"] + 1, last_attempt_at=now)
+                fields.update(attempts=row["attempts"] + 1, last_attempt_at=now, uncertain=1)
+            elif status == "published":
+                fields["uncertain"] = 0
             conn.execute("update inline_publication_intents set {} where id=? and version=?".format(",".join(key + "=?" for key in fields)), (*fields.values(), intent_id, expected_version))
             return self._intent(conn.execute("select * from inline_publication_intents where id=?", (intent_id,)).fetchone())
 
@@ -502,7 +514,7 @@ class InlineState:
                             values(?,?,'stale_unpublished') on conflict(round_id,candidate_id) do update set status='stale_unpublished'""", (row["round_id"], candidate_id))
             else:
                 status = "ready"
-            conn.execute("""update inline_publication_intents set status=?,comment_ids=?,error=?,version=version+1,
+            conn.execute("""update inline_publication_intents set status=?,comment_ids=?,error=?,uncertain=0,version=version+1,
                 updated_at=? where id=? and version=?""", (status, _json(ids), error, now, intent_id, expected_version))
             conn.execute("""insert into inline_publication_audit(intent_id,previous_version,outcome,comment_id,created_at)
                 values(?,?,?,?,?)""", (intent_id, expected_version, outcome, str(comment_id) if comment_id else None, now))
@@ -517,7 +529,7 @@ class InlineState:
                 where id=? and status='publication_failed'""", (utcnow(), round_id)).rowcount == 1
             if changed:
                 conn.execute("""update inline_publication_intents set attempts=0,version=version+1,updated_at=?
-                    where round_id=? and status='ready' and stale=0""", (utcnow(), round_id))
+                    where round_id=? and status='ready' and stale=0 and uncertain=0""", (utcnow(), round_id))
             return changed
 
     def finish_closed_pr(self, workspace: str, repo_slug: str, pr_id: int) -> None:

@@ -19,6 +19,7 @@ class PullRequest:
     destination_commit_hash: Optional[str] = None
     merge_base_hash: Optional[str] = None
     is_draft: bool = False
+    state: str = "OPEN"
 
 
 def review_key(

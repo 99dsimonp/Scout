@@ -2,13 +2,14 @@
 
 Date: 30 September 2026
 
-Status: Proposed; wait for all providers, then select and publish
+Status: Implemented locally; wait for all providers, then select and publish.
+Live Bitbucket and provider CLI contracts still require release verification.
 
-Code baseline: `cbc0b50`
+Code baseline: `19dee02` (includes durable review snapshots and report-comment retry tracking)
 
 Run independent provider reviews concurrently on one snapshot. Wait until every expected provider has either returned a validated result or failed, then use a cheap model to select the most meaningful original comments before publishing. A finding that fully covers another finding wins; uncertain or partially overlapping findings both survive.
 
-Scout already supports running both providers in inline mode. The gap is that publication tracking includes the provider and review run, so it cannot recognize duplicates across providers or reruns. See `StateStore.inline_comment_published` in [state.py](../src/scout/state.py).
+At the baseline, Scout supports running both providers in inline mode, but publication tracking includes the provider and review run, so it cannot recognize duplicates across providers or reruns. See `StateStore.inline_comment_published` in [state.py](../src/scout/state.py).
 
 ```mermaid
 flowchart LR
@@ -192,7 +193,7 @@ The coordination is simpler: one complete input set, one saved selection plan, a
 
    Compare the author of each successful POST response with the trusted identity. On a mismatch, record the comment ID and actual author as an anomaly and stop publishing until corrected; never retry a successful POST as though it failed.
 
-   The new publisher replaces the legacy inline loop in every inline configuration, and `[review.deduplication] enabled` defaults to `true`. Startup behavior:
+   The new publisher handles every newly executed inline review, and `[review.deduplication] enabled` defaults to `true`. Upgrade exception: a pre-existing saved inline publication snapshot from `19dee02` finishes through its existing immutable replay path, preserving its reviewed revision and publication ledger without another provider call. Such snapshots can describe different revisions across providers, so do not combine them into one new round or discard their recorded progress. Pending work with no saved snapshot enters the round pipeline; completed identities remain completed. Startup behavior:
 
    | Situation | Startup |
    |---|---|
@@ -262,6 +263,12 @@ Deliver in phases, each shippable on its own:
 - Eligibility and identity: resolved, outdated, deleted, and unknown-state comments never suppressing; each row of the startup identity table; POST author mismatch; legacy import preserving completed review identities.
 
 **Baseline.** The design inspections ran `test_state test_config test_daemon test_comment_request` (169 tests), the 53 state tests, and `test_state test_daemon test_bitbucket` (129 tests), all passing with `PYTHONPATH=src:tests`. A focused reproduction with the existing polling fixture confirmed that an open draft PR is omitted from today's closed-cleanup keep set. These establish the baseline, not the proposed behavior.
+
+**Implementation verification.** The final suite ran 451 tests on Python 3.14
+and Python 3.9.25. All host tests passed; the container skipped one existing
+non-root setup-script test and passed the rest. Both example-config checks
+passed. Independent review findings were fixed and rechecked. See
+[the implementation record](multi-provider-implementation-plan.md) for details.
 
 **Bitbucket contracts to verify before enabling the publisher**, recording response fixtures:
 

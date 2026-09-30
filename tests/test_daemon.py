@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
@@ -11,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from scout.bitbucket import BitbucketError
+from scout.bitbucket import BitbucketClient, BitbucketCredentials, BitbucketError
 from scout.daemon import (
     ScoutDaemon,
     _append_provider_usage_log_entry,
@@ -24,7 +25,7 @@ from scout.daemon import (
     _seconds_until_next_poll,
 )
 from scout.config import CredentialStore, parse_config
-from scout.gitops import GitError
+from scout.gitops import GitError, GitManager
 from scout.models import PullRequest
 from scout.provider import ProviderError, ProviderResult, ProviderSuperseded
 from scout.schema import validate_review_output
@@ -603,6 +604,7 @@ class DaemonReviewLogTests(unittest.TestCase):
         futures = {running: {"id": 99, "provider": "codex"}}
         pool = _RecordingPool()
 
+        self.assertTrue(daemon._acquire_provider_slot("codex", blocking=False))
         daemon._schedule(pool, futures)
 
         self.assertEqual([job.provider for job in pool.submitted], ["claude"])
@@ -1596,6 +1598,365 @@ class DaemonReviewLogTests(unittest.TestCase):
             )
             self.assertEqual(daemon.state.retryable_failures, [(32, 3, 300)])
 
+    def test_run_job_passes_paginated_discussions_to_provider_in_both_modes(self):
+        for output_mode in ("reports", "inline_comments"):
+            with self.subTest(output_mode=output_mode), tempfile.TemporaryDirectory() as tmp:
+                payload = valid_review()
+                provider = _FakeProvider(final_message={
+                    "recommendation": payload.recommendation,
+                    "report": payload.report,
+                    "annotations": payload.annotations,
+                })
+                daemon = _related_run_job_daemon(tmp, provider=provider)
+                daemon.repository_configs = {}
+                manager = GitManager(tmp)
+                daemon.git = manager
+                worktree = Path(tmp) / "worktree"
+                worktree.mkdir()
+                root = {
+                    "id": 101,
+                    "created_on": "2026-09-30T10:00:00Z",
+                    "content": {"raw": "Missing error handling"},
+                    "user": {"account_id": "reviewer", "display_name": "Reviewer"},
+                    "inline": {"path": "src/app.py", "to": 12},
+                }
+                reply = {
+                    "id": 102,
+                    "parent": {"id": 101},
+                    "created_on": "2026-09-30T10:01:00Z",
+                    "updated_on": "2026-09-30T10:02:00Z",
+                    "content": {"raw": "This issue is out of scope for this PR."},
+                    "user": {"account_id": "developer", "display_name": "Alice"},
+                }
+                client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+                daemon.bitbucket.list_pull_request_comments = client.list_pull_request_comments
+                pages = [
+                    {"values": [root], "next": "https://api.bitbucket.org/2.0/second-page"},
+                    {"values": [reply]},
+                ]
+                original_run = provider.run
+
+                def run_with_context(**kwargs):
+                    manifest = json.loads((worktree / ".scout-review/context.json").read_text(encoding="utf-8"))
+                    comments_path = Path(manifest["comments_path"])
+                    comments = json.loads(comments_path.read_text(encoding="utf-8"))
+                    self.assertEqual(comments, [root, reply])
+                    self.assertIn(str(comments_path), kwargs["prompt"])
+                    self.assertEqual(stat.S_IMODE(comments_path.stat().st_mode) & 0o222, 0)
+                    return original_run(**kwargs)
+
+                diff = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -0,0 +12 @@\n+changed call\n"
+                with patch.object(client, "_request_json", side_effect=pages) as requests, \
+                        patch.object(manager, "ensure_mirror", return_value=Path(tmp) / "mirror.git"), \
+                        patch.object(manager, "create_worktree", return_value=worktree), \
+                        patch.object(manager, "_git_capture", side_effect=["c" * 40, diff, "src/app.py\n"]), \
+                        patch.object(manager, "remove_worktree", side_effect=lambda *_: manager._make_writable(worktree)), \
+                        patch.object(provider, "run", side_effect=run_with_context):
+                    daemon.run_job(review_job(provider="codex", job_id=40, output_mode=output_mode))
+
+                self.assertEqual(requests.call_count, 2)
+                self.assertEqual(len(provider.runs), 1)
+                self.assertEqual(daemon.state.retryable_failures, [])
+                self.assertEqual(len(daemon.state.successes), 1 if output_mode == "reports" else 0)
+                # The provider judges scope; merely loading this thread never
+                # suppresses the provider's returned finding in Python.
+                if output_mode == "reports":
+                    self.assertEqual(len(daemon.bitbucket.annotations[0][3]), 1)
+                else:
+                    self.assertEqual(daemon.bitbucket.inline_comments, [])
+                    self.assertEqual(len(daemon.state.inline.results[0]["annotations"]), 1)
+
+    def test_run_job_retries_failed_discussion_fetch_before_provider(self):
+        for output_mode in ("reports", "inline_comments"):
+            with self.subTest(output_mode=output_mode), tempfile.TemporaryDirectory() as tmp:
+                provider = _FakeProvider()
+                daemon = _related_run_job_daemon(tmp, provider=provider)
+                client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+                daemon.bitbucket.list_pull_request_comments = client.list_pull_request_comments
+                with patch.object(client, "_request_json", side_effect=[
+                    {"values": [{"id": 101}], "next": "https://api.bitbucket.org/2.0/second-page"},
+                    BitbucketError("temporary comments failure", retryable=True),
+                ]):
+                    daemon.run_job(review_job(provider="codex", job_id=41, output_mode=output_mode))
+
+                self.assertEqual(provider.runs, [])
+                self.assertEqual(provider.risk_calls, [])
+                self.assertEqual(daemon.state.retryable_failures, [(41, 3, 300)])
+                self.assertEqual(daemon.bitbucket.operations, [])
+                self.assertEqual(len(daemon.git.removed), 2)
+
+    def test_run_job_checks_supersession_between_discussion_pages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = _FakeProvider()
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+            client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+            daemon.bitbucket.list_pull_request_comments = client.list_pull_request_comments
+
+            def first_page(*args):
+                daemon.state.is_job_superseded = lambda *_: True
+                return {"values": [{"id": 101}], "next": "https://api.bitbucket.org/2.0/second-page"}
+
+            with patch.object(client, "_request_json", side_effect=first_page) as requests:
+                daemon.run_job(review_job(provider="codex", job_id=42))
+
+            self.assertEqual(requests.call_count, 1)
+            self.assertEqual(provider.runs, [])
+            self.assertEqual(daemon.state.retryable_failures, [])
+            self.assertEqual(daemon.bitbucket.operations, [])
+            self.assertEqual(len(daemon.git.removed), 2)
+
+    def test_run_job_report_mode_comments_on_old_dead_code_without_annotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = valid_review()
+            payload.annotations[0].update({
+                "line": 11,
+                "line_side": "OLD",
+                "finding_kind": "dead_code",
+                "severity": "MEDIUM",
+                "summary": "The removed caller leaves a helper unused",
+            })
+            provider = _FakeProvider(final_message={
+                "recommendation": payload.recommendation,
+                "report": payload.report,
+                "annotations": payload.annotations,
+            })
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+            daemon.git.diff = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -11 +11,0 @@\n-last_helper_call()\n"
+
+            daemon.run_job(review_job(provider="codex", job_id=43))
+
+            report = daemon.bitbucket.reports[0][3]
+            self.assertEqual(daemon.bitbucket.annotations[0][3], [])
+            self.assertEqual(report["result"], "FAILED")
+            self.assertIn({"title": "Findings", "type": "NUMBER", "value": 1}, report["data"])
+            self.assertEqual(len(daemon.bitbucket.comments), 1)
+            self.assertIn("The removed caller leaves a helper unused", daemon.bitbucket.comments[0][2])
+            self.assertEqual(daemon.state.retryable_failures, [])
+            review_log = json.loads(Path(tmp, "review-log.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(review_log["recommendation"], "request_changes")
+            self.assertEqual(review_log["findings_count"], 1)
+
+    def test_run_job_report_mode_publishes_each_dead_code_warning_despite_verbose_general_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = valid_review()
+            general = dict(payload.annotations[0], severity="CRITICAL", details="Explanation. " * 1000)
+            dead_code = [
+                dict(
+                    general,
+                    external_id="dead-code-{}".format(line),
+                    finding_kind="dead_code",
+                    severity="LOW",
+                    line=line,
+                    line_side="OLD",
+                    summary="Unused helper {} after removing its caller".format(line),
+                    details="Caller evidence. " * 1000,
+                )
+                for line in (11, 12)
+            ]
+            provider = _FakeProvider(final_message={
+                "recommendation": payload.recommendation,
+                "report": payload.report,
+                "annotations": [general] + dead_code,
+            })
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+            daemon.git.diff = (
+                "diff --git a/src/app.py b/src/app.py\n"
+                "--- a/src/app.py\n+++ b/src/app.py\n"
+                "@@ -11,2 +12 @@\n-last_helper_call()\n-other_helper_call()\n+replacement()\n"
+            )
+
+            daemon.run_job(review_job(provider="codex", job_id=44))
+
+            comments = [comment[2] for comment in daemon.bitbucket.comments]
+            self.assertEqual(len(comments), 3)
+            self.assertTrue(all(len(content) <= 8000 for content in comments))
+            for finding in [general] + dead_code:
+                self.assertEqual(sum(finding["summary"] in content for content in comments), 1)
+            self.assertFalse(any(all(finding["summary"] in content for finding in dead_code) for content in comments))
+            annotations = daemon.bitbucket.annotations[0][3]
+            self.assertEqual(len(annotations), 1)
+            self.assertEqual(annotations[0]["summary"], general["summary"])
+            self.assertEqual(daemon.state.retryable_failures, [])
+            self.assertEqual(len(daemon.state.successes), 1)
+
+    def test_publication_retry_replays_snapshot_without_rerunning_provider(self):
+        for output_mode in ("reports",):
+            with self.subTest(output_mode=output_mode), tempfile.TemporaryDirectory() as tmp:
+                provider = _report_comments_provider()
+                daemon = _related_run_job_daemon(tmp, provider=provider)
+                daemon.config.queue.retry_backoff_seconds = 0
+                daemon.state = StateStore(str(Path(tmp) / "state.db"))
+                daemon.state.initialize()
+                pr = PullRequest("ws", "repo", 13, "PR", "", "feature", "b" * 40, "main")
+                daemon.state.enqueue_or_update_pr(pr, "v1", "v1", "codex", output_mode=output_mode)
+                job = daemon.state.claim_next_pending_job({"codex": 1200})
+                method = "publish_pull_request_comment" if output_mode == "reports" else "publish_inline_pull_request_comment"
+                published = daemon.bitbucket.comments if output_mode == "reports" else daemon.bitbucket.inline_comments
+                publish = getattr(daemon.bitbucket, method)
+                attempts = []
+
+                def fail_second_comment(*args, **kwargs):
+                    self.assertIsNotNone(daemon.state.load_review_snapshot(job))
+                    attempts.append(args)
+                    if len(attempts) == 2:
+                        raise BitbucketError("temporary comment failure", retryable=True)
+                    return publish(*args, **kwargs)
+
+                with patch.object(daemon.bitbucket, method, side_effect=fail_second_comment):
+                    daemon.run_job(job)
+                self.assertEqual(len(published), 1)
+                provider.final_message["annotations"][0]["details"] = "Reworded by a second provider invocation."
+                provider.final_message["annotations"][1]["summary"] = "A different description of the same unused helper"
+                ensured = list(daemon.git.ensured)
+                daemon.config.comments.critical_enabled = False
+                daemon.provider_configs["codex"].model = "different-model-after-upgrade"
+                daemon.state = StateStore(str(Path(tmp) / "state.db"))
+                daemon.state.initialize()
+                if output_mode == "inline_comments":
+                    daemon.bitbucket.current_pr = replace(pr, source_commit_hash="c" * 40)
+                    daemon.state.enqueue_or_update_pr(daemon.bitbucket.current_pr, "v1", "v1", "codex", output_mode=output_mode)
+                retry = daemon.state.claim_next_pending_job({"codex": 1200})
+                daemon.run_job(retry)
+
+                self.assertEqual(len(provider.runs), 1)
+                self.assertEqual(daemon.git.ensured, ensured)
+                if output_mode == "inline_comments":
+                    self.assertEqual(len(published), 1)
+                    self.assertEqual(len(daemon.bitbucket.comments), 2)
+                    bodies = [item[4] for item in published] + [item[2] for item in daemon.bitbucket.comments]
+                    for _, _, body in daemon.bitbucket.comments:
+                        self.assertIn("b" * 40, body)
+                        self.assertIn("src/app.py:", body)
+                        self.assertIn("NEW", body)
+                        self.assertNotIn("```suggestion", body)
+                else:
+                    self.assertEqual(len(published), 3)
+                    bodies = [item[2] for item in published]
+                self.assertFalse(any("Reworded" in body or "different description" in body for body in bodies))
+                if output_mode == "reports":
+                    self.assertTrue(all("b" * 12 in body for body in bodies))
+                    self.assertEqual(daemon.bitbucket.reports[0][3], daemon.bitbucket.reports[-1][3])
+                self.assertEqual(daemon.state.get_job(job.id).status, "succeeded")
+                self.assertEqual(daemon.state.get_job(job.id).running_source_commit_hash, "b" * 40)
+                self.assertEqual(len(Path(tmp, "provider-usage.jsonl").read_text().splitlines()), 1)
+                self.assertEqual(len(Path(tmp, "review-log.jsonl").read_text().splitlines()), 1)
+
+    def test_corrupt_publication_snapshot_fails_closed_without_provider_or_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = _report_comments_provider()
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+            daemon.config.queue.retry_backoff_seconds = 0
+            daemon.state = StateStore(str(Path(tmp) / "state.db"))
+            daemon.state.initialize()
+            pr = PullRequest("ws", "repo", 13, "PR", "", "feature", "b" * 40, "main")
+            daemon.state.enqueue_or_update_pr(pr, "v1", "v1", "codex")
+            job = daemon.state.claim_next_pending_job({"codex": 1200})
+            with patch.object(daemon.bitbucket, "publish_report", side_effect=BitbucketError("temporary failure")):
+                daemon.run_job(job)
+            self.assertIsNotNone(daemon.state.load_review_snapshot(job))
+            with daemon.state.connect() as conn:
+                conn.execute("update review_publication_snapshots set payload='corrupt JSON'")
+            retry = daemon.state.claim_next_pending_job({"codex": 1200})
+            with patch.object(daemon.git, "ensure_mirror", side_effect=AssertionError("must not fetch")) as fetch:
+                daemon.run_job(retry)
+            self.assertEqual(len(provider.runs), 1)
+            fetch.assert_not_called()
+            self.assertEqual(daemon.bitbucket.operations, [])
+            self.assertEqual(daemon.state.get_job(job.id).status, "failed_retryable")
+            self.assertIn("checksum mismatch", daemon.state.get_job(job.id).error_message)
+            self.assertEqual(len(Path(tmp, "provider-usage.jsonl").read_text().splitlines()), 1)
+
+    def test_invalid_review_output_never_saves_publication_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = _FakeProvider(final_message={"invalid": "review"})
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+            daemon.run_job(review_job(provider="codex"))
+            self.assertEqual(daemon.state.review_snapshots, {})
+            self.assertEqual(daemon.bitbucket.operations, [])
+            self.assertEqual(len(daemon.state.retryable_failures), 1)
+
+    def test_snapshot_save_rejecting_lost_lease_prevents_all_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = _related_run_job_daemon(tmp, provider=_report_comments_provider())
+            with patch.object(daemon.state, "save_review_snapshot", return_value=False):
+                daemon.run_job(review_job(provider="codex"))
+            self.assertEqual(daemon.bitbucket.operations, [])
+            self.assertEqual(daemon.state.successes, [])
+            self.assertEqual(daemon.state.retryable_failures, [])
+
+    def test_report_comment_retry_survives_restart_and_fresh_run_can_repeat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = _report_comments_provider()
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+            daemon.config.queue.retry_backoff_seconds = 0
+            daemon.state = StateStore(str(Path(tmp) / "state.db"))
+            daemon.state.initialize()
+            pr = PullRequest("ws", "repo", 13, "PR", "", "feature", "b" * 40, "main")
+            daemon.state.enqueue_or_update_pr(pr, "v1", "v1", "codex")
+            job = daemon.state.claim_next_pending_job({"codex": 1200})
+            publish = daemon.bitbucket.publish_pull_request_comment
+            attempts = []
+
+            def fail_second_comment(*args, **kwargs):
+                attempts.append(args[2])
+                if len(attempts) == 2:
+                    raise BitbucketError("temporary comment failure", retryable=True)
+                return publish(*args, **kwargs)
+
+            with patch.object(daemon.bitbucket, "publish_pull_request_comment", side_effect=fail_second_comment):
+                daemon.run_job(job)
+            self.assertEqual(len(daemon.bitbucket.comments), 1)
+            self.assertEqual(daemon.state.get_job(job.id).status, "failed_retryable")
+
+            daemon.state = StateStore(str(Path(tmp) / "state.db"))
+            daemon.state.initialize()
+            retry = daemon.state.claim_next_pending_job({"codex": 1200})
+            self.assertEqual(retry.running_review_run_id, job.running_review_run_id)
+            daemon.run_job(retry)
+            first_run_comments = [item[2] for item in daemon.bitbucket.comments]
+            self.assertEqual(len(first_run_comments), 3)
+            self.assertEqual(len(set(first_run_comments)), 3)
+            self.assertEqual(daemon.state.get_job(job.id).status, "succeeded")
+
+            daemon.state.force_enqueue_pr_review(pr, "v1", "v1", "codex", output_mode="reports")
+            forced = daemon.state.claim_next_pending_job({"codex": 1200})
+            self.assertNotEqual(forced.running_review_run_id, job.running_review_run_id)
+            daemon.run_job(forced)
+            self.assertEqual([item[2] for item in daemon.bitbucket.comments], first_run_comments * 2)
+            self.assertEqual(len(provider.runs), 2)
+            self.assertEqual(daemon.state.get_job(job.id).status, "succeeded")
+
+    def test_report_comment_retry_reuses_saved_body_despite_changed_provider_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = _report_comments_provider()
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+            job = review_job(provider="codex", job_id=45)
+            daemon.run_job(job)
+            original_comments = list(daemon.bitbucket.comments)
+            self.assertEqual(len(original_comments), 3)
+            # A retry publishes the original review instead of asking the
+            # provider to rewrite a finding it has already posted.
+            provider.final_message["annotations"][1]["details"] = "Different confirmed dead-code evidence."
+            daemon.run_job(job)
+            self.assertEqual(daemon.bitbucket.comments, original_comments)
+            self.assertEqual(len(provider.runs), 1)
+
+    def test_report_comment_ownership_loss_stops_before_next_comment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = _related_run_job_daemon(tmp, provider=_report_comments_provider())
+            publish = daemon.bitbucket.publish_pull_request_comment
+
+            def lose_ownership_after_publish(*args, **kwargs):
+                publish(*args, **kwargs)
+                daemon.state.renew_publishing_lease = lambda *_: False
+
+            with patch.object(daemon.bitbucket, "publish_pull_request_comment", side_effect=lose_ownership_after_publish):
+                daemon.run_job(review_job(provider="codex", job_id=46))
+            self.assertEqual(len(daemon.bitbucket.comments), 1)
+            self.assertEqual(len(daemon.state.marked_inline_comments), 1)
+            self.assertEqual(daemon.state.successes, [])
+            self.assertEqual(daemon.state.retryable_failures, [])
+
     def test_run_job_report_mode_discards_old_side_and_publishes_consistent_no_findings(self):
         with tempfile.TemporaryDirectory() as tmp:
             payload = valid_review()
@@ -1706,6 +2067,9 @@ class _RecordingPool:
 
 
 class _FakeClaimingState:
+    def claim_saved_publication_job(self, *args, **kwargs):
+        return None
+
     def get_active_provider_cooldown(self, provider):
         return None
 
@@ -1713,7 +2077,7 @@ class _FakeClaimingState:
         self.jobs = jobs
         self.claims = []
 
-    def claim_next_pending_job(self, lease_seconds_by_provider, excluded_job_ids=()):
+    def claim_next_pending_job(self, lease_seconds_by_provider, excluded_job_ids=(), exclude_saved_publications=False):
         self.claims.append(dict(lease_seconds_by_provider))
         for index, job in enumerate(self.jobs):
             if job.provider in lease_seconds_by_provider and job.id not in excluded_job_ids:
@@ -1922,8 +2286,24 @@ class _FakeReports:
         }[provider]
 
 
+class _FakeRoundState:
+    def __init__(self):
+        self.results = []
+
+    def save_result(self, job, result):
+        self.results.append(result)
+        return True
+
+    def round_for_job(self, job):
+        return {"id": "round"}
+
+    def start_provider_recovery(self, *args):
+        pass
+
+
 class _FakeRunJobState:
     def __init__(self, cooldowns=None, published_inline_comments=None):
+        self.inline = _FakeRoundState()
         self.publishing_leases = []
         self.renewals = []
         self.successes = []
@@ -1932,6 +2312,7 @@ class _FakeRunJobState:
         self.marked_provider_cooldowns = []
         self.published_inline_comments = set(published_inline_comments or ())
         self.marked_inline_comments = []
+        self.review_snapshots = {}
 
     def get_active_provider_cooldown(self, provider):
         return self.cooldowns.get(provider)
@@ -1977,6 +2358,17 @@ class _FakeRunJobState:
     def return_superseded_to_pending(self, job_id, lease_token=None):
         pass
 
+    def save_review_snapshot(self, job, snapshot):
+        key = (job.id, job.running_review_run_id, job.provider, job.output_mode)
+        if key in self.review_snapshots:
+            return False
+        self.review_snapshots[key] = json.loads(json.dumps(snapshot))
+        return True
+
+    def load_review_snapshot(self, job):
+        key = (job.id, job.running_review_run_id, job.provider, job.output_mode)
+        return self.review_snapshots.get(key)
+
     def inline_comment_published(self, job, external_id):
         return external_id in self.published_inline_comments
 
@@ -1993,7 +2385,8 @@ class _FakeGit:
         self.suffix = suffix
         return "/worktree"
 
-    def prepare_context(self, mirror, worktree, pr):
+    def prepare_context(self, mirror, worktree, pr, related_repositories=None, pull_request_comments=None):
+        self.prepared_comments = pull_request_comments
         return {
             "workspace": pr.workspace,
             "repo_slug": pr.repo_slug,
@@ -2009,6 +2402,7 @@ class _FakeGit:
             "context_path": "/context.json",
             "files_path": "/files.txt",
             "diff_path": "/diff.patch",
+            "comments_path": "/comments.json",
             "diff": (
                 "diff --git a/src/app.py b/src/app.py\n"
                 "--- a/src/app.py\n"
@@ -2041,9 +2435,9 @@ class _RelatedFakeGit(_FakeGit):
     ):
         return "/context-job-{}/{}".format(job_id, repo_slug)
 
-    def prepare_context(self, mirror, worktree, pr, related_repositories=None):
+    def prepare_context(self, mirror, worktree, pr, related_repositories=None, pull_request_comments=None):
         self.prepared_related = related_repositories
-        context = super().prepare_context(mirror, worktree, pr)
+        context = super().prepare_context(mirror, worktree, pr, pull_request_comments=pull_request_comments)
         if self.diff is not None:
             context["diff"] = self.diff
         context["related_repositories"] = list(related_repositories or [])
@@ -2051,6 +2445,21 @@ class _RelatedFakeGit(_FakeGit):
 
     def remove_worktree(self, mirror, worktree):
         self.removed.append((mirror, worktree))
+
+
+def _report_comments_provider():
+    payload = valid_review()
+    general = dict(payload.annotations[0], severity="CRITICAL")
+    dead_code = [
+        dict(general, external_id="dead-{}".format(line), line=line,
+             severity="LOW", finding_kind="dead_code", summary="Unused helper {}".format(line))
+        for line in (13, 14)
+    ]
+    return _FakeProvider(final_message={
+        "recommendation": payload.recommendation,
+        "report": payload.report,
+        "annotations": [general] + dead_code,
+    })
 
 
 class _FailingReviewProvider(_FakeProvider):
@@ -2130,6 +2539,12 @@ class _FakeBitbucket:
         self.inline_comments = []
         self.existing_comments = []
         self.operations = []
+        self.current_pr = PullRequest("ws", "repo", 13, "PR", "", "feature", "b" * 40, "main")
+
+    def get_pull_request(self, repo_slug, pr_id, before_request=None):
+        if before_request is not None:
+            before_request()
+        return self.current_pr
 
     def publish_report(self, repo_slug, commit_hash, report_id, report):
         self.reports.append((repo_slug, commit_hash, report_id, report))

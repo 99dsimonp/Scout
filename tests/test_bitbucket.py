@@ -24,6 +24,53 @@ class FakeResponse:
 
 
 class BitbucketTests(unittest.TestCase):
+    def test_malformed_open_pr_inventory_is_retryable_not_empty(self):
+        client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+        malformed = ({}, {"values": None}, {"values": {}}, {"values": [None]},
+                     {"values": [{"id": 1}]}, {"values": [{"id": True, "source": {"commit": {"hash": "abc"}}}]},
+                     {"values": [{"id": 1, "source": {"commit": {"hash": ["abc"]}}}]},
+                     {"values": [{"id": 1, "source": "malformed"}]})
+        for payload in malformed:
+            with self.subTest(payload=payload), patch.object(client, "_request_json", return_value=payload):
+                with self.assertRaises(BitbucketError) as raised:
+                    client.list_open_pull_requests("repo")
+                self.assertTrue(raised.exception.retryable)
+
+    def test_open_pr_inventory_requires_valid_nonrepeating_next(self):
+        client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+        for next_page in (False, 123, "", "/relative", "https://other.example/prs"):
+            with self.subTest(next_page=next_page), patch.object(client, "_request_json", side_effect=[{"values": [], "next": next_page}] * 3):
+                with self.assertRaises(BitbucketError) as raised:
+                    client.list_open_pull_requests("repo")
+                self.assertTrue(raised.exception.retryable)
+        responses = [{"values": [], "next": "https://api.bitbucket.org/2.0/repeat"}] * 3
+        with patch.object(client, "_request_json", side_effect=responses):
+            with self.assertRaisesRegex(BitbucketError, "repeated a page") as raised:
+                client.list_open_pull_requests("repo")
+            self.assertTrue(raised.exception.retryable)
+
+    def test_malformed_later_inventory_page_does_not_return_partial_prs(self):
+        client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+        pr = {"id": 1, "source": {"commit": {"hash": "abc"}}}
+        pages = [{"values": [pr], "next": "https://api.bitbucket.org/2.0/page2"}, {}]
+        with patch.object(client, "_request_json", side_effect=pages):
+            with self.assertRaises(BitbucketError) as raised:
+                client.list_open_pull_requests("repo")
+            self.assertTrue(raised.exception.retryable)
+
+    def test_incomplete_comments_response_cannot_prove_publication_absent(self):
+        client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+        for payload in ({}, {"values": [{}]}, {"values": [], "next": 123}):
+            with self.subTest(payload=payload), patch.object(client, "_request_json", return_value=payload):
+                with self.assertRaises(BitbucketError):
+                    client.list_pull_request_comments("repo", 1)
+
+    def test_repeated_comment_page_is_an_incomplete_lookup(self):
+        client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+        with patch.object(client, "_request_json", return_value={"values": [], "next": "https://api.bitbucket.org/2.0/repeat"}):
+            with self.assertRaisesRegex(BitbucketError, "repeated a page"):
+                client.list_pull_request_comments("repo", 1)
+
     def test_comment_writes_return_created_id_and_author(self):
         client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("alice", "secret"))
         created = {"id": 12, "user": {"account_id": "bot"}}
@@ -36,6 +83,23 @@ class BitbucketTests(unittest.TestCase):
         with patch("scout.bitbucket.urlopen", return_value=FakeResponse({"account_id": "bot"})) as request:
             self.assertEqual(client.current_user(), {"account_id": "bot"})
         self.assertTrue(request.call_args.args[0].full_url.endswith("/user"))
+
+    def test_get_pull_request_reads_both_revisions_after_lease_callback(self):
+        client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+        callbacks = []
+
+        def request(method, url):
+            self.assertEqual(callbacks, ["checked"])
+            self.assertEqual(method, "GET")
+            self.assertIn("/repositories/ws/repo/pullrequests/13?", url)
+            self.assertIn("source.commit.hash", url)
+            self.assertIn("destination.commit.hash", url)
+            return {"id": 13, "source": {"commit": {"hash": "a" * 40}}, "destination": {"commit": {"hash": "b" * 40}}}
+
+        with patch.object(client, "_request_json", side_effect=request):
+            pr = client.get_pull_request("repo", 13, before_request=lambda: callbacks.append("checked"))
+        self.assertEqual(pr.source_commit_hash, "a" * 40)
+        self.assertEqual(pr.destination_commit_hash, "b" * 40)
 
     def test_basic_auth_header_is_sent(self):
         seen = {}
@@ -351,6 +415,8 @@ class BitbucketTests(unittest.TestCase):
                             {
                                 "id": 1,
                                 "content": {"raw": "@Scout review this"},
+                                "created_on": "2026-06-22T09:00:00+00:00",
+                                "user": {"account_id": "author-1", "display_name": "Alice"},
                                 "updated_on": "2026-06-22T10:00:00+00:00",
                                 "deleted": False,
                                 "inline": {"path": "src/app.py", "to": 12},
@@ -364,6 +430,7 @@ class BitbucketTests(unittest.TestCase):
                     "values": [
                         {
                             "id": 2,
+                            "parent": {"id": 1},
                             "content": {"raw": "later"},
                             "updated_on": "2026-06-22T10:01:00+00:00",
                             "deleted": True,
@@ -382,8 +449,13 @@ class BitbucketTests(unittest.TestCase):
             comments = client.list_pull_request_comments("repo", 9)
 
         self.assertEqual([comment["id"] for comment in comments], [1, 2])
+        self.assertEqual(comments[1]["parent"], {"id": 1})
+        self.assertEqual(comments[0]["user"]["display_name"], "Alice")
         self.assertEqual(requests[1], "https://api.bitbucket.org/2.0/next-page")
         self.assertIn("values.content.raw", requests[0])
+        self.assertIn("values.parent.id", requests[0])
+        self.assertIn("values.created_on", requests[0])
+        self.assertIn("values.user.display_name", requests[0])
         self.assertIn("values.updated_on", requests[0])
         self.assertIn("values.deleted", requests[0])
         self.assertIn("values.inline", requests[0])

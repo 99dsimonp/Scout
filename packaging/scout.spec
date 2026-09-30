@@ -1,6 +1,6 @@
 Name:           scout
 Version:        0.1.0
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Scout Bitbucket Cloud PR AI review service
 License:        Apache-2.0
 BuildArch:      noarch
@@ -67,6 +67,12 @@ exit 0
 %{_unitdir}/scout.service
 
 %changelog
+* Wed Sep 30 2026 Scout contributors <noreply@github.com> - 0.1.0-4
+- Review PR-caused dead code, duplicate implementations, and low-value tests
+- Include PR discussion threads and respect explicit out-of-scope replies
+- Publish dead-code warnings as comments in both review output modes
+- Persist validated reviews so publication retries resume without rerunning the model
+
 * Tue Sep 29 2026 Scout contributors <noreply@github.com> - 0.1.0-3
 - Renew active review leases and exclude active jobs from reclamation
 - Retry temporary lease renewal errors while the confirmed lease remains valid

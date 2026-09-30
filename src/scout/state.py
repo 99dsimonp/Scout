@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -44,6 +46,10 @@ class ReviewJob:
     running_review_run_id: Optional[str]
     error_message: Optional[str]
     output_mode: str = "reports"
+
+
+class ReviewSnapshotError(RuntimeError):
+    pass
 
 
 class StateStore:
@@ -172,6 +178,33 @@ class StateStore:
             self._migrate_failed_permanent_jobs(conn)
             self._migrate_legacy_report_review_keys(conn)
             self.inline.initialize(conn)
+            # Create these after legacy migrations that may rebuild review_jobs.
+            conn.executescript(
+                """
+                create table if not exists review_publication_snapshots (
+                  job_id integer not null,
+                  review_run_id text not null,
+                  review_key text not null,
+                  provider text not null,
+                  output_mode text not null,
+                  source_commit text not null,
+                  payload text not null,
+                  payload_sha256 text not null,
+                  primary key(job_id, review_run_id)
+                );
+                create trigger if not exists delete_job_review_snapshot
+                after delete on review_jobs begin
+                  delete from review_publication_snapshots where job_id=old.id;
+                end;
+                create trigger if not exists discard_obsolete_review_snapshot
+                after update of target_review_run_id, status on review_jobs begin
+                  delete from review_publication_snapshots
+                  where job_id=new.id and (
+                    review_run_id != new.target_review_run_id or new.status='cancelled'
+                  );
+                end;
+                """
+            )
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -209,6 +242,14 @@ class StateStore:
             if not enabled:
                 for row in conn.execute("select distinct pr_id from inline_rounds where workspace=? and repo_slug=?", (workspace, repo_slug)).fetchall():
                     self.inline.cancel_pr(conn, workspace, repo_slug, row["pr_id"], "Repository review is disabled")
+                conn.execute(
+                    """
+                    delete from review_publication_snapshots where job_id in (
+                      select id from review_jobs where workspace=? and repo_slug=?
+                    )
+                    """,
+                    (workspace, repo_slug),
+                )
                 conn.execute(
                     """
                     delete from review_jobs
@@ -742,6 +783,60 @@ class StateStore:
                 ),
             )
 
+    def save_review_snapshot(self, job: ReviewJob, snapshot: Dict[str, object]) -> bool:
+        payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        with self.connect() as conn:
+            result = conn.execute(
+                """
+                insert into review_publication_snapshots(
+                  job_id, review_run_id, review_key, provider, output_mode,
+                  source_commit, payload, payload_sha256
+                )
+                select id, running_review_run_id, running_review_key, provider,
+                       output_mode, running_source_commit_hash, ?, ?
+                from review_jobs
+                where id=? and status='running' and superseded=0
+                  and lease_token=? and leased_until > ?
+                  and running_review_key=? and target_review_key=?
+                  and running_review_run_id=? and target_review_run_id=?
+                  and provider=? and output_mode=?
+                on conflict(job_id, review_run_id) do nothing
+                """,
+                (payload, digest, job.id, job.lease_token, utcnow(),
+                 job.running_review_key, job.running_review_key,
+                 job.running_review_run_id, job.running_review_run_id,
+                 job.provider, job.output_mode),
+            )
+            return result.rowcount == 1
+
+    def load_review_snapshot(self, job: ReviewJob) -> Optional[Dict[str, object]]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                select snapshot.payload, snapshot.payload_sha256
+                from review_publication_snapshots snapshot
+                join review_jobs job on job.id=snapshot.job_id
+                where snapshot.job_id=? and snapshot.review_run_id=?
+                  and snapshot.review_key=? and snapshot.provider=? and snapshot.output_mode=?
+                  and job.target_review_run_id=snapshot.review_run_id
+                  and job.target_review_key=snapshot.review_key
+                """,
+                (job.id, job.running_review_run_id, job.running_review_key, job.provider, job.output_mode),
+            ).fetchone()
+        if row is None:
+            return None
+        payload = row["payload"]
+        if hashlib.sha256(payload.encode("utf-8")).hexdigest() != row["payload_sha256"]:
+            raise ReviewSnapshotError("saved review snapshot checksum mismatch for job {}".format(job.id))
+        try:
+            snapshot = json.loads(payload)
+        except (TypeError, ValueError) as exc:
+            raise ReviewSnapshotError("invalid saved review snapshot for job {}".format(job.id)) from exc
+        if not isinstance(snapshot, dict):
+            raise ReviewSnapshotError("saved review snapshot must be an object")
+        return snapshot
+
     def inline_comment_published(
         self,
         job: ReviewJob,
@@ -900,6 +995,14 @@ class StateStore:
             conn.execute("begin immediate")
             for pr_id in ignored_ids:
                 self.inline.cancel_pr(conn, workspace, repo_slug, pr_id, reason)
+            conn.execute(
+                """
+                delete from review_publication_snapshots where job_id in (
+                  select id from review_jobs where workspace=? and repo_slug=? and {}
+                )
+                """.format(ignored_filter),
+                (workspace, repo_slug, *params),
+            )
             conn.execute(
                 """
                 delete from report_bootstrap_attempts
@@ -1148,6 +1251,10 @@ class StateStore:
                 """,
                 (error_message[:2000], now),
             )
+            conn.execute("""update inline_rounds set lease_token=null,leased_until=null,version=version+1,
+                updated_at=? where status in ('selecting','publishing') and lease_token is not null""", (now,))
+            conn.execute("""update inline_publication_intents set status='unknown',uncertain=1,
+                version=version+1,updated_at=? where status='sending'""", (now,))
             return int(result.rowcount or 0)
 
     def get_active_provider_cooldown(self, provider: str) -> Optional[str]:
@@ -1227,7 +1334,11 @@ class StateStore:
                     """
                     update review_jobs set
                       status='running',
-                      running_source_commit_hash=target_source_commit_hash,
+                      running_source_commit_hash=coalesce((
+                        select source_commit from review_publication_snapshots
+                        where job_id=review_jobs.id and review_run_id=target_review_run_id
+                          and review_key=target_review_key
+                      ), target_source_commit_hash),
                       running_review_key=target_review_key,
                       running_review_run_id=target_review_run_id,
                       superseded=0,
@@ -1271,10 +1382,21 @@ class StateStore:
                     jobs.append(_job_from_row(updated))
         return jobs
 
+    def claim_saved_publication_job(
+        self, lease_seconds: int, excluded_job_ids: Sequence[int] = (),
+    ) -> Optional[ReviewJob]:
+        with self.connect() as conn:
+            providers = {row[0]: lease_seconds for row in conn.execute(
+                "select distinct provider from review_publication_snapshots"
+            )}
+        return self.claim_next_pending_job(providers, excluded_job_ids, publication_only=True)
+
     def claim_next_pending_job(
         self,
         lease_seconds_by_provider: Dict[str, int],
         excluded_job_ids: Sequence[int] = (),
+        publication_only: bool = False,
+        exclude_saved_publications: bool = False,
     ) -> Optional[ReviewJob]:
         if not lease_seconds_by_provider:
             return None
@@ -1307,13 +1429,23 @@ class StateStore:
                     and repositories.repo_slug=review_jobs.repo_slug
                     and repositories.enabled=0
                 )
-                and not exists (
+                and (? or not exists (
                   select 1 from provider_state
                   where provider_state.provider=review_jobs.provider
                     and provider_state.status in ('rate_limited', 'quota_exhausted')
                     and provider_state.cooldown_until is not null
                     and provider_state.cooldown_until > ?
-                )
+                ))
+                and (?=0 or exists (
+                  select 1 from review_publication_snapshots s
+                  where s.job_id=review_jobs.id and s.review_run_id=review_jobs.target_review_run_id
+                    and s.review_key=review_jobs.target_review_key
+                ))
+                and (?=0 or not exists (
+                  select 1 from review_publication_snapshots s
+                  where s.job_id=review_jobs.id and s.review_run_id=review_jobs.target_review_run_id
+                    and s.review_key=review_jobs.target_review_key
+                ))
                 {}
                 order by
                   case when review_jobs.status='failed_retryable' then 1 else 0 end asc,
@@ -1324,7 +1456,7 @@ class StateStore:
                   review_jobs.id asc
                 limit 1
                 """.format(placeholders, excluded_filter),
-                (*providers, now, now, now, *excluded_job_ids),
+                (*providers, now, now, int(publication_only), now, int(publication_only), int(exclude_saved_publications), *excluded_job_ids),
             ).fetchone()
             if row is None:
                 return None
@@ -1337,7 +1469,11 @@ class StateStore:
                 """
                 update review_jobs set
                   status='running',
-                  running_source_commit_hash=target_source_commit_hash,
+                  running_source_commit_hash=coalesce((
+                        select source_commit from review_publication_snapshots
+                        where job_id=review_jobs.id and review_run_id=target_review_run_id
+                          and review_key=target_review_key
+                      ), target_source_commit_hash),
                   running_review_key=target_review_key,
                   running_review_run_id=target_review_run_id,
                   superseded=0,
@@ -1364,15 +1500,25 @@ class StateStore:
                     and repositories.repo_slug=review_jobs.repo_slug
                     and repositories.enabled=0
                 )
-                and not exists (
+                and (? or not exists (
                   select 1 from provider_state
                   where provider_state.provider=review_jobs.provider
                     and provider_state.status in ('rate_limited', 'quota_exhausted')
                     and provider_state.cooldown_until is not null
                     and provider_state.cooldown_until > ?
-                )
+                ))
+                and (?=0 or exists (
+                  select 1 from review_publication_snapshots s
+                  where s.job_id=review_jobs.id and s.review_run_id=review_jobs.target_review_run_id
+                    and s.review_key=review_jobs.target_review_key
+                ))
+                and (?=0 or not exists (
+                  select 1 from review_publication_snapshots s
+                  where s.job_id=review_jobs.id and s.review_run_id=review_jobs.target_review_run_id
+                    and s.review_key=review_jobs.target_review_key
+                ))
                 """,
-                (leased_until, lease_token, now, row["id"], now, now, now),
+                (leased_until, lease_token, now, row["id"], now, now, int(publication_only), now, int(publication_only), int(exclude_saved_publications)),
             )
             if result.rowcount != 1:
                 return None

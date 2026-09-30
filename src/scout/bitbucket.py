@@ -6,7 +6,7 @@ import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -67,10 +67,38 @@ class BitbucketClient:
         query = urlencode({"state": "OPEN", "pagelen": str(pagelen), "fields": fields})
         url = "{}/repositories/{}/{}/pullrequests?{}".format(self.base_url, self.workspace, repo_slug, query)
         prs: List[PullRequest] = []
+        visited: Set[str] = set()
+        origin = urlsplit(self.base_url)
         while url:
+            if url in visited:
+                raise BitbucketError("Bitbucket PR pagination repeated a page", retryable=True)
+            visited.add(url)
             payload = self._request_json("GET", url)
-            for item in payload.get("values", []):
-                prs.append(self._parse_pr(repo_slug, item))
+            values = payload.get("values")
+            if not isinstance(values, list):
+                raise BitbucketError("Bitbucket PR inventory is incomplete", retryable=True)
+            for item in values:
+                try:
+                    if not isinstance(item, dict) or type(item.get("id")) is not int or item["id"] <= 0:
+                        raise ValueError("invalid PR ID")
+                    pr = self._parse_pr(repo_slug, item)
+                    if any(not isinstance(value, str) for value in (
+                        pr.source_commit_hash, pr.source_branch, pr.destination_branch, pr.title, pr.description
+                    )) or (pr.destination_commit_hash is not None and not isinstance(pr.destination_commit_hash, str)):
+                        raise ValueError("invalid PR metadata")
+                except (BitbucketError, AttributeError, KeyError, TypeError, ValueError) as exc:
+                    raise BitbucketError("Bitbucket PR inventory contains an invalid entry", retryable=True) from exc
+                prs.append(pr)
+            next_page = payload.get("next")
+            if next_page is not None:
+                if not isinstance(next_page, str) or not next_page:
+                    raise BitbucketError("Bitbucket PR pagination is invalid", retryable=True)
+                try:
+                    parsed_next = urlsplit(next_page)
+                except ValueError as exc:
+                    raise BitbucketError("Bitbucket PR pagination is invalid", retryable=True) from exc
+                if (parsed_next.scheme, parsed_next.netloc) != (origin.scheme, origin.netloc):
+                    raise BitbucketError("Bitbucket PR pagination changed API origin", retryable=True)
             url = payload.get("next")
         return prs
 
@@ -82,8 +110,16 @@ class BitbucketClient:
     def current_user(self) -> Dict[str, Any]:
         return self._request_json("GET", self.base_url + "/user")
 
-    def get_pull_request(self, repo_slug: str, pr_id: int) -> PullRequest:
-        path = "/repositories/{}/{}/pullrequests/{}".format(self.workspace, repo_slug, pr_id)
+    def get_pull_request(
+        self,
+        repo_slug: str,
+        pr_id: int,
+        before_request: Optional[Callable[[], None]] = None,
+    ) -> PullRequest:
+        query = urlencode({"fields": "id,title,description,draft,state,source.commit.hash,source.branch.name,destination.commit.hash,destination.branch.name"})
+        path = "/repositories/{}/{}/pullrequests/{}?{}".format(self.workspace, repo_slug, pr_id, query)
+        if before_request is not None:
+            before_request()
         return self._parse_pr(repo_slug, self._request_json("GET", self.base_url + path))
 
     def publish_report(self, repo_slug: str, commit_hash: str, report_id: str, report: Dict[str, Any]) -> None:
@@ -188,7 +224,9 @@ class BitbucketClient:
         fields = ",".join(
             [
                 "values.id",
+                "values.parent.id",
                 "values.content.raw",
+                "values.created_on",
                 "values.updated_on",
                 "values.deleted",
                 "values.resolution",
@@ -197,6 +235,7 @@ class BitbucketClient:
                 "values.parent.id",
                 "values.inline",
                 "values.user.account_id",
+                "values.user.display_name",
                 "values.user.nickname",
                 "values.user.username",
                 "values.user.uuid",
@@ -211,11 +250,20 @@ class BitbucketClient:
         )
         url = self.base_url + path
         comments: List[Dict[str, Any]] = []
+        visited: Set[str] = set()
         while url:
+            if url in visited:
+                raise BitbucketError("Bitbucket comment pagination repeated a page", retryable=True)
+            visited.add(url)
             if before_request is not None:
                 before_request()
             payload = self._request_json("GET", url)
-            comments.extend(payload.get("values", []))
+            values = payload.get("values")
+            if not isinstance(values, list) or any(not isinstance(item, dict) or type(item.get("id")) is not int for item in values):
+                raise BitbucketError("Bitbucket comments response is incomplete", retryable=True)
+            if payload.get("next") is not None and not isinstance(payload["next"], str):
+                raise BitbucketError("Bitbucket comment pagination is invalid", retryable=True)
+            comments.extend(values)
             url = payload.get("next")
         return comments
 
@@ -263,6 +311,7 @@ class BitbucketClient:
             destination_branch=destination_branch,
             destination_commit_hash=destination_commit,
             is_draft=(item.get("draft") is True),
+            state=item.get("state") or "OPEN",
         )
 
     def _request_json(self, method: str, url: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

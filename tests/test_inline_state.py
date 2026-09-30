@@ -117,3 +117,189 @@ class InlineStateTests(unittest.TestCase):
         self.assertEqual(self.inline.get_round(ready["id"])["status"], "cancelled")
         self.assertEqual(self.inline.get_intent(intent["id"])["status"], "unknown")
         self.assertEqual(len(self.inline.history("ws", "repo", 1)), 1)
+
+    def test_atomic_request_rollback_never_leaves_partial_provider_set(self):
+        with self.store.connect() as conn:
+            conn.execute("""create trigger reject_second_provider before insert on inline_round_providers
+                when new.provider='claude' begin select raise(abort,'test interruption'); end""")
+        import sqlite3
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.create(trigger="request", request_comment=("3", "today"))
+        self.assertEqual(self.inline.list_rounds(), [])
+        self.assertIsNone(self.store.processed_pull_request_comment_review_requested("ws", "repo", 1, "3", "today"))
+        self.assertIsNone(self.store.claim_next_pending_job({"codex": 120, "claude": 120}))
+
+    def test_replacement_and_final_result_have_one_winner(self):
+        import concurrent.futures
+        import threading
+        round_ = self.create(("codex",))
+        job = self.store.claim_next_pending_job({"codex": 120})
+        barrier = threading.Barrier(2)
+
+        def complete():
+            barrier.wait()
+            return self.inline.save_result(job, {"annotations": []})
+
+        def replace_round():
+            barrier.wait()
+            return self.inline.create_round(replace(self.pr, source_commit_hash="new"), ("codex",), "v1", "v1",
+                                            trigger="replacement", replace_round_id=round_["id"], expected_version=round_["version"])
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            completion = pool.submit(complete)
+            replacement = pool.submit(replace_round)
+            self.assertNotEqual(bool(completion.result()), bool(replacement.result()))
+        self.assertIn(self.inline.get_round(round_["id"])["status"], ("ready_for_selection", "superseded"))
+
+    def test_expired_lease_cannot_save_plan_or_send_on_new_lease(self):
+        old = self.ready()
+        with self.store.connect() as conn:
+            conn.execute("update inline_rounds set leased_until='2000-01-01T00:00:00+00:00' where id=?", (old["id"],))
+        current = self.inline.claim_round(old["id"], 120)
+        self.assertFalse(self.inline.save_plan(old["id"], old["lease_token"], {}))
+        self.assertTrue(self.inline.save_plan(current["id"], current["lease_token"], {}))
+        intent = self.inline.reserve_intent(current["id"], "a", {})
+        self.assertIsNone(self.inline.transition_intent(intent["id"], intent["version"], "sending", lease_token=old["lease_token"]))
+        self.assertIsNotNone(self.inline.transition_intent(intent["id"], intent["version"], "sending", lease_token=current["lease_token"]))
+
+    def test_selection_attempts_do_not_consume_delivery_attempts(self):
+        ready = self.ready()
+        self.inline.start_selection_recovery(ready["id"], 600)
+        self.assertTrue(self.inline.selection_failed(ready["id"], ready["lease_token"], "invalid model output", permanent=True))
+        ready = self.inline.claim_round(ready["id"], 120)
+        self.assertEqual(ready["selection_attempts"], 1)
+        self.assertEqual(ready["attempts"], 0)
+        self.assertFalse(self.inline.save_plan(ready["id"], ready["lease_token"], {}, kind="model"))
+        self.assertTrue(self.inline.save_plan(ready["id"], ready["lease_token"], {}, kind="fallback"))
+
+    def test_retry_resets_known_unsent_budget_and_preserves_plan(self):
+        ready = self.ready()
+        self.inline.save_plan(ready["id"], ready["lease_token"], {"retained_ids": ["a"]})
+        unsent = self.inline.reserve_intent(ready["id"], "a", {})
+        unknown = self.inline.reserve_intent(ready["id"], "b", {})
+        unknown = self.inline.transition_intent(unknown["id"], unknown["version"], "sending")
+        unknown = self.inline.transition_intent(unknown["id"], unknown["version"], "unknown")
+        with self.store.connect() as conn:
+            conn.execute("update inline_publication_intents set attempts=3 where id=?", (unsent["id"],))
+        self.inline.release_round(ready["id"], ready["lease_token"], status="publication_failed")
+        self.assertTrue(self.inline.retry_publication(ready["id"]))
+        self.assertEqual(self.inline.get_intent(unsent["id"])["attempts"], 0)
+        self.assertEqual(self.inline.get_intent(unknown["id"])["attempts"], 1)
+        self.assertEqual(self.inline.get_plan(ready["id"]), {"retained_ids": ["a"]})
+
+    def test_stale_absence_settles_dependents_and_cannot_be_revived(self):
+        ready = self.ready()
+        self.inline.save_plan(ready["id"], ready["lease_token"], {})
+        intent = self.inline.reserve_intent(ready["id"], "a", {"finding": {"id": "a"}, "covers": ["b"]})
+        intent = self.inline.transition_intent(intent["id"], intent["version"], "sending")
+        intent = self.inline.transition_intent(intent["id"], intent["version"], "unknown", stale=True)
+        self.assertTrue(self.inline.resolve_publication(intent["id"], intent["version"], "absent"))
+        self.inline.mark_candidate(ready["id"], "a", "published")
+        self.assertEqual(self.inline.candidate_outcomes(ready["id"])["a"]["status"], "stale_unpublished")
+        self.assertEqual(self.inline.candidate_outcomes(ready["id"])["b"]["status"], "stale_unpublished")
+        self.assertEqual(self.inline.get_intent(intent["id"])["status"], "cancelled")
+
+    def test_shutdown_and_reopen_preserves_result_and_recovery_deadline(self):
+        round_ = self.create()
+        self.finish()
+        deadline = self.inline.start_provider_recovery(round_["id"], "claude", 3600)
+        reopened = StateStore(self.store.path)
+        reopened.initialize()
+        reopened.recover_abandoned_jobs()
+        current = reopened.inline.get_round(round_["id"])
+        self.assertEqual(current["outcomes"][0]["status"], "succeeded")
+        self.assertEqual(current["outcomes"][1]["recovery_deadline_at"], deadline)
+        self.assertIsNone(reopened.claim_next_pending_job({"codex": 120}))
+
+    def test_late_duplicate_anomaly_keeps_terminal_status_and_all_ids(self):
+        ready = self.ready()
+        self.inline.save_plan(ready["id"], ready["lease_token"], {})
+        intent = self.inline.reserve_intent(ready["id"], "a", {})
+        intent = self.inline.transition_intent(intent["id"], intent["version"], "sending")
+        intent = self.inline.transition_intent(intent["id"], intent["version"], "published", comment_ids=[1])
+        self.inline.record_anomaly(intent["id"], [2], "late duplicate")
+        current = self.inline.get_intent(intent["id"])
+        self.assertEqual(current["comment_ids"], ["1", "2"])
+        self.assertEqual(current["status"], "published")
+
+    def test_disabled_repository_keeps_unknown_and_history_until_closure(self):
+        ready = self.ready()
+        self.inline.save_plan(ready["id"], ready["lease_token"], {})
+        intent = self.inline.reserve_intent(ready["id"], "a", {})
+        self.inline.transition_intent(intent["id"], intent["version"], "sending")
+        self.inline.upsert_history("ws", "repo", 1, "1", {}, content="old")
+        self.store.upsert_repository("ws", "repo", "git@example", enabled=False)
+        self.assertEqual(self.inline.get_intent(intent["id"])["status"], "unknown")
+        self.assertEqual(len(self.inline.history("ws", "repo", 1)), 1)
+        self.inline.finish_closed_pr("ws", "repo", 1)
+        self.assertIsNone(self.inline.get_round(ready["id"]))
+        self.assertIsNone(self.inline.get_intent(intent["id"]))
+        self.assertEqual(self.inline.history("ws", "repo", 1), [])
+
+    def test_legacy_saved_inline_snapshot_is_not_destroyed_by_initial_round(self):
+        self.store.enqueue_or_update_pr(self.pr, "v1", "v1", "codex", output_mode="inline_comments")
+        job = self.store.claim_next_pending_job({"codex": 120})
+        snapshot = {"version": 1, "source_commit": "source", "review": {"annotations": []},
+                    "publication": {"comments": [{"content": "frozen original"}]}}
+        self.assertTrue(self.store.save_review_snapshot(job, snapshot))
+        self.store.mark_inline_comment_published(job, "already-posted")
+        self.assertIsNone(self.create())
+        self.assertEqual(self.store.load_review_snapshot(job), snapshot)
+        self.assertTrue(self.store.inline_comment_published(job, "already-posted"))
+        self.assertEqual(self.store.get_job(job.id).running_review_run_id, job.running_review_run_id)
+
+    def test_saved_publication_claim_bypasses_cooldown_without_claiming_new_review(self):
+        self.store.enqueue_or_update_pr(self.pr, "v1", "v1", "codex", output_mode="inline_comments")
+        job = self.store.claim_next_pending_job({"codex": 120})
+        self.store.save_review_snapshot(job, {"source_commit": "source", "publication": {}})
+        self.store.mark_retryable_failure(job.id, "HTTP unavailable", 3, job.lease_token, job.running_review_key)
+        self.store.enqueue_or_update_pr(replace(self.pr, pr_id=2), "v1", "v1", "claude")
+        self.store.mark_provider_cooldown("codex", "quota", 3600)
+        self.assertIsNone(self.store.claim_next_pending_job({"codex": 120}))
+        replay = self.store.claim_saved_publication_job(120)
+        self.assertEqual(replay.id, job.id)
+        self.assertIsNotNone(self.store.load_review_snapshot(replay))
+        self.assertIsNone(self.store.claim_saved_publication_job(120))
+        new_review = self.store.claim_next_pending_job({"claude": 120})
+        self.assertEqual(new_review.pr_id, 2)
+
+    def test_restart_releases_round_lease_and_preserves_ambiguous_send(self):
+        ready = self.ready()
+        self.inline.save_plan(ready["id"], ready["lease_token"], {})
+        intent = self.inline.reserve_intent(ready["id"], "a", {})
+        self.inline.transition_intent(intent["id"], intent["version"], "sending")
+        self.store.recover_abandoned_jobs()
+        current = self.inline.claim_round(ready["id"], 120)
+        self.assertIsNotNone(current)
+        self.assertNotEqual(current["lease_token"], ready["lease_token"])
+        self.assertEqual(self.inline.get_intent(intent["id"])["status"], "unknown")
+        self.assertEqual(self.inline.get_plan(ready["id"]), {})
+
+    def test_best_effort_rearm_remains_uncertain_when_superseded(self):
+        ready = self.ready()
+        self.inline.save_plan(ready["id"], ready["lease_token"], {})
+        intent = self.inline.reserve_intent(ready["id"], "a", {})
+        intent = self.inline.transition_intent(intent["id"], intent["version"], "sending")
+        intent = self.inline.transition_intent(intent["id"], intent["version"], "unknown")
+        intent = self.inline.transition_intent(intent["id"], intent["version"], "ready")
+        self.assertTrue(intent["uncertain"])
+        self.assertIsNone(self.inline.transition_intent(intent["id"], intent["version"], "cancelled"))
+        self.create(trigger="request", request_comment=("new", "today"))
+        intent = self.inline.get_intent(intent["id"])
+        self.assertEqual(intent["status"], "unknown")
+        self.assertTrue(self.inline.resolve_publication(intent["id"], intent["version"], "absent"))
+        intent = self.inline.get_intent(intent["id"])
+        self.assertEqual(intent["status"], "cancelled")
+        self.assertFalse(intent["uncertain"])
+
+    def test_review_claim_can_exclude_saved_http_publications(self):
+        self.store.enqueue_or_update_pr(self.pr, "v1", "v1", "codex")
+        job = self.store.claim_next_pending_job({"codex": 120})
+        self.store.save_review_snapshot(job, {"source_commit": "source", "publication": {}})
+        self.store.mark_retryable_failure(job.id, "HTTP unavailable", 3, job.lease_token, job.running_review_key)
+        self.assertIsNone(self.store.claim_next_pending_job({"codex": 120}, exclude_saved_publications=True))
+        self.store.enqueue_or_update_pr(replace(self.pr, pr_id=2), "v1", "v1", "codex")
+        review = self.store.claim_next_pending_job({"codex": 120}, exclude_saved_publications=True)
+        self.assertEqual(review.pr_id, 2)
+        replay = self.store.claim_saved_publication_job(120)
+        self.assertEqual(replay.id, job.id)
+        self.assertIsNotNone(self.store.load_review_snapshot(replay))

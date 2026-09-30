@@ -26,6 +26,32 @@ class InlineDispatch:
         self.publisher = InlinePublisher(daemon.state, daemon.bitbucket, daemon.config)
         self.locks = {}
 
+    def close_missing_prs(self, workspace, repo_slug, open_pr_ids):
+        keep = set(open_pr_ids)
+        rounds = self.state.list_rounds(workspace=workspace, repo_slug=repo_slug)
+        known = {item["pr_id"] for item in rounds}
+        for pr_id in known - keep:
+            # Known closure fences further sends immediately, even while a
+            # publisher is using cached PR metadata or an HTTP call is in flight.
+            for round_ in rounds:
+                if round_["pr_id"] == pr_id:
+                    self.state.cancel_round(round_["id"], "Pull request closed")
+            key = (workspace, repo_slug, pr_id)
+            active = any(not future.done() and metadata.get("pr") == key
+                         for future, metadata in getattr(self.daemon, "_worker_futures", {}).items())
+            if active:
+                keep.add(pr_id)
+                continue
+            lock = self.locks.setdefault(key, threading.Lock())
+            if not lock.acquire(blocking=False):
+                keep.add(pr_id)
+                continue
+            try:
+                self.publisher.close_pr(workspace, repo_slug, pr_id)
+            finally:
+                lock.release()
+        return sorted(keep)
+
     def maintain(self):
         for round_ in self.state.list_rounds(statuses=["reviewing"]):
             for outcome in round_["outcomes"]:
@@ -63,7 +89,7 @@ class InlineDispatch:
                 if claimed is None:
                     continue
                 future = pool.submit(self.run, claimed, lock, reserved, lease_seconds)
-                futures[future] = {"round_id": round_["id"], "provider": reserved or "", "id": None}
+                futures[future] = {"round_id": round_["id"], "provider": reserved or "", "id": None, "pr": key}
                 dispatched = True
                 return True
             finally:
@@ -108,7 +134,7 @@ class InlineDispatch:
         heartbeat_thread.start()
         try:
             check()
-            if not self.publisher.reconcile(round_, before_request=check):
+            if not self.publisher.reconcile(round_, before_request=check, current_snapshot=lambda: self._snapshot(round_)):
                 self.state.release_round(round_id, token, backoff_seconds=self.config.queue.publication_settle_seconds)
                 return
             plan = self.state.get_plan(round_id)
@@ -184,7 +210,7 @@ class InlineDispatch:
     def _snapshot(self, round_):
         pr = self.daemon.bitbucket.get_pull_request(round_["repo_slug"], round_["pr_id"])
         repo = self.daemon.repository_configs[round_["repo_slug"]]
-        if pr.is_draft or not getattr(repo, "review_enabled", True) or self.daemon._is_ignored_source_branch(repo, pr.source_branch) or self.daemon._is_ignored_target_branch(repo, pr.destination_branch):
+        if pr.state != "OPEN" or pr.is_draft or not getattr(repo, "review_enabled", True) or self.daemon._is_ignored_source_branch(repo, pr.source_branch) or self.daemon._is_ignored_target_branch(repo, pr.destination_branch):
             self.state.cancel_round(round_["id"], "PR is no longer eligible")
             raise ProviderSuperseded("PR is no longer eligible")
         if pr.destination_commit_hash == round_["destination_commit_hash"]:

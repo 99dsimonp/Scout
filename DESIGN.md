@@ -315,7 +315,8 @@ retry_backoff_seconds = 300
 
 [comments]
 critical_enabled = true
-# Empty disables native PR comments. Default is ["CRITICAL"].
+# Empty disables severity-selected comments; dead-code warnings still post.
+# Default is ["CRITICAL"].
 severities = ["CRITICAL"]
 
 [review]
@@ -572,6 +573,8 @@ Scout should generate review context before invoking the provider:
 - Diff patch.
 - Review policy version.
 - JSON schema path or inline schema.
+- Existing PR comment bodies, author identities, parent IDs, timestamps, and
+  inline locations from every API page.
 
 This context may be written into a temporary directory or a hidden worktree
 directory such as `.scout-review/`. The agent prompt should refer to these files.
@@ -579,6 +582,37 @@ Scout generates `diff.patch` with color, external diff drivers, and textconv
 disabled, submodules included in short gitlink form, and explicit `a/` and `b/`
 prefixes. Location filtering relies on that canonical structure and rejects a
 non-empty patch that does not provide it.
+
+Before starting a provider, Scout fetches the PR discussion for both output
+modes and writes `.scout-review/comments.json`. The context manifest and prompt
+refer to this file. It is made read-only with the rest of the review worktree.
+Deleted comments retain their identity and parent relationship as tombstones;
+their deleted bodies cannot be used as evidence of an out-of-scope decision.
+If fetching any page fails, normal job retry handling runs before the provider
+starts. Missing discussion must not be mistaken for an empty discussion.
+
+The provider treats discussion content as untrusted evidence. It suppresses
+only the same concrete issue when a developer reply explicitly says it is out
+of scope. It must connect the reply to the original issue through parent IDs
+and consider later replies that reverse the decision. Root-only mentions,
+resolved state, silence, bot acknowledgements, ambiguous language, and unrelated
+scope decisions do not suppress findings. Existing comments without such a
+developer reply may be reported again.
+
+The best-practices lens checks for code made unused by the PR and avoidable
+duplicates of an existing implementation. Dead-code evidence must account for
+callers, exported interfaces, dynamic dispatch, callbacks, and registrations;
+the changed causal line is the location even if the unused declaration is
+unchanged. Duplicate-code findings identify an existing implementation and
+explain why its behavior and dependency constraints permit reuse.
+
+The tests lens checks whether changed tests add distinct regression protection.
+Examples of low-value tests include repeating existing coverage, proving only
+that a test ran, checking that Jenkins ran a pipeline, and excessive assertions
+about scaffolding that do not exercise product behavior. A finding must identify
+the redundant coverage or signal. Framework and infrastructure tests remain
+useful when they verify the actual behavior under change. These policies use
+the existing lenses and do not add reviewer fan-out or invalidate saved reviews.
 
 ## Git Authentication
 
@@ -727,9 +761,11 @@ At startup, Scout should check each selected provider:
 - Credential is available when `auth_mode = "api"`.
 - Configured home directory can be created when `auth_mode = "api"`.
 
-Scout does not need to pin or enforce provider CLI versions in v1. If any
-selected provider fails validation, startup should fail with an actionable
-error. Scout does not fall back to another provider.
+Scout does not need to pin or enforce provider CLI versions in v1. In report
+mode, a selected provider validation failure aborts startup with an actionable
+error. In inline mode, record the provider failure and cooldown, then continue
+startup so available providers can review. Each round applies its fixed recovery
+deadline before publishing successful providers' results with a coverage notice.
 
 ## Provider Strategy
 
@@ -899,6 +935,7 @@ Example shape:
     {
       "external_id": "finding-001",
       "annotation_type": "BUG",
+      "finding_kind": "general",
       "path": "src/example.py",
       "line": 123,
       "line_side": "NEW",
@@ -918,6 +955,7 @@ Recommended enums:
 
 - `recommendation`: `approve`, `request_changes`
 - `annotation_type`: `BUG`, `VULNERABILITY`, `CODE_SMELL`
+- `finding_kind`: `general`, `dead_code`, `duplicate_code`, `low_value_test`
 - `severity`: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`
 - `annotation.result`: `FAILED`
 - `line_side`: `NEW`, `OLD`
@@ -930,6 +968,9 @@ for the final report result, uses the report type as metadata, and builds the
 published report details from the annotation summaries. Scout-only helper fields
 such as `reviewer`, `confidence`, and `smallest_fix` are embedded into readable
 annotation details because Bitbucket annotations do not accept them directly.
+`finding_kind` classifies the finding for Scout's publishing rules and is not
+sent to the Bitbucket annotation API. Bundled provider schemas require it;
+runtime validation also accepts older outputs without it as general findings.
 
 The v1 schema is stored at `/etc/scout/review.schema.json`. It requires a final
 recommendation and maps deterministically to the Bitbucket report result:
@@ -982,6 +1023,7 @@ Initial schema outline:
         "required": [
           "external_id",
           "annotation_type",
+          "finding_kind",
           "path",
           "line",
           "line_side",
@@ -996,6 +1038,7 @@ Initial schema outline:
         "properties": {
           "external_id": { "type": "string", "minLength": 1 },
           "annotation_type": { "type": "string", "enum": ["BUG", "VULNERABILITY", "CODE_SMELL"] },
+          "finding_kind": { "type": "string", "enum": ["general", "dead_code", "duplicate_code", "low_value_test"] },
           "path": { "type": "string", "minLength": 1 },
           "line": { "type": "integer", "minimum": 1 },
           "line_side": { "type": "string", "enum": ["NEW", "OLD"] },
@@ -1035,8 +1078,9 @@ Validation rules:
   counted even though its diff line starts with `---`.
 - After schema validation, discard annotations that do not target a changed line
   on their declared side. Inline-comment mode retains both sides. Report mode
-  retains only `NEW` because Code Insights is attached to the source commit and
-  Scout's current payload has no old-side anchor. Derive the final
+  retains `NEW` plus valid `OLD` dead-code findings for PR comments. Code Insights
+  is attached to the source commit, so annotation serialization excludes all
+  `OLD` locations. Derive the final
   recommendation, report details, and finding counts from the retained set; an
   empty retained set becomes an approval with no findings.
 - Reject invalid or incomplete provider output without salvaging partial stream
@@ -1120,14 +1164,28 @@ longer present in the validated output.
 Scout can also post selected findings as native Bitbucket PR comments. The
 configured `[comments].severities` list controls which annotation severities are
 included, using `CRITICAL`, `HIGH`, `MEDIUM`, and `LOW`. The default is
-`["CRITICAL"]`. An empty list disables comment posting. The legacy
+`["CRITICAL"]`. An empty list disables severity-selected comments. Each dead-code
+finding gets a separate bounded PR comment, including valid `OLD` findings that
+cannot be serialized as Code Insights annotations. They remain in the report
+counts and recommendation. Its identifying text and location precede long
+details, so another finding cannot consume its comment budget. Ordinary findings
+still use the severity-selected aggregate comment. The legacy
 `[comments].critical_enabled = false` setting is still accepted as shorthand for
-an empty severity list when `severities` is omitted. For a single selected
+an empty severity list when `severities` is omitted. For a single actual
 severity the comment starts with `Scout: {Severity} issue found by {provider}:`;
-for multiple selected severities it starts with `Scout: Issues found by
-{provider}:`. Scout does not deduplicate these comments; each completed review
-run may leave a new PR comment so reviewers retain history after Code Insights
-reports move to a new commit.
+for multiple actual severities it starts with `Scout: Issues found by
+{provider}:`. After each successful report-mode comment POST, Scout records a
+content fingerprint in the existing publication ledger, scoped by repository,
+PR, provider, output mode, and review run. Before any publication, Scout saves
+the validated, location-filtered review in SQLite. Both output modes reuse that
+review on a publication retry, including after restart, without running the
+provider again. The saved output keeps finding identities and wording stable,
+so the publication ledger can skip comments already posted by that run. A fresh
+review run generates new output and may post identical comments again. This
+transport retry protection is separate from the review model's out-of-scope
+discussion rule. As with inline publication, an ambiguous
+POST result or a crash before its success is recorded can still require manual
+reconciliation; local state alone cannot guarantee exactly-once HTTP delivery.
 
 Scout also supports `review.output_mode = "inline_comments"`. Its round,
 selection, and publication contracts are specified in
@@ -1242,6 +1300,7 @@ Job states:
 
 - `pending`
 - `running`
+- `reviewed` (inline result saved; round publication owns the next stage)
 - `publishing`
 - `succeeded`
 - `failed_retryable`
@@ -1270,6 +1329,34 @@ current report identity without queuing completed reviews again. This migration
 also repairs databases whose table layout was already upgraded. Current report
 and inline-comment identities remain unchanged. Recovery requeues interrupted
 work; a package upgrade alone does not invalidate completed reviews.
+
+Report-mode publication snapshots are stored in SQLite rather than the expiring provider run
+directory. Each snapshot retains the validated review, original source commit,
+rendered publication payloads, and audit metadata. Saving requires the current
+lease and review-run identity; an existing snapshot cannot be overwritten.
+A retry uses the saved payloads even if comment configuration or PR metadata has
+changed, so findings cannot acquire new wording or a newer commit label halfway
+through publication. Invalid saved data fails the job instead of regenerating
+output that could duplicate comments already posted. Snapshots are retained
+until the job is removed, cancelled, or moves to a new review run; ordinary
+artifact retention does not remove them. Provider cooldown and queue scheduling
+still apply to publication retries.
+
+Pre-existing saved inline publication snapshots finish the legacy immutable
+replay path, including its old-coordinate regular-comment fallback, without
+calling a provider again. New inline reviews always use rounds.
+
+Inline round results and selection plans use their separate durable records.
+Before sending their inline findings, Scout checks the current source and merge
+base. Stale locations remain unpublished and produce the snapshot-specific stale
+notice described above; they are not converted into full unanchored finding
+comments. Only a new requested review assesses the changed code after selection
+has started. Publication-only tasks do not require a provider slot or wait for a
+provider cooldown.
+
+The snapshot also retains the audit entry. A crash after saving the snapshot but
+before appending the JSONL log can omit that file entry; the review remains in
+SQLite. Publication replay does not append another provider-usage record.
 
 For explicit test runs, `scout --once --reset-state-db` deletes the configured
 SQLite database and WAL/SHM sidecars after acquiring the same runtime lock. This
@@ -1446,7 +1533,8 @@ Examples:
 - Git network, DNS, SSH, fetch, or missing commit failures during review:
   retryable with backoff. Setup validation should catch persistent repository
   URL or SSH key misconfiguration before the service is started.
-- Provider auth failure at startup: fail startup with an actionable error.
+- Provider auth failure at startup: fail startup in report mode; in inline
+  mode, record a cooldown and let rounds apply their provider recovery policy.
 - Provider quota/rate limit: mark provider cooldown.
 - Provider timeout: retryable with backoff.
 - Invalid JSON or schema-invalid output: retryable with backoff.
@@ -1458,8 +1546,10 @@ Examples:
 Retryable failures update the job timestamp and set a retry-after delay, which
 pushes that job behind other eligible queue work. Provider quota and rate-limit
 errors set a provider cooldown and defer that provider's jobs without consuming
-another attempt. Runtime PR jobs do not become permanent solely because they
-reached the configured attempt limit.
+another attempt. Report-mode PR jobs do not become permanent solely because
+they reached the configured attempt limit. Inline rounds finalize a provider as
+failed when its attempts or recovery window are exhausted, so its outage cannot
+prevent successful providers' results from being published.
 
 ## Observability
 

@@ -18,6 +18,10 @@ _MARKER_TEMPLATE = "<!-- scout-publication:{} -->"
 _INELIGIBLE = {"superseded", "cancelled", "review_failed"}
 
 
+class PublicationHalted(RuntimeError):
+    pass
+
+
 def author_ids(comment: dict) -> set:
     user = comment.get("user") or {}
     return {str(user[key]) for key in ("account_id", "uuid") if user.get(key)}
@@ -77,6 +81,7 @@ class InlinePublisher:
         self.bitbucket = bitbucket
         self.config = config
         self.identity: Optional[str] = None
+        self.current_identities = set()
         self.trusted_identities = set()
         self.halted = False
 
@@ -95,11 +100,12 @@ class InlinePublisher:
                 raise ConfigError("multi-provider inline reviews require bitbucket.bot_account_id or GET /user identity")
             LOG.warning("No immutable Bitbucket identity: inline deduplication and marker recovery disabled; retries may duplicate comments")
             return
+        self.current_identities = discovered | {self.identity}
         for identity in discovered | {self.identity}:
             self.state.remember_identity(identity, "discovered" if identity in discovered else "configured")
         self.trusted_identities = set(self.state.verified_identities())
         for intent in self.state.list_intents(statuses=["published"]):
-            if intent.get("error") == "post_author_mismatch" and intent.get("author_id") not in self.trusted_identities:
+            if intent.get("error") == "post_author_mismatch" and intent.get("author_id") not in self.current_identities:
                 raise ConfigError("publication {} has an unresolved POST author mismatch".format(intent["id"]))
 
     def history(self, round_record: dict, before_request=None) -> List[SelectionFinding]:
@@ -110,6 +116,10 @@ class InlinePublisher:
         except BitbucketError:
             LOG.warning("Comment eligibility unavailable for PR %s; retaining new findings", round_record["pr_id"])
             return []
+        self._record_marker_anomalies(round_record, comments)
+        for intent in self.state.list_intents(workspace=round_record["workspace"], repo_slug=round_record["repo_slug"],
+                                             pr_id=round_record["pr_id"], statuses=["published"]):
+            self._confirm(intent)
         known = {str(item["comment_id"]): item for item in self.state.history(round_record["workspace"], round_record["repo_slug"], round_record["pr_id"])}
         findings = []
         for comment in comments:
@@ -145,13 +155,27 @@ class InlinePublisher:
                 superseded.update((stored.get("metadata") or {}).get("supersedes", []))
         return [finding for finding in findings if finding.id not in superseded]
 
+    def _record_marker_anomalies(self, record: dict, comments: list) -> None:
+        intents = self.state.list_intents(workspace=record["workspace"], repo_slug=record["repo_slug"],
+                                          pr_id=record["pr_id"], statuses=["published", "cancelled"])
+        for intent in intents:
+            matches = {str(comment["id"]) for comment in comments
+                       if intent["marker"] in (comment.get("content") or {}).get("raw", "")
+                       and author_ids(comment) & self.trusted_identities}
+            if matches - {str(value) for value in intent["comment_ids"]}:
+                reason = "late_remote_comment" if intent["status"] == "cancelled" else "multiple_remote_comments"
+                self.state.record_anomaly(intent["id"], sorted(matches),
+                                          intent.get("error") if intent.get("error") == "post_author_mismatch" else reason)
+                LOG.error("Publication %s: %s (%s)", intent["id"], reason, sorted(matches))
+
     def close_pr(self, workspace: str, repo_slug: str, pr_id: int, before_request=None) -> None:
         """A closed PR gets one lookup, never a resend, before local retention ends."""
         self.reconcile({"workspace": workspace, "repo_slug": repo_slug, "pr_id": pr_id},
                        before_request, allow_resend=False)
         self.state.finish_closed_pr(workspace, repo_slug, pr_id)
 
-    def reconcile(self, round_record: dict, before_request=None, allow_resend: bool = True) -> bool:
+    def reconcile(self, round_record: dict, before_request=None, allow_resend: bool = True,
+                  current_snapshot: Optional[Callable] = None) -> bool:
         intents = self.state.list_intents(workspace=round_record["workspace"], repo_slug=round_record["repo_slug"], pr_id=round_record["pr_id"], statuses=["unknown", "sending"])
         if not intents:
             return True
@@ -161,6 +185,7 @@ class InlinePublisher:
                 comments = self.bitbucket.list_pull_request_comments(round_record["repo_slug"], round_record["pr_id"], before_request=before_request)
             except BitbucketError:
                 return False
+            self._record_marker_anomalies(round_record, comments)
         all_settled = True
         for intent in intents:
             if intent["status"] == "sending":
@@ -186,10 +211,20 @@ class InlinePublisher:
                 all_settled = False
                 continue
             owner = self.state.get_round(intent["round_id"])
-            if not owner or owner["status"] in _INELIGIBLE:
+            if not owner or owner["status"] in _INELIGIBLE or intent["stale"]:
                 # Absence after a timeout does not prove a superseded POST cannot arrive.
                 all_settled = False
                 continue
+            if intent["kind"] == "finding":
+                if current_snapshot is None:
+                    all_settled = False
+                    continue
+                snapshot = current_snapshot()
+                if snapshot.state != "OPEN" or snapshot.source_commit_hash != owner["source_commit_hash"] or snapshot.merge_base_hash != owner["merge_base_hash"]:
+                    self.state.transition_intent(intent["id"], intent["version"], "unknown",
+                                                 stale=True, error="unknown_post_stale_anchor")
+                    all_settled = False
+                    continue
             if intent["attempts"] >= self.config.queue.publication_max_attempts:
                 LOG.error("PR %s blocked by unresolved publication %s; operator resolution required", round_record["pr_id"], intent["id"])
                 all_settled = False
@@ -224,7 +259,10 @@ class InlinePublisher:
         record = self.state.get_round(round_id)
         if not record or record["status"] in _INELIGIBLE:
             return "cancelled"
-        if not self.reconcile(record, before_request):
+        if not self.reconcile(record, before_request, current_snapshot=current_snapshot):
+            unresolved = self.state.list_intents(round_id=round_id, statuses=["unknown"])
+            if any(intent["attempts"] >= self.config.queue.publication_max_attempts for intent in unresolved):
+                return "publication_failed"
             return "publishing"
         plan = self.state.get_plan(round_id)
         if plan is None:
@@ -259,25 +297,26 @@ class InlinePublisher:
         if not candidates:
             self._reserve(record, "clean_review", {"content": to_round_notice(record, "clean_review")}, "clean_review")
         snapshot_cache = [None, 0.0]
-        def fresh():
+        def snapshot():
             if snapshot_cache[0] is None or time.monotonic() - snapshot_cache[1] >= self.config.queue.publication_snapshot_cache_seconds:
                 snapshot_cache[:] = [current_snapshot(), time.monotonic()]
-            snapshot = snapshot_cache[0]
-            return snapshot.source_commit_hash == record["source_commit_hash"] and snapshot.merge_base_hash == record["merge_base_hash"]
-        status = self._deliver(record, lease_token, fresh, before_request)
+            return snapshot_cache[0]
+        status = self._deliver(record, lease_token, snapshot, before_request)
         if status != "completed":
             return status
         stale = sum(item["status"] == "stale_unpublished" for item in self.state.candidate_outcomes(round_id).values())
         if stale:
             self._reserve(record, "stale_notice", {"content": to_round_notice(record, "stale_notice", stale)}, "stale_notice")
-            status = self._deliver(record, lease_token, fresh, before_request)
+            status = self._deliver(record, lease_token, snapshot, before_request)
             return "completed_with_stale_findings" if status == "completed" else status
         return "completed"
 
-    def _deliver(self, record: dict, lease_token: str, fresh: Callable, before_request=None) -> str:
+    def _deliver(self, record: dict, lease_token: str, current_snapshot: Callable, before_request=None) -> str:
         intents = self.state.list_intents(round_id=record["id"])
         priority = {"coverage_notice": 0, "finding": 1, "clean_review": 2, "stale_notice": 3}
         for intent in sorted(intents, key=lambda item: (priority[item["kind"]], item["id"])):
+            if self.halted:
+                return "publication_failed"
             if intent["status"] == "published":
                 self._confirm(intent)
                 continue
@@ -291,7 +330,17 @@ class InlinePublisher:
             if current["status"] in _INELIGIBLE or current.get("lease_token") != lease_token:
                 return "cancelled"
             payload = intent["payload"]
-            if intent["kind"] == "finding" and not fresh():
+            snapshot = current_snapshot()
+            if self.halted:
+                return "publication_failed"
+            if snapshot.state != "OPEN":
+                return "cancelled"
+            fresh = snapshot.source_commit_hash == record["source_commit_hash"] and snapshot.merge_base_hash == record["merge_base_hash"]
+            if intent["kind"] == "finding" and not fresh:
+                if intent.get("uncertain"):
+                    self.state.transition_intent(intent["id"], intent["version"], "unknown",
+                                                 stale=True, error="unknown_post_stale_anchor")
+                    return "publishing"
                 cancelled = self.state.transition_intent(intent["id"], intent["version"], "cancelled", stale=True, error="stale_anchor", lease_token=lease_token)
                 if cancelled:
                     for candidate_id in [payload["finding"]["id"]] + payload.get("covers", []):
@@ -303,24 +352,33 @@ class InlinePublisher:
             if sending is None:
                 return "publishing"
             try:
+                def check_send():
+                    if self.halted:
+                        raise PublicationHalted("publication halted after a POST author mismatch")
+                    if before_request:
+                        before_request()
+                    if self.halted:
+                        raise PublicationHalted("publication halted after a POST author mismatch")
+                check_send()
                 if intent["kind"] == "finding":
-                    response = self.bitbucket.publish_inline_pull_request_comment(record["repo_slug"], record["pr_id"], payload["path"], payload["line"], payload["content"], line_side=payload["line_side"], before_request=before_request)
+                    response = self.bitbucket.publish_inline_pull_request_comment(record["repo_slug"], record["pr_id"], payload["path"], payload["line"], payload["content"], line_side=payload["line_side"], before_request=check_send)
                 else:
-                    response = self.bitbucket.publish_pull_request_comment(record["repo_slug"], record["pr_id"], payload["content"], before_request=before_request)
+                    response = self.bitbucket.publish_pull_request_comment(record["repo_slug"], record["pr_id"], payload["content"], before_request=check_send)
                 if not response or not isinstance(response.get("id"), int):
                     raise BitbucketError("Comment POST response missing created comment ID", retryable=True)
             except Exception as exc:
                 self.state.transition_intent(intent["id"], sending["version"], "unknown", error=str(exc))
                 LOG.warning("Publication %s has an unknown POST outcome: %s", intent["id"], exc)
-                return "publishing"
+                return "publication_failed" if self.halted else "publishing"
             identities = author_ids(response)
-            mismatch = bool(self.identity and self.identity not in identities)
+            mismatch = bool(self.identity and not identities & self.current_identities)
+            if mismatch:
+                self.halted = True
             confirmed = self.state.transition_intent(intent["id"], sending["version"], "published", comment_ids=[response["id"]],
                         author_id=sorted(identities)[0] if identities else None, error="post_author_mismatch" if mismatch else None)
             if confirmed:
                 self._confirm(confirmed)
             if mismatch:
-                self.halted = True
                 LOG.error("Comment %s created by unexpected author; publication halted", response["id"])
                 return "publication_failed"
             if confirmed is None:

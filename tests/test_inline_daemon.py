@@ -1,5 +1,6 @@
 import json
 import tempfile
+import threading
 import unittest
 from concurrent.futures import Future
 from dataclasses import asdict, replace
@@ -7,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from scout.bitbucket import BitbucketError
 from scout.config import parse_config
 from scout.daemon import ScoutDaemon
 from scout.models import PullRequest
@@ -32,7 +34,7 @@ class InlineBitbucket(FakeBitbucket):
     def list_open_pull_requests(self, repo):
         return list(self.prs)
 
-    def get_pull_request(self, repo, pr_id):
+    def get_pull_request(self, repo, pr_id, before_request=None):
         return next(pr for pr in self.prs if pr.pr_id == pr_id)
 
     def validate_repository(self, repo):
@@ -229,6 +231,198 @@ class InlineDaemonTests(unittest.TestCase):
         daemon.poll_once()
         self.assertEqual(self.round()["status"], "cancelled")
         self.assertEqual(len(daemon.state.inline.history("ws", "repo", 13)), 1)
+
+    def test_closed_inventory_reconciles_without_resend_and_prunes_history(self):
+        daemon = self.daemon
+        daemon.poll_once()
+        daemon.run_pending_jobs()
+        before = list(daemon.bitbucket.posts)
+        daemon.bitbucket.prs = []
+        daemon.poll_once()
+        self.assertEqual(daemon.bitbucket.posts, before)
+        self.assertEqual(daemon.state.inline.list_rounds(), [])
+        self.assertEqual(daemon.state.inline.history("ws", "repo", 13), [])
+
+    def test_closed_pr_fences_active_review_but_defers_pruning_until_worker_exit(self):
+        daemon = self.daemon
+        daemon.poll_once()
+        pool, futures = RecordingPool(), {}
+        daemon._schedule(pool, futures)
+        round_id = self.round()["id"]
+        daemon.bitbucket.prs = []
+        daemon.poll_once()
+        self.assertEqual(daemon.state.inline.get_round(round_id)["status"], "cancelled")
+        for function, args in pool.tasks:
+            function(*args)
+        self.assertEqual([len(provider.runs) for provider in daemon.providers.values()], [0, 0])
+        for future in futures:
+            future.set_result(None)
+        daemon.poll_once()
+        self.assertEqual(daemon.state.inline.list_rounds(), [])
+
+    def test_closed_pr_fences_active_publisher_before_lock_can_be_taken(self):
+        daemon = self.daemon
+        daemon.poll_once()
+        self.run_provider("codex")
+        self.run_provider("claude")
+        dispatcher = daemon._inline_dispatch()
+        lock = threading.Lock()
+        dispatcher.locks[("ws", "repo", 13)] = lock
+        lock.acquire()
+        daemon.bitbucket.prs = []
+        daemon.poll_once()
+        self.assertEqual(self.round()["status"], "cancelled")
+        self.assertEqual(daemon.bitbucket.posts, [])
+        lock.release()
+        daemon.poll_once()
+        self.assertEqual(daemon.state.inline.list_rounds(), [])
+
+    def test_merged_pr_cancels_publication_before_next_poll(self):
+        daemon = self.daemon
+        daemon.poll_once()
+        self.run_provider("codex")
+        self.run_provider("claude")
+        daemon.bitbucket.prs[0] = replace(daemon.bitbucket.prs[0], state="MERGED")
+        daemon.run_pending_jobs()
+        self.assertEqual(self.round()["status"], "cancelled")
+        self.assertEqual(daemon.bitbucket.posts, [])
+
+    def test_destination_movement_with_same_merge_base_keeps_inline_findings(self):
+        daemon = self.daemon
+        daemon.poll_once()
+        self.run_provider("codex")
+        self.run_provider("claude")
+        daemon.bitbucket.prs[0] = replace(daemon.bitbucket.prs[0], destination_commit_hash="e" * 40)
+        daemon.run_pending_jobs()
+        self.assertEqual(self.round()["status"], "completed")
+        self.assertEqual(len(daemon.bitbucket.posts), 2)
+
+    def test_publication_retry_uses_saved_results_and_plan(self):
+        daemon = self.daemon
+        daemon.poll_once()
+        daemon.bitbucket.fail = True
+        daemon.run_pending_jobs()
+        plan = daemon.state.inline.get_plan(self.round()["id"])
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(daemon.bitbucket.posts), 1)
+        daemon.bitbucket.fail = False
+        with daemon.state.connect() as conn:
+            conn.execute("update inline_rounds set retry_after=null")
+        daemon.run_pending_jobs()
+        self.assertEqual(self.round()["status"], "completed")
+        self.assertEqual(len(daemon.bitbucket.posts), 2)
+        self.assertEqual(daemon.state.inline.get_plan(self.round()["id"]), plan)
+        self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [1, 1])
+
+    def test_permanent_selector_error_falls_back_to_exact_plan(self):
+        daemon = self.daemon
+        self.enable_selection()
+        daemon.providers["codex"].classify_findings = lambda **kwargs: (_ for _ in ()).throw(ProviderError("bad credentials", retryable=False))
+        daemon.poll_once()
+        daemon.run_pending_jobs()
+        with daemon.state.connect() as conn:
+            conn.execute("update inline_rounds set retry_after=null")
+        daemon.run_pending_jobs()
+        self.assertEqual(self.round()["status"], "completed")
+        self.assertEqual(len(daemon.bitbucket.posts), 1)
+
+    def test_ready_publication_and_reviews_share_workers_fairly(self):
+        daemon = self.daemon
+        daemon.poll_once()
+        self.run_provider("codex")
+        self.run_provider("claude")
+        daemon.bitbucket.prs.append(replace(daemon.bitbucket.prs[0], pr_id=14))
+        daemon.poll_once()
+        pool, futures = RecordingPool(), {}
+        daemon._schedule(pool, futures)
+        self.assertEqual(len(pool.tasks), 2)
+        self.assertEqual(sum("round_id" in metadata for metadata in futures.values()), 1)
+        self.assertEqual(sum(metadata.get("id") is not None for metadata in futures.values()), 1)
+        # Run the recorded tasks so their reservations and PR lock are released.
+        for function, args in pool.tasks:
+            function(*args)
+
+    def test_finished_selector_does_not_keep_its_provider_slot_during_http(self):
+        daemon = self.daemon
+        daemon.provider_configs["codex"] = replace(daemon.provider_configs["codex"], max_parallel=1)
+        daemon.poll_once()
+        self.run_provider("codex")
+        self.run_provider("claude")
+        publishing_id = self.round()["id"]
+        daemon.bitbucket.prs.append(replace(daemon.bitbucket.prs[0], pr_id=14))
+        daemon.poll_once()
+        # Selection has released its reservation, but the publication worker is
+        # still using the other global worker for HTTP delivery.
+        futures = {Future(): {"round_id": publishing_id, "provider": "codex", "id": None}}
+        pool = RecordingPool()
+        daemon._schedule(pool, futures)
+        self.assertEqual(len(pool.tasks), 1)
+        function, args = pool.tasks[0]
+        self.assertEqual(args[0].provider, "codex")
+        self.assertEqual(args[0].pr_id, 14)
+        function(*args)
+
+    def save_legacy_snapshot(self):
+        daemon = self.daemon
+        pr = daemon.bitbucket.prs[0]
+        daemon.state.enqueue_or_update_pr(pr, "v1", "v1", "codex", output_mode="inline_comments")
+        job = daemon.state.claim_next_pending_job({"codex": 1200})
+        payload = {"version": 1, "source_commit": pr.source_commit_hash,
+                   "review": asdict(valid_review()), "review_log": {},
+                   "publication": {"report_id": "inline-comments", "destination_commit": pr.destination_commit_hash,
+                                   "no_findings_comment": None, "outdated_no_findings_comment": None,
+                                   "comments": [{"external_id": "finding-001", "path": "src/app.py", "line": 12,
+                                                 "line_side": "NEW", "content": "Immutable saved comment", "outdated_content": "Immutable outdated comment"}]}}
+        self.assertTrue(daemon.state.save_review_snapshot(job, payload))
+        daemon.state.mark_retryable_failure(job.id, "delivery interrupted", 3, job.lease_token, job.running_review_key, 0)
+        return job
+
+    def test_old_inline_saved_snapshot_replays_without_provider_even_in_cooldown(self):
+        daemon = self.daemon
+        job = self.save_legacy_snapshot()
+        daemon.state.mark_provider_cooldown("codex", "unavailable", 7200, "quota_exhausted")
+        daemon.poll_once()
+        daemon.run_pending_jobs()
+        self.assertEqual(daemon.state.get_job(job.id).status, "succeeded")
+        self.assertEqual(daemon.bitbucket.posts, ["Immutable saved comment"])
+        self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [0, 0])
+
+    def test_old_inline_snapshot_delivery_failure_retries_frozen_payload(self):
+        daemon = self.daemon
+        job = self.save_legacy_snapshot()
+        with patch.object(daemon.bitbucket, "publish_inline_pull_request_comment", side_effect=BitbucketError("unavailable", retryable=True)):
+            daemon.run_pending_jobs()
+        self.assertEqual(daemon.state.get_job(job.id).status, "failed_retryable")
+        self.assertEqual(daemon.bitbucket.posts, [])
+        with daemon.state.connect() as conn:
+            conn.execute("update review_jobs set leased_until=null where id=?", (job.id,))
+        daemon.run_pending_jobs()
+        self.assertEqual(daemon.state.get_job(job.id).status, "succeeded")
+        self.assertEqual(daemon.bitbucket.posts, ["Immutable saved comment"])
+        self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [0, 0])
+
+    def test_old_inline_saved_snapshot_does_not_reserve_review_capacity(self):
+        daemon = self.daemon
+        job = self.save_legacy_snapshot()
+        daemon.state.mark_provider_cooldown("codex", "unavailable", 7200, "quota_exhausted")
+        daemon.poll_once()
+        self.assertEqual(daemon.state.inline.list_rounds(), [])
+        # With reviews preferred and no cooldown, replay still belongs to the
+        # publication class and must not reserve the model provider.
+        with daemon.state.connect() as conn:
+            conn.execute("delete from provider_state")
+        daemon._prefer_publication = False
+        pool, futures = RecordingPool(), {}
+        daemon._schedule(pool, futures)
+        self.assertEqual(len(pool.tasks), 1)
+        self.assertEqual(next(iter(futures.values()))["provider"], "")
+        for _ in range(daemon.provider_configs["codex"].max_parallel):
+            self.assertTrue(daemon._acquire_provider_slot("codex", blocking=False))
+        for function, args in pool.tasks:
+            function(*args)
+        self.assertEqual(daemon.state.get_job(job.id).status, "succeeded")
+        self.assertEqual(daemon.bitbucket.posts, ["Immutable saved comment"])
+        self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [0, 0])
 
     def test_startup_unavailable_provider_does_not_abort_inline_reviews(self):
         daemon = self.daemon

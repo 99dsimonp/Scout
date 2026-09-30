@@ -4,14 +4,141 @@ import tempfile
 import threading
 import unittest
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import scout.state as state_module
 from scout.models import PullRequest, review_key
-from scout.state import StateStore
+from scout.state import ReviewSnapshotError, StateStore
 
 
 class StateTests(unittest.TestCase):
+    def test_review_snapshot_is_immutable_and_fenced_to_current_lease_and_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            pr = PullRequest("ws", "repo", 1, "PR", "", "feature", "a" * 40, "main")
+            store.enqueue_or_update_pr(pr, "v1", "v1", "codex")
+            job = store.claim_next_pending_job({"codex": 1200})
+            snapshot = {"version": 1, "source_commit": "a" * 40, "review": {"details": "original"}}
+            self.assertFalse(store.save_review_snapshot(replace(job, lease_token="stale"), snapshot))
+            self.assertTrue(store.save_review_snapshot(job, snapshot))
+            self.assertFalse(store.save_review_snapshot(job, {"version": 1, "review": "replacement"}))
+            self.assertEqual(store.load_review_snapshot(job), snapshot)
+            for other_job in (
+                replace(job, provider="claude"),
+                replace(job, output_mode="inline_comments"),
+                replace(job, running_review_run_id="fresh-review-run"),
+                replace(job, running_review_key="changed-review-key"),
+            ):
+                with self.subTest(job=other_job):
+                    self.assertIsNone(store.load_review_snapshot(other_job))
+                    self.assertFalse(store.save_review_snapshot(other_job, snapshot))
+            store.mark_retryable_failure(job.id, "temporary", 3, lease_token=job.lease_token)
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            retry = store.claim_next_pending_job({"codex": 1200})
+            self.assertNotEqual(retry.lease_token, job.lease_token)
+            self.assertEqual(store.load_review_snapshot(retry), snapshot)
+            self.assertFalse(store.save_review_snapshot(job, snapshot))
+            store.mark_publishing(retry, 1200)
+            store.mark_success(retry, "report")
+            store.initialize()
+            self.assertEqual(store.load_review_snapshot(retry), snapshot)
+
+    def test_review_snapshot_rejects_expired_and_superseded_owners(self):
+        for update in ("leased_until='2000-01-01T00:00:00+00:00'", "superseded=1", "status='publishing'"):
+            with self.subTest(update=update), tempfile.TemporaryDirectory() as tmp:
+                store = StateStore(tmp + "/state.db")
+                store.initialize()
+                pr = PullRequest("ws", "repo", 1, "PR", "", "feature", "a" * 40, "main")
+                store.enqueue_or_update_pr(pr, "v1", "v1", "codex")
+                job = store.claim_next_pending_job({"codex": 1200})
+                with store.connect() as conn:
+                    conn.execute("update review_jobs set " + update + " where id=?", (job.id,))
+                self.assertFalse(store.save_review_snapshot(job, {"version": 1}))
+                self.assertIsNone(store.load_review_snapshot(job))
+
+    def test_review_snapshot_cleanup_follows_review_job_lifecycle(self):
+        for action in ("new_commit", "forced_run", "closed", "ignored", "disabled", "ignored_success", "disabled_success"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as tmp:
+                store = StateStore(tmp + "/state.db")
+                store.initialize()
+                pr = PullRequest("ws", "repo", 1, "PR", "", "feature", "a" * 40, "main")
+                store.enqueue_or_update_pr(pr, "v1", "v1", "codex")
+                job = store.claim_next_pending_job({"codex": 1200})
+                self.assertTrue(store.save_review_snapshot(job, {"version": 1}))
+                if action.endswith("_success"):
+                    store.mark_publishing(job, 1200)
+                    store.mark_success(job, "report")
+                    action = action.removesuffix("_success")
+                if action in ("new_commit", "forced_run", "closed"):
+                    store.mark_retryable_failure(job.id, "temporary", 3, lease_token=job.lease_token)
+                if action == "new_commit":
+                    store.enqueue_or_update_pr(replace(pr, source_commit_hash="b" * 40), "v1", "v1", "codex")
+                elif action == "forced_run":
+                    store.force_enqueue_pr_review(pr, "v1", "v1", "codex")
+                elif action == "closed":
+                    store.prune_closed_pull_requests("ws", "repo", [])
+                elif action == "ignored":
+                    store.prune_ignored_pull_requests("ws", "repo", [1])
+                else:
+                    store.upsert_repository("ws", "repo", "ssh://repo", enabled=False)
+                with store.connect() as conn:
+                    self.assertEqual(conn.execute("select count(*) from review_publication_snapshots").fetchone()[0], 0)
+
+    def test_snapshot_retry_keeps_original_inline_source_for_both_claim_paths(self):
+        for claim_many in (False, True):
+            with self.subTest(claim_many=claim_many), tempfile.TemporaryDirectory() as tmp:
+                store = StateStore(tmp + "/state.db")
+                store.initialize()
+                pr = PullRequest("ws", "repo", 1, "PR", "", "feature", "a" * 40, "main")
+                store.enqueue_or_update_pr(pr, "v1", "v1", "codex", output_mode="inline_comments")
+                job = store.claim_next_pending_job({"codex": 1200})
+                store.save_review_snapshot(job, {"version": 1})
+                store.mark_retryable_failure(job.id, "temporary", 3, lease_token=job.lease_token)
+                store.enqueue_or_update_pr(replace(pr, source_commit_hash="b" * 40), "v1", "v1", "codex", output_mode="inline_comments")
+                retry = store.claim_pending_jobs(1, 1200)[0] if claim_many else store.claim_next_pending_job({"codex": 1200})
+                self.assertEqual(retry.target_source_commit_hash, "b" * 40)
+                self.assertEqual(retry.running_source_commit_hash, "a" * 40)
+                self.assertEqual(store.load_review_snapshot(retry), {"version": 1})
+
+    def test_review_snapshot_checksum_rejects_changed_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            pr = PullRequest("ws", "repo", 1, "PR", "", "feature", "a" * 40, "main")
+            store.enqueue_or_update_pr(pr, "v1", "v1", "codex")
+            job = store.claim_next_pending_job({"codex": 1200})
+            store.save_review_snapshot(job, {"version": 1})
+            with store.connect() as conn:
+                conn.execute("update review_publication_snapshots set payload='{}'")
+            with self.assertRaisesRegex(ReviewSnapshotError, "checksum mismatch"):
+                store.load_review_snapshot(job)
+
+    def test_comment_publication_ledger_keeps_provider_mode_and_review_run_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            pr = PullRequest("ws", "repo", 1, "PR", "", "feature", "a" * 40, "main")
+            store.enqueue_or_update_pr(pr, "v1", "v1", "codex", output_mode="reports")
+            job = store.claim_next_pending_job({"codex": 1200})
+            comment_id = "report-comment-body-fingerprint"
+            self.assertFalse(store.inline_comment_published(job, comment_id))
+            store.mark_inline_comment_published(job, comment_id)
+            self.assertTrue(store.inline_comment_published(job, comment_id))
+            for other_job in (
+                replace(job, provider="claude"),
+                replace(job, output_mode="inline_comments"),
+                replace(job, running_review_run_id="fresh-review-run"),
+                replace(job, workspace="other-workspace"),
+                replace(job, repo_slug="other-repository"),
+                replace(job, pr_id=2),
+            ):
+                with self.subTest(job=other_job):
+                    self.assertFalse(store.inline_comment_published(other_job, comment_id))
+            self.assertFalse(store.inline_comment_published(job, "changed-body-fingerprint"))
+
     def test_legacy_report_history_survives_repeated_upgrades(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(tmp + "/state.db")
