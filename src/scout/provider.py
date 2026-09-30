@@ -5,9 +5,10 @@ import os
 import re
 import signal
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 
 DEFAULT_PROVIDER_COOLDOWN_SECONDS = 5 * 60 * 60
@@ -81,6 +82,62 @@ def terminate_process_group(proc: subprocess.Popen) -> None:
             os.killpg(proc.pid, signal.SIGKILL)
         except Exception:
             pass
+        proc.wait()
+
+
+def run_selection_command(
+    provider: str,
+    cmd: list,
+    prompt_file: Path,
+    run_dir: str,
+    env: dict,
+    timeout_seconds: int,
+    is_superseded: Callable[[], bool],
+    output_file: Optional[Path] = None,
+) -> str:
+    stdout_file = Path(run_dir) / "{}-selection-stdout.log".format(provider)
+    stderr_file = Path(run_dir) / "{}-selection-stderr.log".format(provider)
+    timed_out = False
+    with prompt_file.open("r", encoding="utf-8") as prompt_input, \
+        stdout_file.open("w", encoding="utf-8") as stdout, \
+        stderr_file.open("w", encoding="utf-8") as stderr:
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=prompt_input, stdout=stdout, stderr=stderr,
+                cwd=run_dir, text=True, env=env, start_new_session=True,
+            )
+        except OSError as exc:
+            raise ProviderError("{} selection could not start: {}".format(provider, exc)) from exc
+        started = time.monotonic()
+        try:
+            while proc.poll() is None:
+                if is_superseded():
+                    raise ProviderSuperseded("finding selection superseded")
+                if time.monotonic() - started > timeout_seconds:
+                    timed_out = True
+                    break
+                time.sleep(0.1)
+        finally:
+            if proc.poll() is None:
+                terminate_process_group(proc)
+
+    stdout_text = read_text(stdout_file)
+    stderr_text = read_text(stderr_file)
+    final_message = read_text(output_file) if output_file is not None else stdout_text
+    cooldown_seconds = provider_quota_cooldown_seconds(provider, stdout_text, stderr_text, final_message)
+    error = None
+    if timed_out:
+        error = "{} selection timed out after {} seconds".format(provider, timeout_seconds)
+    elif proc.returncode != 0:
+        error = "{} selection exited with status {}: {}".format(provider, proc.returncode, stderr_text[:1000])
+    elif not final_message.strip():
+        error = "{} selection did not write a final message".format(provider)
+    if error:
+        raise ProviderError(
+            error, cooldown_seconds=cooldown_seconds,
+            provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
+        )
+    return final_message
 
 
 def read_text(path: Path) -> str:

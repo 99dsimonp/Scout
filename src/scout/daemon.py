@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from collections import Counter
+from dataclasses import asdict
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,6 +80,11 @@ class ScoutDaemon:
         )
         if request_comments_provider and request_comments_provider not in runtime_provider_names:
             runtime_provider_names.append(request_comments_provider)
+        deduplication = getattr(config.review, "deduplication", None)
+        if request_comments_provider and getattr(deduplication, "enabled", True):
+            selection_provider = getattr(deduplication, "provider", request_comments_provider)
+            if selection_provider not in runtime_provider_names:
+                runtime_provider_names.append(selection_provider)
         self.provider_configs = {
             provider: _provider_config(config, provider)
             for provider in runtime_provider_names
@@ -87,10 +93,7 @@ class ScoutDaemon:
             provider: _provider_runner(config, credentials, provider)
             for provider in runtime_provider_names
         }
-        self.max_parallel_reviews = min(
-            config.queue.max_parallel_reviews,
-            sum(self.provider_configs[provider].max_parallel for provider in self.provider_names),
-        )
+        self.max_parallel_reviews = config.queue.max_parallel_reviews
         self.clone_urls: Dict[str, str] = {
             repo.slug: repo.clone_url for repo in config.bitbucket.repositories
         }
@@ -118,14 +121,25 @@ class ScoutDaemon:
         recovered = self.state.recover_abandoned_jobs()
         if recovered:
             LOG.info("recovered abandoned active review jobs count=%s", recovered)
+        if getattr(getattr(self.config, "review", None), "output_mode", "reports") == "inline_comments":
+            self._inline_dispatch().publisher.initialize_identity()
         self.cleanup_old_artifacts()
 
     def validate_startup(self) -> None:
         for repo in self.config.bitbucket.repositories:
             self.bitbucket.validate_repository(repo.slug)
             self.git.validate_clone_url(repo.clone_url)
-        for provider in self.providers.values():
-            provider.validate_startup()
+        for name, provider in self.providers.items():
+            try:
+                provider.validate_startup()
+            except ProviderError as exc:
+                if getattr(self.config.review, "output_mode", "reports") != "inline_comments":
+                    raise
+                LOG.warning("inline review provider unavailable at startup provider=%s error=%s", name, exc)
+                self.state.mark_provider_cooldown(
+                    name, str(exc), getattr(exc, "cooldown_seconds", None) or _retry_backoff_seconds(self.config),
+                    PROVIDER_COOLDOWN_STATUS,
+                )
 
     def run_forever(self) -> None:
         with RuntimeLock(self.config.service.state_dir):
@@ -141,7 +155,7 @@ class ScoutDaemon:
                         if not futures:
                             self.cleanup_old_artifacts()
                     self._schedule(pool, futures)
-                    wait_timeout = _seconds_until_next_poll(next_poll_at, time.monotonic())
+                    wait_timeout = min(5.0, _seconds_until_next_poll(next_poll_at, time.monotonic()))
                     if futures:
                         done, _ = wait(list(futures), timeout=wait_timeout, return_when=FIRST_COMPLETED)
                         _reap_worker_futures(done, futures)
@@ -162,6 +176,7 @@ class ScoutDaemon:
             while futures:
                 done, _ = wait(list(futures), return_when=FIRST_COMPLETED)
                 _reap_worker_futures(done, futures)
+                self._schedule(pool, futures)
 
     def poll_once(self) -> None:
         if not self.config.polling.enabled:
@@ -175,6 +190,7 @@ class ScoutDaemon:
             except BitbucketError as exc:
                 LOG.error("Bitbucket poll failed repo=%s retryable=%s error=%s", repo.slug, exc.retryable, exc)
                 continue
+            all_open_pr_ids = [pr.pr_id for pr in prs]
             ignored_pr_ids = [pr.pr_id for pr in prs if self._is_ignored_source_branch(repo, pr.source_branch)]
             if ignored_pr_ids:
                 ignored_set = set(ignored_pr_ids)
@@ -241,7 +257,7 @@ class ScoutDaemon:
                 pruned = self.state.prune_closed_pull_requests(
                     self.config.bitbucket.workspace,
                     repo.slug,
-                    [pr.pr_id for pr in prs],
+                    all_open_pr_ids,
                 )
                 if pruned:
                     LOG.info(
@@ -253,6 +269,14 @@ class ScoutDaemon:
             for pr in prs:
                 policy_version = self.config.review.policy_version
                 schema_version = "v1"
+                if output_mode == "inline_comments":
+                    try:
+                        self._queue_inline_round(pr, policy_version, schema_version)
+                    except GitError as exc:
+                        LOG.warning("cannot resolve inline snapshot repo=%s pr=%s error=%s", pr.repo_slug, pr.pr_id, exc)
+                        continue
+                    self._process_review_request_comments(pr, policy_version, schema_version, output_mode)
+                    continue
                 for provider in self.provider_names:
                     if (
                         output_mode == "reports"
@@ -364,30 +388,40 @@ class ScoutDaemon:
                 )
                 continue
 
-            for provider in self.provider_names:
-                queued = self.state.force_enqueue_pr_review(
-                    pr,
-                    policy_version,
-                    schema_version,
-                    provider,
-                    output_mode=output_mode,
+            try:
+                snapshot = self._resolve_inline_snapshot(pr)
+                self.state.inline.create_round(
+                    snapshot, self.provider_names, policy_version, schema_version,
+                    trigger="request", request_comment=(comment_id, updated_on),
                 )
-                if queued:
-                    LOG.info(
-                        "queued review from Scout mention provider=%s repo=%s pr=%s comment=%s",
-                        provider,
-                        pr.repo_slug,
-                        pr.pr_id,
-                        comment_id,
-                    )
-            self.state.mark_pull_request_comment_processed(
-                pr.workspace,
-                pr.repo_slug,
-                pr.pr_id,
-                comment_id,
-                updated_on,
-                True,
-            )
+            except GitError as exc:
+                LOG.warning("cannot resolve requested inline snapshot repo=%s pr=%s error=%s", pr.repo_slug, pr.pr_id, exc)
+
+    def _resolve_inline_snapshot(self, pr: PullRequest) -> PullRequest:
+        mirror = self.git.ensure_mirror(pr.workspace, pr.repo_slug, self.clone_urls[pr.repo_slug])
+        return self.git.resolve_review_snapshot(mirror, pr)
+
+    def _queue_inline_round(self, pr: PullRequest, policy_version: str, schema_version: str) -> None:
+        rounds = self.state.inline.list_rounds(workspace=pr.workspace, repo_slug=pr.repo_slug, pr_id=pr.pr_id)
+        reviewing = next((item for item in rounds if item["status"] == "reviewing"), None)
+        if reviewing is not None:
+            if reviewing["source_commit_hash"] != pr.source_commit_hash:
+                self.state.inline.create_round(
+                    self._resolve_inline_snapshot(pr), reviewing["providers"],
+                    reviewing["policy_version"], reviewing["schema_version"],
+                    trigger="replacement", replace_round_id=reviewing["id"],
+                    expected_version=reviewing["version"],
+                )
+            return
+        if rounds:
+            return
+        self.state.inline.create_round(self._resolve_inline_snapshot(pr), self.provider_names, policy_version, schema_version)
+
+    def _inline_dispatch(self):
+        if not hasattr(self, "_inline_dispatcher"):
+            from .inline_dispatch import InlineDispatch
+            self._inline_dispatcher = InlineDispatch(self)
+        return self._inline_dispatcher
 
     def _classify_review_request_comment(
         self,
@@ -523,7 +557,10 @@ class ScoutDaemon:
         )
         return True
 
-    def run_job(self, job: ReviewJob) -> None:
+    def _run_reserved_job(self, job: ReviewJob) -> None:
+        self.run_job(job, provider_reserved=True)
+
+    def run_job(self, job: ReviewJob, provider_reserved: bool = False) -> None:
         stop = threading.Event()
         lease_lost = threading.Event()
         lease_seconds = self._lease_seconds(job.provider)
@@ -564,6 +601,8 @@ class ScoutDaemon:
 
         if not renew():
             self.state.return_superseded_to_pending(job.id, job.lease_token)
+            if provider_reserved:
+                self._release_provider_slot(job.provider)
             return
 
         def heartbeat() -> None:
@@ -575,13 +614,16 @@ class ScoutDaemon:
         # a provider starts polling for supersession.
         worker = threading.Thread(target=heartbeat, name="review-lease-{}".format(job.id), daemon=True)
         worker.start()
+        reservation = {"held": provider_reserved}
         try:
-            self._run_job(job, is_lease_lost)
+            self._run_job(job, is_lease_lost, reservation)
         finally:
+            if reservation["held"]:
+                self._release_provider_slot(job.provider)
             stop.set()
             worker.join()
 
-    def _run_job(self, job: ReviewJob, is_lease_lost: Callable[[], bool]) -> None:
+    def _run_job(self, job: ReviewJob, is_lease_lost: Callable[[], bool], reservation: dict) -> None:
         def is_superseded() -> bool:
             return is_lease_lost() or self.state.is_job_superseded(job.id, job.lease_token)
 
@@ -590,6 +632,7 @@ class ScoutDaemon:
         provider_runner = self.providers[job.provider]
         cooldown_until = self.state.get_active_provider_cooldown(job.provider)
         if cooldown_until is not None:
+            self._record_inline_failure(job, ProviderError("provider cooldown"))
             LOG.info("provider cooldown active provider=%s until=%s job=%s", job.provider, cooldown_until, job.id)
             deferred = self.state.defer_job_for_provider_cooldown(
                 job.id,
@@ -674,6 +717,9 @@ class ScoutDaemon:
                 context = self.git.prepare_context(mirror, worktree, pr)
             if is_superseded():
                 raise ProviderSuperseded("review superseded during context preparation")
+            if reservation["held"]:
+                self._release_provider_slot(job.provider)
+                reservation["held"] = False
             risk = self._risk_for_job(job, source_commit, is_superseded)
             effective_max_per_lens = effective_subagent_max_per_lens(
                 provider_config.subagent_max_per_lens,
@@ -709,7 +755,10 @@ class ScoutDaemon:
                 )
             prompt = build_provider_prompt(job.provider, context, self.config.review.schema_path, review_plan)
             run_dir = str(Path(self.config.service.state_dir) / "runs" / str(job.id))
-            self._acquire_provider_slot(job.provider, blocking=True)
+            if not self._acquire_provider_slot(job.provider, blocking=False):
+                self.state.release_unstarted_job(job)
+                return
+            reservation["held"] = True
             try:
                 if is_superseded():
                     raise ProviderSuperseded("review superseded while waiting for provider capacity")
@@ -727,6 +776,7 @@ class ScoutDaemon:
                 result = provider_runner.run(**provider_run_args)
             finally:
                 self._release_provider_slot(job.provider)
+                reservation["held"] = False
             _append_provider_usage_log_entry(
                 self.config.service.state_dir,
                 _provider_usage_log_entry(
@@ -780,7 +830,7 @@ class ScoutDaemon:
                         annotation["line"],
                         annotation["line_side"],
                     )
-            if not self.state.mark_publishing(job, self._lease_seconds(job.provider)):
+            if output_mode != "inline_comments" and not self.state.mark_publishing(job, self._lease_seconds(job.provider)):
                 raise ProviderSuperseded("review superseded before publish")
             review_log_path = _append_review_log_entry(
                 self.config.service.state_dir,
@@ -801,52 +851,9 @@ class ScoutDaemon:
                 job.pr_id,
             )
             if output_mode == "inline_comments":
-                report_id = "inline-comments"
-                review_run_id = job.running_review_run_id or job.target_review_run_id
-                no_findings_comment = to_no_findings_pr_comment(validated, provider=job.provider)
-                if no_findings_comment and not self.state.inline_comment_published(
-                    job,
-                    _NO_FINDINGS_INLINE_COMMENT_ID,
-                ):
-                    if _pull_request_comment_exists(
-                        self.bitbucket,
-                        job.repo_slug,
-                        job.pr_id,
-                        no_findings_comment,
-                        before_request=lambda: self._renew_publish_or_superseded(job),
-                    ):
-                        self.state.mark_inline_comment_published(job, _NO_FINDINGS_INLINE_COMMENT_ID)
-                    else:
-                        if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
-                            raise ProviderSuperseded("review superseded before no-findings comment publish")
-                        self.bitbucket.publish_pull_request_comment(
-                            job.repo_slug,
-                            job.pr_id,
-                            no_findings_comment,
-                            before_request=lambda: self._renew_publish_or_superseded(job),
-                        )
-                        self.state.mark_inline_comment_published(job, _NO_FINDINGS_INLINE_COMMENT_ID)
-                for comment in to_inline_pr_comments(
-                    validated,
-                    provider=job.provider,
-                    source_commit=source_commit,
-                    review_run_id=review_run_id,
-                ):
-                    external_id = comment["external_id"]
-                    if self.state.inline_comment_published(job, external_id):
-                        continue
-                    if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
-                        raise ProviderSuperseded("review superseded before inline comment publish")
-                    self.bitbucket.publish_inline_pull_request_comment(
-                        job.repo_slug,
-                        job.pr_id,
-                        comment["path"],
-                        comment["line"],
-                        comment["content"],
-                        line_side=comment["line_side"],
-                        before_request=lambda: self._renew_publish_or_superseded(job),
-                    )
-                    self.state.mark_inline_comment_published(job, external_id)
+                if not self.state.inline.save_result(job, asdict(validated)):
+                    raise ProviderSuperseded("inline round no longer accepts this result")
+                return
             else:
                 report_id = self.config.reports.report_id_for(job.provider)
                 report_title = self.config.reports.title_for(job.provider)
@@ -936,6 +943,8 @@ class ScoutDaemon:
             if self.state.is_job_superseded(job.id, job.lease_token):
                 self.state.return_superseded_to_pending(job.id, job.lease_token)
                 return
+            if self._record_inline_failure(job, exc):
+                return
             if isinstance(exc, ProviderError) and provider_cooldown_seconds:
                 marked = self.state.defer_job_for_provider_cooldown(
                     job.id,
@@ -958,6 +967,8 @@ class ScoutDaemon:
             LOG.exception("review job failed unexpectedly id=%s", job.id)
             if self.state.is_job_superseded(job.id, job.lease_token):
                 self.state.return_superseded_to_pending(job.id, job.lease_token)
+                return
+            if self._record_inline_failure(job, exc):
                 return
             marked = self.state.mark_retryable_failure(
                 job.id,
@@ -985,31 +996,72 @@ class ScoutDaemon:
                 except Exception as exc:
                     LOG.warning("failed to remove worktree path=%s error=%s", worktree, exc)
 
+    def _record_inline_failure(self, job: ReviewJob, error: Exception) -> bool:
+        if job.output_mode != "inline_comments":
+            return False
+        round_ = self.state.inline.round_for_job(job)
+        if round_ is None:
+            return True
+        self.state.inline.start_provider_recovery(
+            round_["id"], job.provider,
+            getattr(self.config.queue, "max_provider_recovery_seconds", 3600),
+        )
+        if not getattr(error, "retryable", True) or job.attempts >= self.config.queue.max_attempts:
+            self.state.inline.fail_provider(round_["id"], job.provider, str(error))
+            return True
+        return False
+
     def _schedule(self, pool: ThreadPoolExecutor, futures: dict) -> None:
+        inline = getattr(getattr(self.config, "review", None), "output_mode", "reports") == "inline_comments"
+        if inline:
+            self._inline_dispatch().maintain()
         capacity = self.max_parallel_reviews - len(futures)
-        running_by_provider = Counter(_future_provider(metadata) for metadata in futures.values())
         while capacity > 0:
-            lease_seconds_by_provider = {}
-            for provider in self.provider_names:
-                provider_capacity = self.provider_configs[provider].max_parallel - running_by_provider[provider]
-                if provider_capacity > 0:
-                    lease_seconds_by_provider[provider] = self._lease_seconds(provider)
-            if not lease_seconds_by_provider:
+            dispatched = False
+            prefer_publication = getattr(self, "_prefer_publication", True)
+            for publication in (prefer_publication, not prefer_publication):
+                if publication:
+                    if inline:
+                        dispatched = self._inline_dispatch().schedule(pool, futures)
+                else:
+                    dispatched = self._schedule_review(pool, futures)
+                if dispatched:
+                    self._prefer_publication = not publication
+                    break
+            if not dispatched:
                 return
-            # A worker can still be cleaning up after its row becomes pending,
-            # or after a failed heartbeat. Keep its workspace exclusive until it exits.
+            capacity -= 1
+
+    def _schedule_review(self, pool: ThreadPoolExecutor, futures: dict) -> bool:
+        running = Counter(_future_provider(item) for item in futures.values())
+        reservations = {}
+        for provider in self.provider_names:
+            if running[provider] >= self.provider_configs[provider].max_parallel:
+                continue
+            if self.state.get_active_provider_cooldown(provider) is not None:
+                continue
+            if self._acquire_provider_slot(provider, blocking=False):
+                reservations[provider] = self._lease_seconds(provider)
+        if not reservations:
+            return False
+        job = None
+        try:
             job = self.state.claim_next_pending_job(
-                lease_seconds_by_provider,
-                excluded_job_ids=[_future_job_id(metadata) for metadata in futures.values()],
+                reservations,
+                excluded_job_ids=[_future_job_id(item) for item in futures.values()],
             )
             if job is None:
-                return
-            futures[pool.submit(self.run_job, job)] = {
-                "id": job.id,
-                "provider": job.provider,
-            }
-            running_by_provider[job.provider] += 1
-            capacity -= 1
+                return False
+            # Old pending inline jobs are adopted by poll_once before execution.
+            if job.output_mode == "inline_comments" and self.state.inline.round_for_job(job) is None:
+                self.state.release_unstarted_job(job)
+                return False
+            futures[pool.submit(self._run_reserved_job, job)] = {"id": job.id, "provider": job.provider}
+            return True
+        finally:
+            for provider in reservations:
+                if job is None or provider != job.provider:
+                    self._release_provider_slot(provider)
 
     def _renew_publish_or_superseded(self, job: ReviewJob) -> None:
         if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
@@ -1029,7 +1081,9 @@ class ScoutDaemon:
             if lock is None:
                 lock = threading.Lock()
                 self._risk_cache_locks[key] = lock
-        with lock:
+        if not lock.acquire(blocking=False):
+            return DEFAULT_RISK
+        try:
             with self._risk_cache_guard:
                 cached = self._risk_cache.get(key)
                 if cached is not None:
@@ -1044,6 +1098,8 @@ class ScoutDaemon:
                 self._risk_cache[key] = risk
                 self._risk_cache_locks.pop(key, None)
             return risk
+        finally:
+            lock.release()
 
     def _ensure_risk_cache(self) -> None:
         if not hasattr(self, "_risk_cache"):

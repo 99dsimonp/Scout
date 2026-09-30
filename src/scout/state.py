@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence
 
 from .models import PullRequest, legacy_report_review_key, review_key
+from .inline_state import InlineState
 
 
 def utcnow() -> str:
@@ -48,6 +49,7 @@ class ReviewJob:
 class StateStore:
     def __init__(self, path: str):
         self.path = path
+        self.inline = InlineState(self)
 
     def initialize(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
@@ -169,6 +171,7 @@ class StateStore:
             self._migrate_review_jobs_output_mode_unique(conn)
             self._migrate_failed_permanent_jobs(conn)
             self._migrate_legacy_report_review_keys(conn)
+            self.inline.initialize(conn)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -204,6 +207,8 @@ class StateStore:
                 (workspace, repo_slug, clone_url, enabled_value),
             )
             if not enabled:
+                for row in conn.execute("select distinct pr_id from inline_rounds where workspace=? and repo_slug=?", (workspace, repo_slug)).fetchall():
+                    self.inline.cancel_pr(conn, workspace, repo_slug, row["pr_id"], "Repository review is disabled")
                 conn.execute(
                     """
                     delete from review_jobs
@@ -893,24 +898,8 @@ class StateStore:
         reason = ignore_reason or "PR source branch is ignored by repository configuration"
         with self.connect() as conn:
             conn.execute("begin immediate")
-            conn.execute(
-                """
-                delete from processed_pr_comments
-                where workspace=?
-                  and repo_slug=?
-                  and {}
-                """.format(ignored_filter),
-                (workspace, repo_slug, *params),
-            )
-            conn.execute(
-                """
-                delete from inline_comment_publications
-                where workspace=?
-                  and repo_slug=?
-                  and {}
-                """.format(ignored_filter),
-                (workspace, repo_slug, *params),
-            )
+            for pr_id in ignored_ids:
+                self.inline.cancel_pr(conn, workspace, repo_slug, pr_id, reason)
             conn.execute(
                 """
                 delete from report_bootstrap_attempts
@@ -1406,6 +1395,17 @@ class StateStore:
             or job.running_review_key != job.target_review_key
             or job.running_review_run_id != job.target_review_run_id
         )
+
+    def release_unstarted_job(self, job: ReviewJob) -> bool:
+        with self.connect() as conn:
+            return conn.execute(
+                """update review_jobs set status='pending',attempts=max(0,attempts-1),
+                  lease_token=null,leased_until=null,running_review_run_id=null,
+                  running_review_key=null,running_source_commit_hash=null,updated_at=?
+                where id=? and status='running' and lease_token=? and superseded=0
+                  and target_review_run_id=? and running_review_run_id=?""",
+                (utcnow(), job.id, job.lease_token, job.running_review_run_id, job.running_review_run_id),
+            ).rowcount == 1
 
     def mark_publishing(self, job: ReviewJob, lease_seconds: int) -> bool:
         now = utcnow()

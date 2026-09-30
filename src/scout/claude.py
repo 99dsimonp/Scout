@@ -25,6 +25,7 @@ from .provider import (
     provider_quota_cooldown_seconds,
     read_text as _read_text,
     redacted_cmd as _redacted_cmd,
+    run_selection_command,
     terminate_process_group as _terminate_process_group,
 )
 from .risk import build_risk_prompt, extract_risk, risk_schema_json
@@ -324,6 +325,29 @@ class ClaudeRunner:
             cmd.extend(["--add-dir", directory])
         return cmd
 
+    def classify_findings(
+        self,
+        prompt: str,
+        schema_json: str,
+        model: str,
+        effort: str,
+        timeout_seconds: int,
+        run_dir: str,
+        is_superseded: Callable[[], bool],
+    ) -> str:
+        run_dir = str(Path(run_dir).resolve())
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        prompt_file = Path(run_dir) / "claude-selection-prompt.txt"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        cmd = self.build_comment_request_command(schema_json, model, effort)
+        cmd[cmd.index("--tools") + 1] = ""
+        cmd[cmd.index("--allowedTools") + 1] = ""
+        LOG.info("starting Claude selection command=%s prompt_file=%s", _redacted_cmd(cmd), prompt_file)
+        stdout = run_selection_command(
+            "claude", cmd, prompt_file, run_dir, self._env(), timeout_seconds, is_superseded,
+        )
+        return _extract_selection_message(stdout)
+
     def build_risk_command(self, schema_content: str, model: str, effort: str) -> list:
         cmd = [
             self.config.command,
@@ -373,6 +397,27 @@ class ClaudeRunner:
                 "Claude schema file is unreadable: {}".format(schema_path),
                 retryable=False,
             ) from exc
+
+
+def _extract_selection_message(stdout_text: str) -> str:
+    cooldown_seconds = provider_quota_cooldown_seconds("claude", stdout_text)
+    try:
+        parsed = json.loads(stdout_text)
+        if not isinstance(parsed, dict):
+            raise ValueError("stdout JSON must be an object")
+        if parsed.get("is_error") is True:
+            raise ValueError("reported an error result")
+        result = parsed.get("structured_output", parsed.get("result", parsed))
+        if isinstance(result, str):
+            result = json.loads(result)
+        if not isinstance(result, dict):
+            raise ValueError("selection result must be a JSON object")
+        return json.dumps(result, separators=(",", ":"))
+    except ValueError as exc:
+        raise ProviderError(
+            "Claude selection {}".format(exc), cooldown_seconds=cooldown_seconds,
+            provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
+        ) from exc
 
 
 def _extract_final_message(stdout_text: str) -> str:

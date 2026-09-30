@@ -79,6 +79,13 @@ class BitbucketClient:
         url = "{}/repositories/{}/{}?{}".format(self.base_url, self.workspace, repo_slug, query)
         self._request_json("GET", url)
 
+    def current_user(self) -> Dict[str, Any]:
+        return self._request_json("GET", self.base_url + "/user")
+
+    def get_pull_request(self, repo_slug: str, pr_id: int) -> PullRequest:
+        path = "/repositories/{}/{}/pullrequests/{}".format(self.workspace, repo_slug, pr_id)
+        return self._parse_pr(repo_slug, self._request_json("GET", self.base_url + path))
+
     def publish_report(self, repo_slug: str, commit_hash: str, report_id: str, report: Dict[str, Any]) -> None:
         path = "/repositories/{}/{}/commit/{}/reports/{}".format(
             self.workspace, repo_slug, commit_hash, report_id
@@ -163,14 +170,14 @@ class BitbucketClient:
         pr_id: int,
         content: str,
         before_request: Optional[Callable[[], None]] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         body = {"content": {"raw": content}}
         path = "/repositories/{}/{}/pullrequests/{}/comments".format(
             self.workspace, repo_slug, pr_id
         )
         if before_request is not None:
             before_request()
-        self._request_json("POST", self.base_url + path, body)
+        return self._request_json("POST", self.base_url + path, body)
 
     def list_pull_request_comments(
         self,
@@ -184,6 +191,10 @@ class BitbucketClient:
                 "values.content.raw",
                 "values.updated_on",
                 "values.deleted",
+                "values.resolution",
+                "values.resolved",
+                "values.outdated",
+                "values.parent.id",
                 "values.inline",
                 "values.user.account_id",
                 "values.user.nickname",
@@ -217,7 +228,7 @@ class BitbucketClient:
         content: str,
         before_request: Optional[Callable[[], None]] = None,
         line_side: str = "NEW",
-    ) -> None:
+    ) -> Dict[str, Any]:
         line_key = {"NEW": "to", "OLD": "from"}.get(line_side)
         if line_key is None:
             raise BitbucketError("inline comment line_side must be NEW or OLD")
@@ -230,7 +241,7 @@ class BitbucketClient:
         )
         if before_request is not None:
             before_request()
-        self._request_json("POST", self.base_url + request_path, body)
+        return self._request_json("POST", self.base_url + request_path, body)
 
     def _parse_pr(self, repo_slug: str, item: Dict[str, Any]) -> PullRequest:
         source = item.get("source") or {}

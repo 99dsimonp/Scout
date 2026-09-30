@@ -24,6 +24,19 @@ class FakeResponse:
 
 
 class BitbucketTests(unittest.TestCase):
+    def test_comment_writes_return_created_id_and_author(self):
+        client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("alice", "secret"))
+        created = {"id": 12, "user": {"account_id": "bot"}}
+        with patch("scout.bitbucket.urlopen", return_value=FakeResponse(created)):
+            self.assertEqual(client.publish_pull_request_comment("repo", 9, "body"), created)
+            self.assertEqual(client.publish_inline_pull_request_comment("repo", 9, "app.py", 2, "body"), created)
+
+    def test_current_user_exposes_immutable_identity(self):
+        client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("alice", "secret"))
+        with patch("scout.bitbucket.urlopen", return_value=FakeResponse({"account_id": "bot"})) as request:
+            self.assertEqual(client.current_user(), {"account_id": "bot"})
+        self.assertTrue(request.call_args.args[0].full_url.endswith("/user"))
+
     def test_basic_auth_header_is_sent(self):
         seen = {}
 

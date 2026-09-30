@@ -24,6 +24,7 @@ from .provider import (
     provider_quota_cooldown_seconds,
     read_text as _read_text,
     redacted_cmd as _redacted_cmd,
+    run_selection_command,
     terminate_process_group as _terminate_process_group,
 )
 from .risk import build_risk_prompt, extract_risk, risk_schema_json
@@ -346,6 +347,38 @@ class CodexRunner:
                 provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
             )
         return extract_comment_request(final_message)
+
+    def classify_findings(
+        self,
+        prompt: str,
+        schema_json: str,
+        model: str,
+        effort: str,
+        timeout_seconds: int,
+        run_dir: str,
+        is_superseded: Callable[[], bool],
+    ) -> str:
+        run_dir = str(Path(run_dir).resolve())
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        output_file = Path(run_dir) / "codex-selection-final-message.json"
+        output_file.unlink(missing_ok=True)
+        prompt_file = Path(run_dir) / "codex-selection-prompt.txt"
+        schema_file = Path(run_dir) / "selection.schema.json"
+        prompt_file.write_text(prompt, encoding="utf-8")
+        schema_file.write_text(schema_json, encoding="utf-8")
+        cmd = self.build_comment_request_command(
+            run_dir, str(schema_file), str(output_file), model, effort,
+        )
+        cmd.extend([
+            "--config", "features.shell_tool=false",
+            "--config", "features.multi_agent=false",
+            "--config", 'web_search="disabled"',
+        ])
+        LOG.info("starting Codex selection command=%s prompt_file=%s", _redacted_cmd(cmd), prompt_file)
+        return run_selection_command(
+            "codex", cmd, prompt_file, run_dir, self._env(), timeout_seconds,
+            is_superseded, output_file=output_file,
+        )
 
     def build_command(
         self,

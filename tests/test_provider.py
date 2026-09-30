@@ -1,13 +1,25 @@
 import unittest
+import signal
+import subprocess
 from datetime import datetime, timezone
+from unittest.mock import Mock, call, patch
 
 from scout.provider import (
     DEFAULT_PROVIDER_COOLDOWN_SECONDS,
     provider_quota_cooldown_seconds,
+    terminate_process_group,
 )
 
 
 class ProviderQuotaDetectionTests(unittest.TestCase):
+    def test_killed_process_is_reaped_after_ignoring_termination(self):
+        proc = Mock(pid=123)
+        proc.wait.side_effect = [subprocess.TimeoutExpired("provider", 10), None]
+        with patch("scout.provider.os.killpg") as killpg:
+            terminate_process_group(proc)
+        self.assertEqual(killpg.call_args_list, [call(123, signal.SIGTERM), call(123, signal.SIGKILL)])
+        self.assertEqual(proc.wait.call_args_list, [call(timeout=10), call()])
+
     def test_detects_claude_usage_limit_lockout(self):
         self.assertEqual(
             provider_quota_cooldown_seconds(

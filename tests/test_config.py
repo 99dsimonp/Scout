@@ -78,6 +78,60 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.bitbucket.repositories[0].review_enabled)
         self.assertIsNone(config.bitbucket.repositories[0].context_ref)
 
+    def test_inline_deduplication_defaults_and_overrides(self):
+        raw = {
+            "bitbucket": {"workspace": "ws", "repositories": [{"slug": "repo", "clone_url": "/tmp/repo"}]},
+            "review": {"output_mode": "inline_comments", "request_comments": {
+                "model": "cheap-model", "effort": "medium", "timeout_seconds": 45,
+            }},
+        }
+        config = parse_config(raw)
+        self.assertTrue(config.review.deduplication.enabled)
+        self.assertEqual(config.review.deduplication.model, "cheap-model")
+        self.assertEqual(config.review.deduplication.effort, "medium")
+        self.assertEqual(config.review.deduplication.timeout_seconds, 45)
+        self.assertEqual(config.review.deduplication.max_input_findings, 200)
+        self.assertEqual(config.review.deduplication.max_input_bytes, 200000)
+        self.assertEqual(config.queue.max_provider_recovery_seconds, 3600)
+        self.assertEqual(config.queue.max_selection_recovery_seconds, 600)
+        self.assertIsNone(config.bitbucket.bot_account_id)
+        raw["bitbucket"]["bot_account_id"] = " {bot-uuid} "
+        raw["review"]["deduplication"] = {"enabled": False, "model": "different", "max_input_findings": 20}
+        raw["queue"] = {"publication_max_attempts": 5, "max_provider_recovery_seconds": 1200}
+        config = parse_config(raw)
+        self.assertFalse(config.review.deduplication.enabled)
+        self.assertEqual(config.review.deduplication.model, "different")
+        self.assertEqual(config.review.deduplication.max_input_findings, 20)
+        self.assertEqual(config.queue.publication_max_attempts, 5)
+        self.assertEqual(config.queue.max_provider_recovery_seconds, 1200)
+        self.assertEqual(config.bitbucket.bot_account_id, "{bot-uuid}")
+
+    def test_inline_deduplication_rejects_invalid_configuration(self):
+        invalid_sections = [
+            {"enabled": "false"}, {"provider": "invalid"}, {"provider": "claude"},
+            {"effort": "impossible"}, {"timeout_seconds": 0},
+            {"max_input_findings": 0}, {"max_input_bytes": -1}, [],
+        ]
+        for section in invalid_sections:
+            with self.subTest(section=section), self.assertRaises(ConfigError):
+                parse_config({
+                    "bitbucket": {"workspace": "ws", "repositories": [{"slug": "repo", "clone_url": "/tmp/repo"}]},
+                    "review": {"output_mode": "inline_comments", "deduplication": section},
+                })
+
+    def test_publication_configuration_rejects_invalid_limits_and_identity(self):
+        for key in ("publication_max_attempts", "publication_retry_backoff_seconds", "publication_settle_seconds",
+                    "publication_snapshot_cache_seconds", "max_provider_recovery_seconds", "max_selection_recovery_seconds"):
+            with self.subTest(key=key), self.assertRaises(ConfigError):
+                parse_config({
+                    "bitbucket": {"workspace": "ws", "repositories": [{"slug": "repo", "clone_url": "/tmp/repo"}]},
+                    "queue": {key: 0},
+                })
+        for identity in ("", " ", 123):
+            with self.subTest(identity=identity), self.assertRaises(ConfigError):
+                parse_config({"bitbucket": {"workspace": "ws", "bot_account_id": identity,
+                                           "repositories": [{"slug": "repo", "clone_url": "/tmp/repo"}]}})
+
     def test_parse_related_and_context_only_repositories(self):
         config = parse_config(
             {

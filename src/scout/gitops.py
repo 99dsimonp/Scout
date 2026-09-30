@@ -10,6 +10,7 @@ import stat
 import subprocess
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple
 
@@ -126,6 +127,16 @@ class GitManager:
                 raise
         return worktree
 
+    def resolve_review_snapshot(self, mirror: Path, pr: PullRequest) -> PullRequest:
+        destination = self._git_capture([
+            "-C", str(mirror), "rev-parse", "--verify",
+            "{}^{{commit}}".format(pr.destination_commit_hash or pr.destination_branch),
+        ]).strip()
+        merge_base = self._git_capture([
+            "-C", str(mirror), "merge-base", pr.source_commit_hash, destination,
+        ]).strip()
+        return replace(pr, destination_commit_hash=destination, merge_base_hash=merge_base)
+
     def prepare_context(
         self,
         mirror: Path,
@@ -134,7 +145,7 @@ class GitManager:
         related_repositories: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, object]:
         base_ref = pr.destination_commit_hash or pr.destination_branch
-        merge_base = self._git_capture(["-C", str(worktree), "merge-base", "HEAD", base_ref]).strip()
+        merge_base = getattr(pr, "merge_base_hash", None) or self._git_capture(["-C", str(worktree), "merge-base", "HEAD", base_ref]).strip()
         diff = self._git_capture(
             [
                 "-C",

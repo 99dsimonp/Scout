@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from pathlib import Path
@@ -39,7 +40,26 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--repo", help="Limit --usage-summary to one repository slug")
     parser.add_argument("--pr", type=int, help="Limit --usage-summary to one pull request id")
+    publication = parser.add_mutually_exclusive_group()
+    publication.add_argument("--list-unresolved-publications", action="store_true", help="List blocked publication intents and failed rounds, with versions")
+    publication.add_argument("--resolve-publication", metavar="ID", help="Record an operator decision about an unknown POST outcome")
+    publication.add_argument("--retry-publication", metavar="ROUND_ID", help="Retry delivery of a saved selection plan")
+    parser.add_argument("--expected-version", type=int)
+    parser.add_argument("--outcome", choices=("published", "absent"))
+    parser.add_argument("--comment-id", type=int)
     args = parser.parse_args(argv)
+    publication_command = args.list_unresolved_publications or args.resolve_publication or args.retry_publication
+    if publication_command and (args.once or args.check_config or args.check_startup or args.recover_abandoned_jobs or args.reset_state_db or args.usage_summary):
+        parser.error("publication commands cannot be combined with daemon, check, or recovery commands")
+    if args.resolve_publication:
+        if args.expected_version is None or args.outcome is None:
+            parser.error("--resolve-publication requires --expected-version and --outcome")
+        if args.outcome == "published" and args.comment_id is None:
+            parser.error("--outcome published requires --comment-id")
+        if args.outcome == "absent" and args.comment_id is not None:
+            parser.error("--comment-id is only valid with --outcome published")
+    elif args.expected_version is not None or args.outcome is not None or args.comment_id is not None:
+        parser.error("--expected-version, --outcome, and --comment-id require --resolve-publication")
     if args.reset_state_db and not args.once:
         parser.error("--reset-state-db requires --once")
     if args.reset_state_db and (
@@ -50,6 +70,21 @@ def main(argv=None) -> int:
         parser.error("--repo and --pr are only valid with --usage-summary")
 
     config = load_config(args.config)
+    if publication_command:
+        state = StateStore(config.service.state_db)
+        state.initialize()
+        if args.list_unresolved_publications:
+            print(json.dumps(state.inline.list_unresolved_publications(), indent=2, sort_keys=True))
+            return 0
+        if args.resolve_publication:
+            changed = state.inline.resolve_publication(args.resolve_publication, args.expected_version, args.outcome, comment_id=args.comment_id)
+        else:
+            changed = state.inline.retry_publication(args.retry_publication)
+        if not changed:
+            print("publication unchanged: version changed or publication is not eligible for this operation", file=sys.stderr)
+            return 1
+        print("publication updated")
+        return 0
     if args.check_config:
         print("configuration OK")
         return 0

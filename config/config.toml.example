@@ -11,6 +11,8 @@ workspace = "my-workspace"
 api_base_url = "https://api.bitbucket.org/2.0"
 # Supported values: "basic" or "oauth_client_credentials".
 api_auth = "basic"
+# Immutable bot account ID or UUID; needed when GET /user cannot discover it.
+# bot_account_id = "{your-bot-uuid}"
 api_username_credential = "bitbucket_username"
 api_key_credential = "bitbucket_api_key"
 # When api_auth = "oauth_client_credentials", Scout reads these systemd
@@ -61,6 +63,14 @@ max_parallel_reviews = 2
 job_timeout_seconds = 1800
 max_attempts = 3
 retry_backoff_seconds = 300
+publication_max_attempts = 3
+publication_retry_backoff_seconds = 300
+publication_settle_seconds = 60
+publication_snapshot_cache_seconds = 10
+# Recovery clocks start only after an error or observed provider cooldown.
+# Healthy waiting for worker/provider capacity has no deadline.
+max_provider_recovery_seconds = 3600
+max_selection_recovery_seconds = 600
 
 [comments]
 critical_enabled = true
@@ -98,6 +108,18 @@ provider = "codex"
 model = "gpt-5.4"
 effort = "low"
 timeout_seconds = 120
+
+[review.deduplication]
+# Inline mode waits for all providers to succeed/fail before selecting comments.
+# False retains every candidate; selector failure falls back to exact matching.
+enabled = true
+# Omitted model settings inherit review.request_comments.
+# provider = "codex"
+# model = "gpt-5.4"
+# effort = "low"
+# timeout_seconds = 120
+max_input_findings = 200
+max_input_bytes = 200000
 
 [agents]
 # Legacy single-provider selector. Still valid by itself.

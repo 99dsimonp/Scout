@@ -43,7 +43,8 @@ The project name is Scout. The main daemon should use Scout naming consistently:
 - Credential/account rotation.
 - Quota bypassing through user account pools.
 - Full hostile-repository sandboxing.
-- Merged multi-provider consensus review.
+- Synthesizing a new consensus finding from multiple providers. Inline mode
+  selects among original findings instead.
 
 The reviewed repositories and Bitbucket workspace are assumed to be trusted by
 the service operator. Scout should still use readonly checkouts, minimal
@@ -1128,26 +1129,53 @@ for multiple selected severities it starts with `Scout: Issues found by
 run may leave a new PR comment so reviewers retain history after Code Insights
 reports move to a new commit.
 
-Scout also supports `review.output_mode = "inline_comments"` as an alternative
-to Code Insights report publishing. In this mode Scout reviews each non-draft PR
-once per provider/policy/schema and stores that PR-level review identity in
-SQLite, excluding source and target commit hashes. New commits update local PR
-metadata but do not enqueue another review. Developers can request a fresh
-review by mentioning `@scout` or `@Scout` in a PR comment; Scout first applies a
-case-insensitive mention prefilter, then classifies the comment with
-`[review.request_comments]` using the configured provider, model, effort, and
-timeout. Processed comment IDs plus `updated_on` values are stored so the same
-comment version is not handled repeatedly.
+Scout also supports `review.output_mode = "inline_comments"`. Its round,
+selection, and publication contracts are specified in
+[the multi-provider design](docs/multi-provider-inline-review-design.md).
+The report-mode behavior above is unchanged.
 
-Inline comment mode publishes no Code Insights report or annotation and ignores
-`[comments].severities` and `[comments].critical_enabled`. Every validated
-annotation with a valid location on its declared side is posted as one native
-Bitbucket inline code comment on `annotation.path` and `annotation.line`.
+An inline round freezes the source, destination, merge base, and expected
+providers before dispatch. All providers finish with a validated result or a
+recorded failure before any findings are selected. Successful results persist
+independently of worker leases. A provider error or cooldown starts one fixed
+recovery deadline; healthy queueing starts no deadline. A failed provider does
+not discard another provider's successful results. A PR-level notice reports
+partial provider coverage, including when all new findings were already reported.
+
+A cheap structured selector picks original comments that fully cover overlapping
+findings and preserves uncertain or distinct issues. The selected severity cannot
+silently downgrade a covered finding. Historical matching requires a confirmed,
+open, current Scout comment. If selection cannot recover, exact-only matching
+preserves unmatched findings; disabling deduplication retains every candidate.
+The model/fallback plan is saved once before publication and cannot be replaced
+by a late model response or delivery retry.
+
+Inline jobs use the shared worker pool with nonblocking provider reservations.
+Capacity limits account for review and classifier calls together. Review and
+selection/publication dispatch alternate when both are runnable. No waiting
+barrier, cooldown, or recovery intent holds a worker.
+
+Source pushes replace rounds only while their persisted phase is `reviewing`.
+After `ready_for_selection`, freshness checks prevent sending comments whose
+source or merge-base locations changed. Such findings produce a snapshot-specific
+stale notice; Scout does not remap their line numbers. Completed inline rounds
+rerun only after explicit requests. A tagged review request and all jobs in its
+new round are recorded atomically with the processed comment ID/version.
+
+The publisher owns stable marker-bearing intents and returned comment IDs.
+An ambiguous POST becomes unknown and must be reconciled before new comments on
+that PR. Complete negative lookups can permit a best-effort resend after settling,
+with the documented risk of a late duplicate. Publication retries reuse saved
+results and the exact selected payload. Operator commands resolve known outcomes
+or retry delivery without rerunning the reviews. Supersession and draft/ignored
+filters preserve unknown intents and canonical history. Closure pruning uses the
+complete open-PR inventory before eligibility filtering.
+
 `line_side = "NEW"` uses Bitbucket's `inline.to`; `line_side = "OLD"` uses
 `inline.from`, including deletion-only changes. Invalid locations are discarded
-before publishing. If Bitbucket rejects a location that passed this check, the
-job fails and follows normal retry handling; Scout does not fall back to a
-PR-level comment.
+before selection. Bitbucket publication failures use the independent publication
+budget; they never rerun an expensive provider review. Inline mode publishes no
+Code Insights report and ignores the report-mode comment severity filter.
 
 Scout enforces `review.max_findings` during output validation. If the provider
 returns too many annotations, the review is rejected rather than truncated and

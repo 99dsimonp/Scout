@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional
@@ -56,6 +56,7 @@ class BitbucketConfig:
     oauth_token_url: str
     ssh_key_credential: str
     repositories: List[RepositoryConfig]
+    bot_account_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,12 @@ class QueueConfig:
     job_timeout_seconds: int
     max_attempts: int
     retry_backoff_seconds: int
+    publication_max_attempts: int = 3
+    publication_retry_backoff_seconds: int = 300
+    publication_settle_seconds: int = 60
+    publication_snapshot_cache_seconds: int = 10
+    max_provider_recovery_seconds: int = 3600
+    max_selection_recovery_seconds: int = 600
 
 
 @dataclass(frozen=True)
@@ -85,6 +92,18 @@ class ReviewConfig:
     subagent_large_loc_limit: int
     subagent_high_risk_bonus: int
     subagent_max_per_lens: int
+    deduplication: "DeduplicationConfig" = field(default_factory=lambda: DeduplicationConfig())
+
+
+@dataclass(frozen=True)
+class DeduplicationConfig:
+    enabled: bool = True
+    provider: str = "codex"
+    model: str = "gpt-5.4"
+    effort: str = "low"
+    timeout_seconds: int = 120
+    max_input_findings: int = 200
+    max_input_bytes: int = 200000
 
 
 @dataclass(frozen=True)
@@ -303,6 +322,10 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
     risk_config = _parse_risk_config(review, codex, claude)
     request_comments_config = _parse_request_comments_config(review, codex, claude, output_mode)
 
+    deduplication_config = _parse_deduplication_config(
+        review, codex, claude, output_mode, request_comments_config
+    )
+
     state_dir = str(service.get("state_dir", "/var/lib/scout"))
     retention_days = _positive_int(service.get("retention_days", 7), "service.retention_days")
     if retention_days > 7:
@@ -394,6 +417,7 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
             ),
             ssh_key_credential=str(bitbucket.get("ssh_key_credential", "bitbucket_ssh_key")),
             repositories=repositories,
+            bot_account_id=_bot_account_id(bitbucket.get("bot_account_id")),
         ),
         polling=PollingConfig(
             enabled=bool(polling.get("enabled", True)),
@@ -407,6 +431,17 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
                 queue.get("retry_backoff_seconds", 300),
                 "queue.retry_backoff_seconds",
             ),
+            **{
+                name: _positive_int(queue.get(name, default), "queue." + name)
+                for name, default in (
+                    ("publication_max_attempts", 3),
+                    ("publication_retry_backoff_seconds", 300),
+                    ("publication_settle_seconds", 60),
+                    ("publication_snapshot_cache_seconds", 10),
+                    ("max_provider_recovery_seconds", 3600),
+                    ("max_selection_recovery_seconds", 600),
+                )
+            },
         ),
         review=ReviewConfig(
             policy_version=str(review.get("policy_version", "v1")),
@@ -415,6 +450,7 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
             output_mode=output_mode,
             risk=risk_config,
             request_comments=request_comments_config,
+            deduplication=deduplication_config,
             subagent_small_loc_limit=review_subagent_small_loc_limit,
             subagent_medium_loc_limit=review_subagent_medium_loc_limit,
             subagent_large_loc_limit=review_subagent_large_loc_limit,
@@ -657,6 +693,50 @@ def _parse_request_comments_config(
             "review.request_comments.timeout_seconds",
         ),
     )
+
+
+def _parse_deduplication_config(
+    review: Dict[str, Any],
+    codex: Dict[str, Any],
+    claude: Dict[str, Any],
+    output_mode: str,
+    defaults: RequestCommentsConfig,
+) -> DeduplicationConfig:
+    section = review.get("deduplication", {})
+    if not isinstance(section, dict):
+        raise ConfigError("review.deduplication must be a table")
+    enabled = _bool_value(section.get("enabled", True), "review.deduplication.enabled")
+    settings = {
+        "provider": defaults.provider,
+        "model": defaults.model,
+        "effort": defaults.effort,
+        "timeout_seconds": defaults.timeout_seconds,
+    }
+    settings.update(section)
+    try:
+        parsed = _parse_request_comments_config(
+            {"request_comments": settings}, codex, claude,
+            output_mode if enabled else "reports",
+        )
+    except ConfigError as exc:
+        raise ConfigError(str(exc).replace("review.request_comments", "review.deduplication")) from exc
+    return DeduplicationConfig(
+        enabled=enabled,
+        provider=parsed.provider,
+        model=parsed.model,
+        effort=parsed.effort,
+        timeout_seconds=parsed.timeout_seconds,
+        max_input_findings=_positive_int(section.get("max_input_findings", 200), "review.deduplication.max_input_findings"),
+        max_input_bytes=_positive_int(section.get("max_input_bytes", 200000), "review.deduplication.max_input_bytes"),
+    )
+
+
+def _bot_account_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError("bitbucket.bot_account_id must be a non-empty account ID or UUID")
+    return value.strip()
 
 
 def _provider_enabled(provider: str, provider_config: Dict[str, Any]) -> bool:

@@ -622,6 +622,7 @@ def _format_inline_comment(
     provider_label: str,
     source_commit: str,
     review_run_id: str,
+    publication_marker: str = "",
 ) -> str:
     body = "\n".join(
         [
@@ -640,6 +641,8 @@ def _format_inline_comment(
         _reviewer_label(annotation["reviewer"]),
         annotation["confidence"],
     )
+    if publication_marker:
+        footer += "\n" + publication_marker
     suggested_change = annotation.get("suggested_change")
     if isinstance(suggested_change, dict) and isinstance(suggested_change.get("replacement"), str):
         replacement = suggested_change["replacement"]
@@ -648,6 +651,21 @@ def _format_inline_comment(
         if len(content_with_suggestion) <= BITBUCKET_COMMENT_MAX_LENGTH:
             return content_with_suggestion
     return _format_inline_comment_parts(body, footer, limit=BITBUCKET_COMMENT_MAX_LENGTH)
+
+
+def to_round_notice(round_record: Dict[str, Any], kind: str, stale_count: int = 0) -> str:
+    succeeded = [_provider_label(o["provider"]) for o in round_record["outcomes"] if o["status"] == "succeeded"]
+    failed = [_provider_label(o["provider"]) for o in round_record["outcomes"] if o["status"] == "failed"]
+    snapshot = "`{}` (base `{}`)".format(round_record["source_commit_hash"][:12], (round_record.get("merge_base_hash") or "unknown")[:12])
+    if kind == "stale_notice":
+        return "Scout found {} issues on {} that were not posted because the code changed before publication. Comment `@scout review` to review the current code.".format(stale_count, snapshot)
+    if kind == "clean_review":
+        content = "Scout: {} found no material issues on {}.".format(", ".join(succeeded), snapshot)
+    else:
+        content = "Scout reviewed {} with {}. Findings reflect these providers' reviews only.".format(snapshot, ", ".join(succeeded))
+    if failed:
+        content += " {} did not complete this review (provider unavailable).".format(", ".join(failed))
+    return content
 
 
 def _format_inline_comment_parts(

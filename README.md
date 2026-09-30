@@ -13,7 +13,7 @@ worktrees, and can run multiple providers independently on the same PR.
 Scout provides:
 
 - Code Insights reports and inline annotations for each reviewed commit.
-- An alternate inline-comment mode that posts one native code comment per finding.
+- Inline reviews that wait for all providers, select the most useful overlapping findings, and publish recoverable native code comments.
 - Optional native PR comments for selected severities in report mode.
 - Retry and cooldown handling for provider failures and usage-limit lockouts.
 - Local audit logs and provider usage summaries with short retention.
@@ -303,8 +303,9 @@ providers = ["codex", "claude"]
 enabled = true
 ```
 
-There is no provider fallback. The daemon queues, validates, and runs one job
-per selected provider. Claude is disabled by default; selecting it as a review
+The daemon queues, validates, and runs one job per selected provider; it does
+not silently switch a review job to another provider. Inline rounds can finish
+with the providers that succeeded when another provider fails. Claude is disabled by default; selecting it as a review
 provider or risk provider requires `agents.claude.enabled = true`.
 
 Codex behavior is configured under `[agents.codex]`:
@@ -449,14 +450,80 @@ effort = "low"
 timeout_seconds = 120
 ```
 
-Inline comment mode reviews each non-draft PR once per configured provider. New
-commits do not automatically trigger another review; a developer can request one
-by mentioning `@scout` or `@Scout` in a PR comment. Scout classifies tagged
-comments with `review.request_comments` before queueing a rerun. In this mode,
-`[comments].severities` and `[comments].critical_enabled` are ignored: every
-validated annotation with a valid changed-line location on its declared `NEW`
-or `OLD` side is posted as its own inline code comment, and no PR-level fallback
-comment is posted.
+Inline mode reviews all configured providers against one frozen PR snapshot.
+Scout waits until each provider succeeds or fails, then selects comments across
+all successful results. A comment that fully explains another finding wins;
+partial overlap and uncertain matches both survive. Eligible existing Scout
+comments can suppress already reported findings across reruns. Human discussions
+are never used to suppress a finding.
+
+Workers are shared across providers. A busy provider does not reserve idle
+threads, and waiting for a worker or provider slot has no failure deadline. A
+retryable error or cooldown starts a fixed recovery deadline instead. If a
+provider cannot recover, Scout publishes the successful providers' results and
+names the missing providers on the PR. If all providers fail, nothing is posted.
+The selector also has a recovery deadline: if it fails, Scout uses exact matching
+and retains everything else, so duplicate comments are possible but successful
+reviews are not discarded.
+
+```toml
+[review.deduplication]
+enabled = true
+# Provider/model/effort/timeout default to review.request_comments.
+# enabled = false retains every finding, including exact duplicates.
+
+[queue]
+max_provider_recovery_seconds = 3600
+max_selection_recovery_seconds = 600
+```
+
+These recovery deadlines start after a problem, not when the work is queued.
+They persist through retries and restarts. Calls still have their configured
+timeouts. Native inline mode ignores `[comments].severities` and
+`[comments].critical_enabled`; validated findings on changed `NEW` or `OLD`
+lines enter selection regardless of severity.
+
+A source push replaces the entire round while reviewers are running. Once
+selection is ready, later pushes cannot restart it; Scout retains findings with
+obsolete locations and posts a stale notice. Completed rounds do not rerun on
+pushes. Developers can request a fresh round by mentioning `@scout` or `@Scout`
+in a PR comment, interpreted by `review.request_comments`.
+
+Scout saves provider results and the publication plan before sending comments.
+Delivery retries do not repeat reviews or choose new wording. Stable publication
+markers allow recovery of comments whose POST response was lost. After a complete
+negative lookup and a settle delay, a retry can still produce a duplicate if the
+original comment appears late; this is not exactly-once delivery.
+
+Multi-provider publication requires a trusted immutable Bitbucket account ID,
+discovered from the API or supplied explicitly:
+
+```toml
+[bitbucket]
+bot_account_id = "{your-bot-account-uuid}"
+```
+
+A successful discovery that conflicts with this value fails startup. A
+single-provider install without an identity can start in compatibility mode,
+with deduplication and marker recovery disabled and possible duplicate retries.
+
+Publication recovery commands do not rerun providers:
+
+```bash
+scout --config /etc/scout/config.toml --list-unresolved-publications
+scout --config /etc/scout/config.toml --retry-publication ROUND_ID
+scout --config /etc/scout/config.toml --resolve-publication ID --expected-version V --outcome published --comment-id N
+scout --config /etc/scout/config.toml --resolve-publication ID --expected-version V --outcome absent
+```
+
+Use the listed intent version when recording a known outcome. An obsolete intent
+confirmed absent is settled without resending; a currently eligible intent can
+retry after fresh lifecycle and snapshot checks. State changes use version checks
+so the daemon and an operator cannot overwrite each other's decisions.
+
+See [the detailed design](docs/multi-provider-inline-review-design.md) for matching,
+retention, and recovery rules. Live Bitbucket marker and anchoring contracts need
+verification before production rollout; tests use recorded-shape response stubs.
 
 ## Local Review Log
 
@@ -490,9 +557,11 @@ After each successful unfiltered poll of open Bitbucket PRs, Scout prunes SQLite
 state for PRs that are no longer open. It keeps closed PR rows while they still
 have an active `running` or `publishing` job, then removes their PR state,
 review jobs, and report-bootstrap rows on a later poll. During every poll, Scout
-also removes queued jobs and bootstrap rows for PRs currently ignored by
-repository `ignored_source_branches` or `ignored_target_branches`, and draft PRs when
-`ignore_draft_pull_requests` is enabled.
+also cancels queued work for PRs currently ignored by repository
+`ignored_source_branches` or `ignored_target_branches`, and draft PRs when
+`ignore_draft_pull_requests` is enabled. Open ignored and draft PRs retain inline
+publication history and unknown outcomes; only the complete unfiltered open-PR
+inventory can establish closure.
 
 ## License
 

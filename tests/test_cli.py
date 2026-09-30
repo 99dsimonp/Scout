@@ -13,6 +13,16 @@ from scout.state import StateStore
 
 
 class CliTests(unittest.TestCase):
+    def test_resolve_publication_requires_version_and_complete_outcome(self):
+        for flags in (["--resolve-publication", "one"],
+                      ["--resolve-publication", "one", "--expected-version", "1", "--outcome", "published"],
+                      ["--outcome", "absent"],
+                      ["--retry-publication", "one", "--once"]):
+            with self.subTest(flags=flags), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    main(flags)
+                self.assertEqual(error.exception.code, 2)
+
     def test_reset_state_db_requires_once(self):
         stderr = io.StringIO()
 
