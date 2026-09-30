@@ -483,6 +483,11 @@ normal inline finding comments. The legacy
 `[comments].critical_enabled = false` setting is still accepted when
 `severities` is omitted.
 
+In report mode, Scout records each successfully posted comment by its exact
+rendered content and review run. If a later comment fails, retries and restarts
+skip those recorded comments. A separate review run may post the same text again;
+this retry protection does not suppress issues from earlier discussions.
+
 To use native inline comments instead of Code Insights reports, set:
 
 ```toml

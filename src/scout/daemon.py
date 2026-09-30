@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -883,6 +884,12 @@ class ScoutDaemon:
                     source_commit=source_commit,
                     severities=_comment_severities(config=self.config),
                 ):
+                    # The publication ledger includes output_mode and review_run_id.
+                    # Hash the body because a retry can reuse a finding ID for
+                    # different evidence; a fresh review run may repeat any comment.
+                    comment_id = "report-comment-" + hashlib.sha256(pr_comment.encode("utf-8")).hexdigest()
+                    if self.state.inline_comment_published(job, comment_id):
+                        continue
                     if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
                         raise ProviderSuperseded("review superseded before PR comment publish")
                     self.bitbucket.publish_pull_request_comment(
@@ -891,6 +898,7 @@ class ScoutDaemon:
                         pr_comment,
                         before_request=lambda: self._renew_publish_or_superseded(job),
                     )
+                    self.state.mark_inline_comment_published(job, comment_id)
             if not self.state.mark_success(job, report_id):
                 raise ProviderSuperseded("review superseded before success mark")
             LOG.info("review job succeeded id=%s repo=%s pr=%s", job.id, job.repo_slug, job.pr_id)

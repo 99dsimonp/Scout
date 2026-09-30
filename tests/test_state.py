@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 import sqlite3
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import scout.state as state_module
@@ -12,6 +13,29 @@ from scout.state import StateStore
 
 
 class StateTests(unittest.TestCase):
+    def test_comment_publication_ledger_keeps_provider_mode_and_review_run_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(tmp + "/state.db")
+            store.initialize()
+            pr = PullRequest("ws", "repo", 1, "PR", "", "feature", "a" * 40, "main")
+            store.enqueue_or_update_pr(pr, "v1", "v1", "codex", output_mode="reports")
+            job = store.claim_next_pending_job({"codex": 1200})
+            comment_id = "report-comment-body-fingerprint"
+            self.assertFalse(store.inline_comment_published(job, comment_id))
+            store.mark_inline_comment_published(job, comment_id)
+            self.assertTrue(store.inline_comment_published(job, comment_id))
+            for other_job in (
+                replace(job, provider="claude"),
+                replace(job, output_mode="inline_comments"),
+                replace(job, running_review_run_id="fresh-review-run"),
+                replace(job, workspace="other-workspace"),
+                replace(job, repo_slug="other-repository"),
+                replace(job, pr_id=2),
+            ):
+                with self.subTest(job=other_job):
+                    self.assertFalse(store.inline_comment_published(other_job, comment_id))
+            self.assertFalse(store.inline_comment_published(job, "changed-body-fingerprint"))
+
     def test_legacy_report_history_survives_repeated_upgrades(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(tmp + "/state.db")

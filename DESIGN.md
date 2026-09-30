@@ -1171,9 +1171,16 @@ still use the severity-selected aggregate comment. The legacy
 an empty severity list when `severities` is omitted. For a single actual
 severity the comment starts with `Scout: {Severity} issue found by {provider}:`;
 for multiple actual severities it starts with `Scout: Issues found by
-{provider}:`. Scout does not deduplicate these comments; each completed review
-run may leave a new PR comment so reviewers retain history after Code Insights
-reports move to a new commit.
+{provider}:`. After each successful report-mode comment POST, Scout records a
+content fingerprint in the existing publication ledger, scoped by repository,
+PR, provider, output mode, and review run. A retry of that run skips recorded
+comments even after restart. The fingerprint uses the rendered body rather than
+its position in the list, so reordered or changed provider output cannot cause
+a different comment to be skipped. Separate review runs may post identical
+comments again. This transport retry protection is separate from the review
+model's out-of-scope discussion rule. As with inline publication, an ambiguous
+POST result or a crash before its success is recorded can still require manual
+reconciliation; local state alone cannot guarantee exactly-once HTTP delivery.
 
 Scout also supports `review.output_mode = "inline_comments"` as an alternative
 to Code Insights report publishing. In this mode Scout reviews each non-draft PR
