@@ -181,11 +181,14 @@ class BitbucketClient:
         fields = ",".join(
             [
                 "values.id",
+                "values.parent.id",
                 "values.content.raw",
+                "values.created_on",
                 "values.updated_on",
                 "values.deleted",
                 "values.inline",
                 "values.user.account_id",
+                "values.user.display_name",
                 "values.user.nickname",
                 "values.user.username",
                 "values.user.uuid",

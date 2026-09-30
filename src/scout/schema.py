@@ -28,6 +28,7 @@ REVIEWER_ORDER = [
 REVIEWERS = set(REVIEWER_ORDER)
 CONFIDENCE = {"HIGH", "MEDIUM", "LOW"}
 LINE_SIDES = {"NEW", "OLD"}
+FINDING_KINDS = {"general", "dead_code", "duplicate_code", "low_value_test"}
 INTERNAL_EXTERNAL_ID_PREFIX = "__scout_"
 BITBUCKET_REPORT_DETAILS_MAX_LENGTH = 2000
 BITBUCKET_ANNOTATION_SUMMARY_MAX_LENGTH = 450
@@ -87,14 +88,17 @@ def filter_annotation_locations(
     review: ValidatedReview,
     diff: str,
     allowed_line_sides: Iterable[str] = ("NEW",),
+    allow_old_dead_code: bool = False,
 ) -> ValidatedReview:
     """Return a review containing only annotations publishable in this mode.
 
     Native inline comments can target either side of the PR diff. Code Insights
     annotations are attached to the source commit and currently support only
     new-side locations, so callers select which sides their output mode can
-    publish. If no findings remain, the recommendation must also become an
-    approval so every downstream summary is derived from the same state.
+    publish. Report mode can retain old-side dead code for a separate PR warning;
+    Code Insights conversion omits these old-side annotations. If no findings
+    remain, the recommendation must also become an approval so every downstream
+    summary is derived from the same state.
     """
     allowed_sides = set(allowed_line_sides)
     if not allowed_sides or not allowed_sides.issubset(LINE_SIDES):
@@ -106,7 +110,14 @@ def filter_annotation_locations(
     annotations = [
         annotation
         for annotation in review.annotations
-        if annotation["line_side"] in allowed_sides
+        if (
+            annotation["line_side"] in allowed_sides
+            or (
+                allow_old_dead_code
+                and annotation["line_side"] == "OLD"
+                and annotation.get("finding_kind") == "dead_code"
+            )
+        )
         and (annotation["path"], annotation["line"])
         in changed_lines[annotation["line_side"]]
     ]
@@ -311,6 +322,10 @@ def to_bitbucket_annotations(review: ValidatedReview, provider: str = "codex") -
     provider_label = _provider_label(provider)
     converted = []
     for annotation in review.annotations:
+        # Removed lines refer to the target side, not the source commit that
+        # owns Code Insights. Dead-code findings still appear in PR comments.
+        if annotation["line_side"] == "OLD":
+            continue
         item = {
             "external_id": annotation["external_id"],
             "annotation_type": annotation["annotation_type"],
@@ -334,13 +349,11 @@ def to_pr_comment(
     severities: Iterable[str] = ("CRITICAL",),
 ) -> str:
     allowed_severities = set(severities)
-    selected_severities = [severity for severity in SEVERITY_ORDER if severity in allowed_severities]
-    if not selected_severities:
-        return ""
     selected = sorted(
         (
             annotation for annotation in review.annotations
-            if annotation["severity"] in selected_severities
+            if annotation["severity"] in allowed_severities
+            or annotation.get("finding_kind") == "dead_code"
         ),
         key=lambda annotation: (
             SEVERITY_ORDER.index(annotation["severity"]),
@@ -352,6 +365,10 @@ def to_pr_comment(
     if not selected:
         return ""
     provider_label = _provider_label(provider)
+    selected_severities = [
+        severity for severity in SEVERITY_ORDER
+        if any(annotation["severity"] == severity for annotation in selected)
+    ]
     if len(selected_severities) == 1:
         heading = "Scout: {} issue found by {}:".format(
             _sentence_case(selected_severities[0]),
@@ -385,6 +402,57 @@ def to_pr_comment(
             ]
         )
     return _truncate("\n".join(lines).rstrip(), BITBUCKET_COMMENT_MAX_LENGTH)
+
+
+def to_pr_comments(
+    review: ValidatedReview,
+    provider: str = "codex",
+    source_commit: str = "",
+    severities: Iterable[str] = ("CRITICAL",),
+) -> List[str]:
+    """Keep every dead-code warning visible even when another finding is long."""
+    comments = []
+    ordinary = []
+    for annotation in review.annotations:
+        if annotation.get("finding_kind") != "dead_code":
+            ordinary.append(annotation)
+            continue
+        path = annotation["path"]
+        path_note = ""
+        # Normal checkout paths fit in this budget. An exceptional longer path
+        # must not consume the summary or disguise the shortening as a real path.
+        path_budget = BITBUCKET_COMMENT_MAX_LENGTH - 2000
+        if len(path) > path_budget:
+            prefix_length = (path_budget - 3) // 2
+            path = path[:prefix_length] + "..." + path[-(path_budget - 3 - prefix_length):]
+            path_note = " [path shortened]"
+        lines = [
+            "**Scout: {} issue found by {}:**".format(
+                _sentence_case(annotation["severity"]), _provider_label(provider)
+            ),
+            "",
+            "Location: `{}:{}` ({}){}".format(
+                path, annotation["line"], annotation["line_side"].lower(), path_note
+            ),
+            "**{}**".format(_truncate(annotation["summary"], BITBUCKET_ANNOTATION_SUMMARY_MAX_LENGTH)),
+        ]
+        if source_commit:
+            lines.append("Commit: `{}`".format(source_commit[:12]))
+        lines.extend([
+            "Reviewer: {} / {} confidence".format(
+                _reviewer_label(annotation["reviewer"]), annotation["confidence"]
+            ),
+            "Why it matters: {}".format(annotation["details"]),
+            "Smallest fix: {}".format(annotation["smallest_fix"]),
+        ])
+        comments.append(_truncate("\n".join(lines), BITBUCKET_COMMENT_MAX_LENGTH))
+    ordinary_comment = to_pr_comment(
+        ValidatedReview(review.recommendation, review.report, ordinary),
+        provider=provider, source_commit=source_commit, severities=severities,
+    )
+    if ordinary_comment:
+        comments.append(ordinary_comment)
+    return comments
 
 
 def to_critical_pr_comment(
@@ -517,7 +585,7 @@ def _validate_annotations(value: Any, max_findings: int) -> List[Dict[str, Any]]
             "confidence",
             "smallest_fix",
         }
-        allowed = required | {"suggested_change"}
+        allowed = required | {"suggested_change", "finding_kind"}
         _require_keys(item, required, label)
         _reject_extra_keys(item, allowed, label)
         external_id = _nonempty_string(item["external_id"], "{}.external_id".format(label))
@@ -543,6 +611,8 @@ def _validate_annotations(value: Any, max_findings: int) -> List[Dict[str, Any]]
         _enum(item["reviewer"], REVIEWERS, "{}.reviewer".format(label))
         _enum(item["confidence"], CONFIDENCE, "{}.confidence".format(label))
         _nonempty_string(item["smallest_fix"], "{}.smallest_fix".format(label))
+        if "finding_kind" in item:
+            _enum(item["finding_kind"], FINDING_KINDS, "{}.finding_kind".format(label))
         if "suggested_change" in item:
             _validate_suggested_change(item["suggested_change"], "{}.suggested_change".format(label))
         converted.append(deepcopy(item))

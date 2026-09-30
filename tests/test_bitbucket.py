@@ -338,6 +338,8 @@ class BitbucketTests(unittest.TestCase):
                             {
                                 "id": 1,
                                 "content": {"raw": "@Scout review this"},
+                                "created_on": "2026-06-22T09:00:00+00:00",
+                                "user": {"account_id": "author-1", "display_name": "Alice"},
                                 "updated_on": "2026-06-22T10:00:00+00:00",
                                 "deleted": False,
                                 "inline": {"path": "src/app.py", "to": 12},
@@ -351,6 +353,7 @@ class BitbucketTests(unittest.TestCase):
                     "values": [
                         {
                             "id": 2,
+                            "parent": {"id": 1},
                             "content": {"raw": "later"},
                             "updated_on": "2026-06-22T10:01:00+00:00",
                             "deleted": True,
@@ -369,8 +372,13 @@ class BitbucketTests(unittest.TestCase):
             comments = client.list_pull_request_comments("repo", 9)
 
         self.assertEqual([comment["id"] for comment in comments], [1, 2])
+        self.assertEqual(comments[1]["parent"], {"id": 1})
+        self.assertEqual(comments[0]["user"]["display_name"], "Alice")
         self.assertEqual(requests[1], "https://api.bitbucket.org/2.0/next-page")
         self.assertIn("values.content.raw", requests[0])
+        self.assertIn("values.parent.id", requests[0])
+        self.assertIn("values.created_on", requests[0])
+        self.assertIn("values.user.display_name", requests[0])
         self.assertIn("values.updated_on", requests[0])
         self.assertIn("values.deleted", requests[0])
         self.assertIn("values.inline", requests[0])

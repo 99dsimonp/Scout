@@ -20,6 +20,32 @@ LOG = logging.getLogger(__name__)
 DEFAULT_GIT_TIMEOUT_SECONDS = 600
 
 
+def _review_comments(comments: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    records = []
+    for comment in comments:
+        record = {
+            field: comment[field]
+            for field in ("id", "created_on", "updated_on", "deleted")
+            if field in comment
+        }
+        for field, keys in (
+            ("parent", ("id",)),
+            ("user", ("account_id", "uuid", "nickname", "username", "display_name")),
+            ("inline", ("path", "from", "to")),
+        ):
+            value = comment.get(field)
+            if isinstance(value, dict):
+                record[field] = {key: value[key] for key in keys if key in value}
+        # Keep deleted roots as tombstones so live replies retain their parent,
+        # but deleted text cannot be evidence for suppressing a finding.
+        if comment.get("deleted") is not True:
+            content = comment.get("content")
+            if isinstance(content, dict) and isinstance(content.get("raw"), str):
+                record["content"] = {"raw": content["raw"]}
+        records.append(record)
+    return sorted(records, key=lambda record: (str(record.get("created_on", "")), str(record.get("id", ""))))
+
+
 class GitError(RuntimeError):
     pass
 
@@ -132,6 +158,7 @@ class GitManager:
         worktree: Path,
         pr: PullRequest,
         related_repositories: Optional[List[Dict[str, str]]] = None,
+        pull_request_comments: Optional[List[Dict[str, object]]] = None,
     ) -> Dict[str, object]:
         base_ref = pr.destination_commit_hash or pr.destination_branch
         merge_base = self._git_capture(["-C", str(worktree), "merge-base", "HEAD", base_ref]).strip()
@@ -168,12 +195,17 @@ class GitManager:
             "changed_lines": str(changed_lines),
             "diff_path": str(context_dir / "diff.patch"),
             "files_path": str(context_dir / "files.txt"),
+            "comments_path": str(context_dir / "comments.json"),
             "related_repositories": list(related_repositories or []),
         }
         context["context_path"] = str(context_dir / "context.json")
         (context_dir / "context.json").write_text(json.dumps(context, indent=2, sort_keys=True), encoding="utf-8")
         (context_dir / "diff.patch").write_text(diff, encoding="utf-8")
         (context_dir / "files.txt").write_text(files, encoding="utf-8")
+        (context_dir / "comments.json").write_text(
+            json.dumps(_review_comments(pull_request_comments or []), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
         self._make_readonly(worktree)
         return context
 

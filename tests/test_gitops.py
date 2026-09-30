@@ -406,6 +406,24 @@ class GitManagerTests(unittest.TestCase):
                     "path": "/context/contracts",
                 }
             ]
+            comments = [
+                {
+                    "id": 8,
+                    "parent": {"id": 7, "links": {"self": "unused"}},
+                    "created_on": "2026-09-30T10:01:00Z",
+                    "updated_on": "2026-09-30T10:02:00Z",
+                    "user": {"account_id": "developer", "display_name": "Alice", "links": {}},
+                    "content": {"raw": "This is out of scope.", "html": "unused"},
+                    "inline": {"path": "src/app.py", "from": 3, "to": None, "links": {}},
+                    "links": {"self": "unused"},
+                },
+                {
+                    "id": 7,
+                    "created_on": "2026-09-30T10:00:00Z",
+                    "deleted": True,
+                    "content": {"raw": "Deleted text must not authorize suppression."},
+                },
+            ]
             with patch.object(
                 manager,
                 "_git_capture",
@@ -416,11 +434,27 @@ class GitManagerTests(unittest.TestCase):
                     worktree,
                     pr,
                     related_repositories=related,
+                    pull_request_comments=comments,
                 )
 
             manifest = json.loads(Path(context["context_path"]).read_text(encoding="utf-8"))
             self.assertEqual(manifest["related_repositories"], related)
             self.assertEqual(context["related_repositories"], related)
+            self.assertEqual(manifest["comments_path"], context["comments_path"])
+            comments_path = Path(context["comments_path"])
+            stored_comments = json.loads(comments_path.read_text(encoding="utf-8"))
+            self.assertEqual([comment["id"] for comment in stored_comments], [7, 8])
+            self.assertTrue(stored_comments[0]["deleted"])
+            self.assertNotIn("content", stored_comments[0])
+            reply = stored_comments[1]
+            self.assertEqual(reply["parent"], {"id": 7})
+            self.assertEqual(reply["content"], {"raw": "This is out of scope."})
+            self.assertEqual(reply["user"], {"account_id": "developer", "display_name": "Alice"})
+            self.assertEqual(reply["inline"], {"path": "src/app.py", "from": 3, "to": None})
+            self.assertEqual(reply["created_on"], comments[0]["created_on"])
+            self.assertEqual(reply["updated_on"], comments[0]["updated_on"])
+            self.assertNotIn("links", reply)
+            self.assertEqual(stat.S_IMODE(comments_path.stat().st_mode) & 0o222, 0)
 
     def test_prepare_context_forces_canonical_diff_output(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -448,7 +482,9 @@ class GitManagerTests(unittest.TestCase):
                 "_git_capture",
                 side_effect=[merge_base + "\n", "", ""],
             ) as git_capture:
-                manager.prepare_context(Path(tmp) / "mirror.git", worktree, pr)
+                context = manager.prepare_context(Path(tmp) / "mirror.git", worktree, pr)
+
+            self.assertEqual(json.loads(Path(context["comments_path"]).read_text(encoding="utf-8")), [])
 
             self.assertEqual(
                 git_capture.call_args_list[1].args[0],

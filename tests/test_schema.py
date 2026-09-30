@@ -15,6 +15,7 @@ from scout.schema import (
     to_inline_pr_comments,
     to_no_findings_pr_comment,
     to_pr_comment,
+    to_pr_comments,
     to_bitbucket_report,
     filter_annotation_locations,
     validate_review_output,
@@ -54,6 +55,161 @@ def valid_review():
 
 
 class SchemaTests(unittest.TestCase):
+    def test_finding_kind_is_optional_for_existing_reviews_and_validated_when_present(self):
+        self.assertNotIn("finding_kind", validate_review_output(valid_review()).annotations[0])
+        for kind in ("general", "dead_code", "duplicate_code", "low_value_test"):
+            with self.subTest(kind=kind):
+                payload = valid_review()
+                payload["annotations"][0]["finding_kind"] = kind
+                review = validate_review_output(payload)
+                self.assertEqual(review.annotations[0]["finding_kind"], kind)
+                self.assertNotIn("finding_kind", to_bitbucket_annotations(review)[0])
+        for kind in ("unknown", None, 1):
+            with self.subTest(kind=kind):
+                payload = valid_review()
+                payload["annotations"][0]["finding_kind"] = kind
+                with self.assertRaisesRegex(ReviewValidationError, "finding_kind must be one of"):
+                    validate_review_output(payload)
+
+    def test_provider_schemas_require_finding_kind(self):
+        root = Path(__file__).resolve().parents[1]
+        for relative_path in ("config/review.schema.json", "src/scout/data/review.schema.json"):
+            schema = json.loads((root / relative_path).read_text(encoding="utf-8"))
+            annotation = schema["properties"]["annotations"]["items"]
+            self.assertIn("finding_kind", annotation["required"])
+            self.assertEqual(
+                annotation["properties"]["finding_kind"]["enum"],
+                ["general", "dead_code", "duplicate_code", "low_value_test"],
+            )
+
+    def test_dead_code_always_gets_pr_warning_with_truthful_severity_heading(self):
+        for side in ("NEW", "OLD"):
+            for severity in ("CRITICAL", "HIGH", "MEDIUM", "LOW"):
+                for severities in (("CRITICAL",), ()):
+                    with self.subTest(side=side, severity=severity, severities=severities):
+                        payload = valid_review()
+                        payload["annotations"][0].update(
+                            finding_kind="dead_code", line_side=side, severity=severity,
+                            summary="Last caller removed",
+                        )
+                        review = validate_review_output(payload)
+                        comment = to_pr_comment(review, severities=severities)
+                        self.assertIn("Last caller removed", comment)
+                        self.assertIn("Scout: {} issue found".format(severity.capitalize()), comment)
+                        self.assertIn("src/app.py:12", comment)
+                        self.assertIn("({})".format(side.lower()), comment)
+
+    def test_dead_code_comment_does_not_promote_other_lower_severity_findings(self):
+        payload = valid_review()
+        for kind in ("dead_code", "duplicate_code", "low_value_test"):
+            annotation = dict(payload["annotations"][0])
+            annotation.update(external_id=kind, summary=kind, finding_kind=kind, severity="LOW")
+            payload["annotations"].append(annotation)
+        payload["annotations"][0]["severity"] = "CRITICAL"
+        comment = to_pr_comment(validate_review_output(payload))
+        self.assertIn("Scout: Issues found by Codex:", comment)
+        self.assertIn("Missing error handling", comment)
+        self.assertIn("dead_code", comment)
+        self.assertNotIn("duplicate_code", comment)
+        self.assertNotIn("low_value_test", comment)
+
+    def test_dead_code_warning_survives_long_earlier_critical_finding(self):
+        payload = valid_review()
+        payload["annotations"][0].update(severity="CRITICAL", details="d" * 8100)
+        dead_code = dict(payload["annotations"][0])
+        dead_code.update(
+            external_id="dead-code", finding_kind="dead_code", severity="LOW",
+            line_side="OLD", summary="Unused old helper", path="src/unused.c", line=23,
+        )
+        payload["annotations"].append(dead_code)
+        review = validate_review_output(payload)
+
+        comments = to_pr_comments(review)
+
+        self.assertEqual(len(comments), 2)
+        self.assertIn("Unused old helper", comments[0])
+        self.assertIn("src/unused.c:23` (old)", comments[0])
+        self.assertIn("Missing error handling", comments[1])
+        self.assertNotIn("Unused old helper", comments[1])
+        self.assertTrue(all(len(comment) <= BITBUCKET_COMMENT_MAX_LENGTH for comment in comments))
+
+    def test_each_long_dead_code_warning_preserves_summary_and_location(self):
+        payload = valid_review()
+        payload["annotations"] = []
+        for index, side in enumerate(("NEW", "OLD")):
+            annotation = dict(valid_review()["annotations"][0])
+            annotation.update(
+                external_id="dead-{}".format(index), finding_kind="dead_code", severity="LOW",
+                summary="Unused helper {} ".format(index) + "s" * 8100,
+                details="d" * 8100, smallest_fix="f" * 8100,
+                path="src/" + "nested/" * 1500 + "unused{}.c".format(index),
+                line=index + 10, line_side=side,
+            )
+            payload["annotations"].append(annotation)
+        review = validate_review_output(payload)
+
+        comments = to_pr_comments(review, severities=())
+
+        self.assertEqual(len(comments), 2)
+        for index, comment in enumerate(comments):
+            self.assertIn("Unused helper {}".format(index), comment)
+            self.assertIn("Location: `src/", comment)
+            self.assertIn("[path shortened]", comment)
+            self.assertIn("unused{}.c:{}`".format(index, index + 10), comment)
+            self.assertIn("({})".format(("new", "old")[index]), comment)
+            self.assertLessEqual(len(comment), BITBUCKET_COMMENT_MAX_LENGTH)
+        self.assertEqual(len(review.annotations[0]["summary"]), 8116)
+        self.assertNotIn("...", review.annotations[0]["path"])
+
+    def test_dead_code_warning_keeps_full_checkout_location_before_long_summary(self):
+        payload = valid_review()
+        path = "src/" + "nested/" * 500 + "unused.c"
+        payload["annotations"][0].update(
+            finding_kind="dead_code", path=path, summary="Unused helper " + "s" * 8100,
+        )
+
+        comment = to_pr_comments(validate_review_output(payload))[0]
+
+        self.assertIn("Location: `{}:12` (new)".format(path), comment)
+        self.assertNotIn("[path shortened]", comment)
+        self.assertLess(comment.index("Location:"), comment.index("Unused helper"))
+        self.assertLessEqual(len(comment), BITBUCKET_COMMENT_MAX_LENGTH)
+
+    def test_pr_comments_keep_normal_severity_selection_and_aggregate_format(self):
+        review = validate_review_output(valid_review())
+        self.assertEqual(to_pr_comments(review), [])
+        self.assertEqual(
+            to_pr_comments(review, provider="claude", source_commit="abc123", severities=("HIGH",)),
+            [to_pr_comment(review, provider="claude", source_commit="abc123", severities=("HIGH",))],
+        )
+
+    def test_report_mode_preserves_only_valid_old_dead_code_for_pr_comment(self):
+        payload = valid_review()
+        for kind in ("dead_code", "general", "duplicate_code", "low_value_test"):
+            annotation = dict(payload["annotations"][0])
+            annotation.update(
+                external_id=kind, finding_kind=kind, line=5, line_side="OLD", severity="LOW",
+            )
+            payload["annotations"].append(annotation)
+        invalid = dict(payload["annotations"][1])
+        invalid.update(external_id="unchanged-dead-code", line=6)
+        payload["annotations"].append(invalid)
+        review = validate_review_output(payload)
+        diff = """diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -5,2 +5 @@
+-last_call()
+ context
+"""
+        filtered = filter_annotation_locations(review, diff, allow_old_dead_code=True)
+        self.assertEqual([a["external_id"] for a in filtered.annotations], ["dead_code"])
+        self.assertEqual(filtered.recommendation, "request_changes")
+        self.assertIn("(old)", to_pr_comment(filtered))
+        self.assertEqual(to_bitbucket_annotations(filtered), [])
+        self.assertEqual(to_bitbucket_report(filtered, "Review")["result"], "FAILED")
+        self.assertEqual(filter_annotation_locations(review, diff).annotations, [])
+
     def test_changed_lines_use_physical_lines_on_both_sides(self):
         for separator in ("\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"):
             with self.subTest(separator=repr(separator)):

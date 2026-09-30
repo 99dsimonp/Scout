@@ -35,7 +35,7 @@ from .schema import (
     parse_review_json,
     summarize_findings,
     to_bitbucket_annotations,
-    to_pr_comment,
+    to_pr_comments,
     to_bitbucket_report,
     to_inline_pr_comments,
     to_no_findings_pr_comment,
@@ -663,15 +663,22 @@ class ScoutDaemon:
                     related_commit,
                     related_worktree,
                 )
-            if related_context:
-                context = self.git.prepare_context(
-                    mirror,
-                    worktree,
-                    pr,
-                    related_repositories=related_context,
-                )
-            else:
-                context = self.git.prepare_context(mirror, worktree, pr)
+            def before_comments_request():
+                if is_superseded():
+                    raise ProviderSuperseded("review superseded while loading PR comments")
+
+            pull_request_comments = self.bitbucket.list_pull_request_comments(
+                job.repo_slug,
+                job.pr_id,
+                before_request=before_comments_request,
+            )
+            context = self.git.prepare_context(
+                mirror,
+                worktree,
+                pr,
+                related_repositories=related_context,
+                pull_request_comments=pull_request_comments,
+            )
             if is_superseded():
                 raise ProviderSuperseded("review superseded during context preparation")
             risk = self._risk_for_job(job, source_commit, is_superseded)
@@ -760,6 +767,7 @@ class ScoutDaemon:
                     validated,
                     diff,
                     allowed_line_sides=allowed_line_sides,
+                    allow_old_dead_code=output_mode == "reports",
                 )
                 retained_external_ids = {
                     annotation["external_id"] for annotation in validated.annotations
@@ -869,13 +877,12 @@ class ScoutDaemon:
                     annotations,
                     before_request=lambda: self._renew_publish_or_superseded(job),
                 )
-                pr_comment = to_pr_comment(
+                for pr_comment in to_pr_comments(
                     validated,
                     provider=job.provider,
                     source_commit=source_commit,
                     severities=_comment_severities(config=self.config),
-                )
-                if pr_comment:
+                ):
                     if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
                         raise ProviderSuperseded("review superseded before PR comment publish")
                     self.bitbucket.publish_pull_request_comment(

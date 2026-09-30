@@ -65,7 +65,8 @@ retry_backoff_seconds = 300
 [comments]
 critical_enabled = true
 # Native PR comments are posted for annotations with these severities.
-# Empty list disables comment posting. Defaults to ["CRITICAL"].
+# Empty list disables severity-selected comments; dead-code warnings still post.
+# Defaults to ["CRITICAL"].
 severities = ["CRITICAL"]
 
 [review]

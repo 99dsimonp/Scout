@@ -50,7 +50,7 @@ rpmbuild -ba packaging/scout.spec
 Install the built package:
 
 ```bash
-sudo dnf install -y ~/rpmbuild/RPMS/noarch/scout-0.1.0-3.el9.noarch.rpm
+sudo dnf install -y ~/rpmbuild/RPMS/noarch/scout-0.1.0-4.el9.noarch.rpm
 scout --config /etc/scout/config.toml --check-config
 ```
 
@@ -83,7 +83,7 @@ while the service is stopped. Upgrade the RPM, then start the service again:
 ```bash
 sudo systemctl stop scout
 # Back up the configured database, its sidecars, and /etc/scout/config.toml.
-sudo dnf upgrade -y /path/to/scout-0.1.0-3.el9.noarch.rpm
+sudo dnf upgrade -y /path/to/scout-0.1.0-4.el9.noarch.rpm
 sudo systemctl start scout
 ```
 
@@ -403,6 +403,47 @@ to one subagent per category to keep token use predictable unless you opt in to
 more fan-out. Each selected provider's `max_subagents` is the hard total limit
 validated at config load and before each review.
 
+## Review quality and existing discussions
+
+The best-practices lens checks whether the PR adds unused code or removes the
+last use of existing code. It must inspect callers, exports, callbacks,
+registrations, and other supported entry points before reporting dead code.
+The finding names the unused code and anchors the change that made it unused,
+including a removed call on the old side of the diff.
+
+The same lens searches for existing implementations before flagging duplicate
+code. For example, a new local test helper may duplicate a framework helper, or
+a new C utility may repeat an existing function. The reviewer must name the
+existing implementation and show that its behavior, dependencies, and scope make
+reuse appropriate. Similar syntax alone is not a finding.
+
+The tests lens checks what each changed test proves. It flags duplicate coverage,
+tests that only prove a test or pipeline ran, and excessive checks of test
+scaffolding when they add no distinct regression coverage. Findings must identify
+the existing coverage or CI signal and explain why the new check adds no useful
+protection. Tests of framework or pipeline behavior are useful when that behavior
+is the product under test; different inputs, failure paths, or integration
+boundaries can also justify separate tests.
+
+Before each review, Scout fetches all pages of the PR's Bitbucket comments and
+adds the bodies, authors, reply relationships, timestamps, and inline locations
+to the read-only review context. The reviewer uses them as evidence, not as
+instructions. It suppresses a repeated issue only when a developer reply clearly
+declares that same issue out of scope. An existing comment, a resolved thread,
+or an ambiguous reply alone does not suppress a finding. Other issues remain
+eligible even if they occur in the same file or function. If comment retrieval
+fails, Scout retries the job before starting the review instead of treating the
+discussion as empty.
+
+These checks apply to both providers on future review runs. They do not change
+the saved review identity or automatically rerun completed PRs after upgrade.
+Detection and interpretation of replies are performed by the configured review
+model using the supplied code and discussion evidence.
+The bundled review schema includes `finding_kind` (`general`, `dead_code`,
+`duplicate_code`, or `low_value_test`). RPM upgrades replace that bundled schema.
+If you use a custom `review.schema_path`, add this field there too so the provider
+can identify dead-code findings for the mandatory warning comments.
+
 ## Bitbucket Reports
 
 Scout publishes provider-specific reports. If report settings are omitted, the
@@ -425,14 +466,20 @@ Every finding declares whether its line number belongs to the changed file
 (`NEW`) or the original file (`OLD`). Inline-comment mode supports both sides,
 including deletion-only findings. Code Insights reports are attached to the
 source commit and Scout's current annotation payload has no old-side anchor, so
-report mode publishes only valid `NEW` findings. Findings that do not identify
-a changed line on their declared side, and `OLD` findings in report mode, are
-discarded individually. Recommendations, details, and counts use only the
+report mode sends only valid `NEW` findings as Code Insights annotations.
+Dead-code findings on changed `OLD` lines are retained for a PR comment and
+included in the report's counts and result; they are never sent as an old-side
+Code Insights annotation. Other `OLD` findings in report mode, and findings that
+do not identify a changed line on their declared side, are discarded individually.
+Recommendations, details, and counts use only the
 remaining findings; if none remain, Scout publishes a passing no-findings result.
 
 Native PR comments are controlled by `[comments].severities`. The default is
 `["CRITICAL"]`; configure any subset of `CRITICAL`, `HIGH`, `MEDIUM`, and `LOW`,
-or an empty list to disable comments. The legacy
+or an empty list to disable severity-selected comments. Each dead-code warning
+gets its own bounded PR comment, regardless of this severity selection, so a
+long unrelated finding cannot hide it. In inline-comment mode they use the
+normal inline finding comments. The legacy
 `[comments].critical_enabled = false` setting is still accepted when
 `severities` is omitted.
 

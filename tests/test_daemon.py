@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
@@ -11,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from scout.bitbucket import BitbucketError
+from scout.bitbucket import BitbucketClient, BitbucketCredentials, BitbucketError
 from scout.daemon import (
     ScoutDaemon,
     _append_provider_usage_log_entry,
@@ -24,7 +25,7 @@ from scout.daemon import (
     _seconds_until_next_poll,
 )
 from scout.config import CredentialStore, parse_config
-from scout.gitops import GitError
+from scout.gitops import GitError, GitManager
 from scout.models import PullRequest
 from scout.provider import ProviderError, ProviderResult, ProviderSuperseded
 from scout.schema import validate_review_output
@@ -2230,6 +2231,186 @@ class DaemonReviewLogTests(unittest.TestCase):
             )
             self.assertEqual(daemon.state.retryable_failures, [(32, 3, 300)])
 
+    def test_run_job_passes_paginated_discussions_to_provider_in_both_modes(self):
+        for output_mode in ("reports", "inline_comments"):
+            with self.subTest(output_mode=output_mode), tempfile.TemporaryDirectory() as tmp:
+                payload = valid_review()
+                provider = _FakeProvider(final_message={
+                    "recommendation": payload.recommendation,
+                    "report": payload.report,
+                    "annotations": payload.annotations,
+                })
+                daemon = _related_run_job_daemon(tmp, provider=provider)
+                daemon.repository_configs = {}
+                manager = GitManager(tmp)
+                daemon.git = manager
+                worktree = Path(tmp) / "worktree"
+                worktree.mkdir()
+                root = {
+                    "id": 101,
+                    "created_on": "2026-09-30T10:00:00Z",
+                    "content": {"raw": "Missing error handling"},
+                    "user": {"account_id": "reviewer", "display_name": "Reviewer"},
+                    "inline": {"path": "src/app.py", "to": 12},
+                }
+                reply = {
+                    "id": 102,
+                    "parent": {"id": 101},
+                    "created_on": "2026-09-30T10:01:00Z",
+                    "updated_on": "2026-09-30T10:02:00Z",
+                    "content": {"raw": "This issue is out of scope for this PR."},
+                    "user": {"account_id": "developer", "display_name": "Alice"},
+                }
+                client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+                daemon.bitbucket.list_pull_request_comments = client.list_pull_request_comments
+                pages = [
+                    {"values": [root], "next": "https://api.bitbucket.org/2.0/second-page"},
+                    {"values": [reply]},
+                ]
+                original_run = provider.run
+
+                def run_with_context(**kwargs):
+                    manifest = json.loads((worktree / ".scout-review/context.json").read_text(encoding="utf-8"))
+                    comments_path = Path(manifest["comments_path"])
+                    comments = json.loads(comments_path.read_text(encoding="utf-8"))
+                    self.assertEqual(comments, [root, reply])
+                    self.assertIn(str(comments_path), kwargs["prompt"])
+                    self.assertEqual(stat.S_IMODE(comments_path.stat().st_mode) & 0o222, 0)
+                    return original_run(**kwargs)
+
+                diff = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -0,0 +12 @@\n+changed call\n"
+                with patch.object(client, "_request_json", side_effect=pages) as requests, \
+                        patch.object(manager, "ensure_mirror", return_value=Path(tmp) / "mirror.git"), \
+                        patch.object(manager, "create_worktree", return_value=worktree), \
+                        patch.object(manager, "_git_capture", side_effect=["c" * 40, diff, "src/app.py\n"]), \
+                        patch.object(manager, "remove_worktree", side_effect=lambda *_: manager._make_writable(worktree)), \
+                        patch.object(provider, "run", side_effect=run_with_context):
+                    daemon.run_job(review_job(provider="codex", job_id=40, output_mode=output_mode))
+
+                self.assertEqual(requests.call_count, 2)
+                self.assertEqual(len(provider.runs), 1)
+                self.assertEqual(daemon.state.retryable_failures, [])
+                self.assertEqual(len(daemon.state.successes), 1)
+                # The provider judges scope; merely loading this thread never
+                # suppresses the provider's returned finding in Python.
+                if output_mode == "reports":
+                    self.assertEqual(len(daemon.bitbucket.annotations[0][3]), 1)
+                else:
+                    self.assertEqual(len(daemon.bitbucket.inline_comments), 1)
+
+    def test_run_job_retries_failed_discussion_fetch_before_provider(self):
+        for output_mode in ("reports", "inline_comments"):
+            with self.subTest(output_mode=output_mode), tempfile.TemporaryDirectory() as tmp:
+                provider = _FakeProvider()
+                daemon = _related_run_job_daemon(tmp, provider=provider)
+                client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+                daemon.bitbucket.list_pull_request_comments = client.list_pull_request_comments
+                with patch.object(client, "_request_json", side_effect=[
+                    {"values": [{"id": 101}], "next": "https://api.bitbucket.org/2.0/second-page"},
+                    BitbucketError("temporary comments failure"),
+                ]):
+                    daemon.run_job(review_job(provider="codex", job_id=41, output_mode=output_mode))
+
+                self.assertEqual(provider.runs, [])
+                self.assertEqual(provider.risk_calls, [])
+                self.assertEqual(daemon.state.retryable_failures, [(41, 3, 300)])
+                self.assertEqual(daemon.bitbucket.operations, [])
+                self.assertEqual(len(daemon.git.removed), 2)
+
+    def test_run_job_checks_supersession_between_discussion_pages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = _FakeProvider()
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+            client = BitbucketClient("https://api.bitbucket.org/2.0", "ws", BitbucketCredentials("bot", "secret"))
+            daemon.bitbucket.list_pull_request_comments = client.list_pull_request_comments
+
+            def first_page(*args):
+                daemon.state.is_job_superseded = lambda *_: True
+                return {"values": [{"id": 101}], "next": "https://api.bitbucket.org/2.0/second-page"}
+
+            with patch.object(client, "_request_json", side_effect=first_page) as requests:
+                daemon.run_job(review_job(provider="codex", job_id=42))
+
+            self.assertEqual(requests.call_count, 1)
+            self.assertEqual(provider.runs, [])
+            self.assertEqual(daemon.state.retryable_failures, [])
+            self.assertEqual(daemon.bitbucket.operations, [])
+            self.assertEqual(len(daemon.git.removed), 2)
+
+    def test_run_job_report_mode_comments_on_old_dead_code_without_annotation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = valid_review()
+            payload.annotations[0].update({
+                "line": 11,
+                "line_side": "OLD",
+                "finding_kind": "dead_code",
+                "severity": "MEDIUM",
+                "summary": "The removed caller leaves a helper unused",
+            })
+            provider = _FakeProvider(final_message={
+                "recommendation": payload.recommendation,
+                "report": payload.report,
+                "annotations": payload.annotations,
+            })
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+            daemon.git.diff = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n@@ -11 +11,0 @@\n-last_helper_call()\n"
+
+            daemon.run_job(review_job(provider="codex", job_id=43))
+
+            report = daemon.bitbucket.reports[0][3]
+            self.assertEqual(daemon.bitbucket.annotations[0][3], [])
+            self.assertEqual(report["result"], "FAILED")
+            self.assertIn({"title": "Findings", "type": "NUMBER", "value": 1}, report["data"])
+            self.assertEqual(len(daemon.bitbucket.comments), 1)
+            self.assertIn("The removed caller leaves a helper unused", daemon.bitbucket.comments[0][2])
+            self.assertEqual(daemon.state.retryable_failures, [])
+            review_log = json.loads(Path(tmp, "review-log.jsonl").read_text(encoding="utf-8"))
+            self.assertEqual(review_log["recommendation"], "request_changes")
+            self.assertEqual(review_log["findings_count"], 1)
+
+    def test_run_job_report_mode_publishes_each_dead_code_warning_despite_verbose_general_finding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = valid_review()
+            general = dict(payload.annotations[0], severity="CRITICAL", details="Explanation. " * 1000)
+            dead_code = [
+                dict(
+                    general,
+                    external_id="dead-code-{}".format(line),
+                    finding_kind="dead_code",
+                    severity="LOW",
+                    line=line,
+                    line_side="OLD",
+                    summary="Unused helper {} after removing its caller".format(line),
+                    details="Caller evidence. " * 1000,
+                )
+                for line in (11, 12)
+            ]
+            provider = _FakeProvider(final_message={
+                "recommendation": payload.recommendation,
+                "report": payload.report,
+                "annotations": [general] + dead_code,
+            })
+            daemon = _related_run_job_daemon(tmp, provider=provider)
+            daemon.git.diff = (
+                "diff --git a/src/app.py b/src/app.py\n"
+                "--- a/src/app.py\n+++ b/src/app.py\n"
+                "@@ -11,2 +12 @@\n-last_helper_call()\n-other_helper_call()\n+replacement()\n"
+            )
+
+            daemon.run_job(review_job(provider="codex", job_id=44))
+
+            comments = [comment[2] for comment in daemon.bitbucket.comments]
+            self.assertEqual(len(comments), 3)
+            self.assertTrue(all(len(content) <= 8000 for content in comments))
+            for finding in [general] + dead_code:
+                self.assertEqual(sum(finding["summary"] in content for content in comments), 1)
+            self.assertFalse(any(all(finding["summary"] in content for finding in dead_code) for content in comments))
+            annotations = daemon.bitbucket.annotations[0][3]
+            self.assertEqual(len(annotations), 1)
+            self.assertEqual(annotations[0]["summary"], general["summary"])
+            self.assertEqual(daemon.state.retryable_failures, [])
+            self.assertEqual(len(daemon.state.successes), 1)
+
     def test_run_job_inline_mode_publishes_deleted_and_new_side_findings(self):
         with tempfile.TemporaryDirectory() as tmp:
             payload = valid_review()
@@ -2680,7 +2861,8 @@ class _FakeGit:
         self.suffix = suffix
         return "/worktree"
 
-    def prepare_context(self, mirror, worktree, pr):
+    def prepare_context(self, mirror, worktree, pr, related_repositories=None, pull_request_comments=None):
+        self.prepared_comments = pull_request_comments
         return {
             "workspace": pr.workspace,
             "repo_slug": pr.repo_slug,
@@ -2696,6 +2878,7 @@ class _FakeGit:
             "context_path": "/context.json",
             "files_path": "/files.txt",
             "diff_path": "/diff.patch",
+            "comments_path": "/comments.json",
             "diff": (
                 "diff --git a/src/app.py b/src/app.py\n"
                 "--- a/src/app.py\n"
@@ -2728,9 +2911,9 @@ class _RelatedFakeGit(_FakeGit):
     ):
         return "/context-job-{}/{}".format(job_id, repo_slug)
 
-    def prepare_context(self, mirror, worktree, pr, related_repositories=None):
+    def prepare_context(self, mirror, worktree, pr, related_repositories=None, pull_request_comments=None):
         self.prepared_related = related_repositories
-        context = super().prepare_context(mirror, worktree, pr)
+        context = super().prepare_context(mirror, worktree, pr, pull_request_comments=pull_request_comments)
         if self.diff is not None:
             context["diff"] = self.diff
         context["related_repositories"] = list(related_repositories or [])

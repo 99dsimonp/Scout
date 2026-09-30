@@ -314,7 +314,8 @@ retry_backoff_seconds = 300
 
 [comments]
 critical_enabled = true
-# Empty disables native PR comments. Default is ["CRITICAL"].
+# Empty disables severity-selected comments; dead-code warnings still post.
+# Default is ["CRITICAL"].
 severities = ["CRITICAL"]
 
 [review]
@@ -571,6 +572,8 @@ Scout should generate review context before invoking the provider:
 - Diff patch.
 - Review policy version.
 - JSON schema path or inline schema.
+- Existing PR comment bodies, author identities, parent IDs, timestamps, and
+  inline locations from every API page.
 
 This context may be written into a temporary directory or a hidden worktree
 directory such as `.scout-review/`. The agent prompt should refer to these files.
@@ -578,6 +581,37 @@ Scout generates `diff.patch` with color, external diff drivers, and textconv
 disabled, submodules included in short gitlink form, and explicit `a/` and `b/`
 prefixes. Location filtering relies on that canonical structure and rejects a
 non-empty patch that does not provide it.
+
+Before starting a provider, Scout fetches the PR discussion for both output
+modes and writes `.scout-review/comments.json`. The context manifest and prompt
+refer to this file. It is made read-only with the rest of the review worktree.
+Deleted comments retain their identity and parent relationship as tombstones;
+their deleted bodies cannot be used as evidence of an out-of-scope decision.
+If fetching any page fails, normal job retry handling runs before the provider
+starts. Missing discussion must not be mistaken for an empty discussion.
+
+The provider treats discussion content as untrusted evidence. It suppresses
+only the same concrete issue when a developer reply explicitly says it is out
+of scope. It must connect the reply to the original issue through parent IDs
+and consider later replies that reverse the decision. Root-only mentions,
+resolved state, silence, bot acknowledgements, ambiguous language, and unrelated
+scope decisions do not suppress findings. Existing comments without such a
+developer reply may be reported again.
+
+The best-practices lens checks for code made unused by the PR and avoidable
+duplicates of an existing implementation. Dead-code evidence must account for
+callers, exported interfaces, dynamic dispatch, callbacks, and registrations;
+the changed causal line is the location even if the unused declaration is
+unchanged. Duplicate-code findings identify an existing implementation and
+explain why its behavior and dependency constraints permit reuse.
+
+The tests lens checks whether changed tests add distinct regression protection.
+Examples of low-value tests include repeating existing coverage, proving only
+that a test ran, checking that Jenkins ran a pipeline, and excessive assertions
+about scaffolding that do not exercise product behavior. A finding must identify
+the redundant coverage or signal. Framework and infrastructure tests remain
+useful when they verify the actual behavior under change. These policies use
+the existing lenses and do not add reviewer fan-out or invalidate saved reviews.
 
 ## Git Authentication
 
@@ -898,6 +932,7 @@ Example shape:
     {
       "external_id": "finding-001",
       "annotation_type": "BUG",
+      "finding_kind": "general",
       "path": "src/example.py",
       "line": 123,
       "line_side": "NEW",
@@ -917,6 +952,7 @@ Recommended enums:
 
 - `recommendation`: `approve`, `request_changes`
 - `annotation_type`: `BUG`, `VULNERABILITY`, `CODE_SMELL`
+- `finding_kind`: `general`, `dead_code`, `duplicate_code`, `low_value_test`
 - `severity`: `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`
 - `annotation.result`: `FAILED`
 - `line_side`: `NEW`, `OLD`
@@ -929,6 +965,9 @@ for the final report result, uses the report type as metadata, and builds the
 published report details from the annotation summaries. Scout-only helper fields
 such as `reviewer`, `confidence`, and `smallest_fix` are embedded into readable
 annotation details because Bitbucket annotations do not accept them directly.
+`finding_kind` classifies the finding for Scout's publishing rules and is not
+sent to the Bitbucket annotation API. Bundled provider schemas require it;
+runtime validation also accepts older outputs without it as general findings.
 
 The v1 schema is stored at `/etc/scout/review.schema.json`. It requires a final
 recommendation and maps deterministically to the Bitbucket report result:
@@ -981,6 +1020,7 @@ Initial schema outline:
         "required": [
           "external_id",
           "annotation_type",
+          "finding_kind",
           "path",
           "line",
           "line_side",
@@ -995,6 +1035,7 @@ Initial schema outline:
         "properties": {
           "external_id": { "type": "string", "minLength": 1 },
           "annotation_type": { "type": "string", "enum": ["BUG", "VULNERABILITY", "CODE_SMELL"] },
+          "finding_kind": { "type": "string", "enum": ["general", "dead_code", "duplicate_code", "low_value_test"] },
           "path": { "type": "string", "minLength": 1 },
           "line": { "type": "integer", "minimum": 1 },
           "line_side": { "type": "string", "enum": ["NEW", "OLD"] },
@@ -1034,8 +1075,9 @@ Validation rules:
   counted even though its diff line starts with `---`.
 - After schema validation, discard annotations that do not target a changed line
   on their declared side. Inline-comment mode retains both sides. Report mode
-  retains only `NEW` because Code Insights is attached to the source commit and
-  Scout's current payload has no old-side anchor. Derive the final
+  retains `NEW` plus valid `OLD` dead-code findings for PR comments. Code Insights
+  is attached to the source commit, so annotation serialization excludes all
+  `OLD` locations. Derive the final
   recommendation, report details, and finding counts from the retained set; an
   empty retained set becomes an approval with no findings.
 - Reject invalid or incomplete provider output without salvaging partial stream
@@ -1119,11 +1161,16 @@ longer present in the validated output.
 Scout can also post selected findings as native Bitbucket PR comments. The
 configured `[comments].severities` list controls which annotation severities are
 included, using `CRITICAL`, `HIGH`, `MEDIUM`, and `LOW`. The default is
-`["CRITICAL"]`. An empty list disables comment posting. The legacy
+`["CRITICAL"]`. An empty list disables severity-selected comments. Each dead-code
+finding gets a separate bounded PR comment, including valid `OLD` findings that
+cannot be serialized as Code Insights annotations. They remain in the report
+counts and recommendation. Its identifying text and location precede long
+details, so another finding cannot consume its comment budget. Ordinary findings
+still use the severity-selected aggregate comment. The legacy
 `[comments].critical_enabled = false` setting is still accepted as shorthand for
-an empty severity list when `severities` is omitted. For a single selected
+an empty severity list when `severities` is omitted. For a single actual
 severity the comment starts with `Scout: {Severity} issue found by {provider}:`;
-for multiple selected severities it starts with `Scout: Issues found by
+for multiple actual severities it starts with `Scout: Issues found by
 {provider}:`. Scout does not deduplicate these comments; each completed review
 run may leave a new PR comment so reviewers retain history after Code Insights
 reports move to a new commit.

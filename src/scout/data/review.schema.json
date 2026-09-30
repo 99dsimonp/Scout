@@ -53,6 +53,7 @@
           "reviewer",
           "confidence",
           "smallest_fix",
+          "finding_kind",
           "suggested_change"
         ],
         "properties": {
@@ -70,6 +71,7 @@
             "enum": ["correctness", "security", "tests", "performance", "best-practices", "compatibility"]
           },
           "confidence": { "type": "string", "enum": ["HIGH", "MEDIUM", "LOW"] },
+          "finding_kind": { "type": "string", "enum": ["general", "dead_code", "duplicate_code", "low_value_test"] },
           "smallest_fix": { "type": "string", "minLength": 1 },
           "suggested_change": {
             "type": ["object", "null"],

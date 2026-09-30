@@ -9,8 +9,8 @@ class PackagingTests(unittest.TestCase):
     def test_rpm_spec_uses_pyproject_build_macros(self):
         spec = (ROOT / "packaging" / "scout.spec").read_text(encoding="utf-8")
 
-        self.assertIn("Release:        3%{?dist}", spec)
-        self.assertIn("Scout contributors <noreply@github.com> - 0.1.0-3", spec)
+        self.assertIn("Release:        4%{?dist}", spec)
+        self.assertIn("Scout contributors <noreply@github.com> - 0.1.0-4", spec)
         self.assertIn("BuildRequires:  pyproject-rpm-macros", spec)
         self.assertIn("%generate_buildrequires\n%pyproject_buildrequires -w", spec)
         self.assertIn("%pyproject_wheel", spec)
