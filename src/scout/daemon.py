@@ -8,6 +8,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -526,24 +527,48 @@ class ScoutDaemon:
         stop = threading.Event()
         lease_lost = threading.Event()
         lease_seconds = self._lease_seconds(job.provider)
+        renewal_interval = _lease_renewal_interval(lease_seconds)
+        next_renewal_delay = renewal_interval
+        deadline = time.monotonic()
+        try:
+            deadline += max(0.0, (
+                datetime.fromisoformat(job.leased_until) - datetime.now(timezone.utc)
+            ).total_seconds())
+        except (TypeError, ValueError):
+            # A missing or invalid claim expiry gives no grace if renewal fails.
+            pass
+
+        def is_lease_lost() -> bool:
+            # Provider polling must observe expiry even while renewal SQL blocks.
+            if time.monotonic() >= deadline:
+                lease_lost.set()
+            return lease_lost.is_set()
 
         def renew() -> bool:
+            nonlocal deadline, next_renewal_delay
+            started_at = time.monotonic()
             try:
                 renewed = self.state.renew_job_lease(job, lease_seconds)
             except Exception:
                 LOG.exception("failed to renew review job lease id=%s", job.id)
-                renewed = False
-            if not renewed:
-                lease_lost.set()
-            return renewed
+                next_renewal_delay = min(1.0, renewal_interval)
+            else:
+                if not renewed:
+                    lease_lost.set()
+                else:
+                    # StateStore timestamps the lease before SQL and truncates
+                    # to whole seconds. SQL wait time must not extend our deadline.
+                    deadline = started_at + lease_seconds - 1
+                    next_renewal_delay = renewal_interval
+            return not is_lease_lost()
 
         if not renew():
             self.state.return_superseded_to_pending(job.id, job.lease_token)
             return
 
         def heartbeat() -> None:
-            while not stop.wait(_lease_renewal_interval(lease_seconds)):
-                if not renew():
+            while not stop.wait(max(0.0, min(next_renewal_delay, deadline - time.monotonic()))):
+                if is_lease_lost() or not renew():
                     return
 
         # Fetches and provider-slot waits can outlast the original lease before
@@ -551,14 +576,14 @@ class ScoutDaemon:
         worker = threading.Thread(target=heartbeat, name="review-lease-{}".format(job.id), daemon=True)
         worker.start()
         try:
-            self._run_job(job, lease_lost)
+            self._run_job(job, is_lease_lost)
         finally:
             stop.set()
             worker.join()
 
-    def _run_job(self, job: ReviewJob, lease_lost: threading.Event) -> None:
+    def _run_job(self, job: ReviewJob, is_lease_lost: Callable[[], bool]) -> None:
         def is_superseded() -> bool:
-            return lease_lost.is_set() or self.state.is_job_superseded(job.id, job.lease_token)
+            return is_lease_lost() or self.state.is_job_superseded(job.id, job.lease_token)
 
         LOG.info("starting review job id=%s repo=%s pr=%s commit=%s", job.id, job.repo_slug, job.pr_id, job.running_source_commit_hash)
         provider_config = self.provider_configs[job.provider]

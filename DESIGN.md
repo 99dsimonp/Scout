@@ -1229,9 +1229,12 @@ manual Scout process cannot clear live leases from the active daemon.
 While a worker is active, a heartbeat renews its lease through repository
 preparation, provider waits, execution, and publishing. Renewal checks the lease
 token and review identity, so an old worker cannot extend another attempt's
-lease. The scheduler also excludes job IDs with active worker futures until
-their cleanup finishes; an expired lease must not start a second worker that
-removes the first worker's worktree.
+lease. A temporary database error does not prove ownership was lost: the worker
+retries renewal while the last confirmed lease is still valid. It stops if an
+update rejects its ownership or that lease reaches its expiry deadline. Failed
+renewals do not move the deadline forward. The scheduler also excludes job IDs
+with active worker futures until their cleanup finishes; an expired lease must
+not start a second worker that removes the first worker's worktree.
 
 RPM upgrades preserve the configured SQLite database and user configuration.
 Startup migrates report identities written before output modes existed to the

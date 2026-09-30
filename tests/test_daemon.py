@@ -1,9 +1,12 @@
 import json
+import sqlite3
 import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import Future
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -153,14 +156,14 @@ class DaemonReviewLogTests(unittest.TestCase):
                 self.assertTrue(renewed.is_set())
                 self.assertEqual(daemon.state.successes, [("codex", "scout-codex-v1")])
 
-    def test_failed_heartbeat_cancels_provider_and_cleans_worktrees(self):
+    def test_rejected_heartbeat_cancels_provider_and_cleans_worktrees(self):
         with tempfile.TemporaryDirectory() as tmp:
             daemon = _related_run_job_daemon(tmp)
             provider_started = threading.Event()
 
             def renew(job, seconds):
                 if provider_started.is_set():
-                    raise RuntimeError("database unavailable")
+                    return False
                 return True
 
             def run(**kwargs):
@@ -174,12 +177,153 @@ class DaemonReviewLogTests(unittest.TestCase):
             daemon.state.renew_job_lease = renew
             daemon.providers["codex"].run = run
             with patch("scout.daemon._lease_renewal_interval", return_value=0.01):
-                with self.assertLogs("scout.daemon", level="ERROR") as captured:
-                    daemon.run_job(review_job(provider="codex"))
-            self.assertIn("failed to renew review job lease", captured.output[0])
+                daemon.run_job(review_job(provider="codex"))
             self.assertEqual(daemon.state.successes, [])
             self.assertEqual(len(daemon.git.removed), 2)
             self.assertFalse(any(thread.name == "review-lease-7" for thread in threading.enumerate()))
+
+    def test_transient_renewal_failure_keeps_the_same_provider_run(self):
+        for fail_initial_renewal in (False, True):
+            with self.subTest(initial=fail_initial_renewal), tempfile.TemporaryDirectory() as tmp:
+                daemon = _related_run_job_daemon(tmp)
+                provider_started = threading.Event()
+                recovered = threading.Event()
+                failed = []
+                original_run = daemon.providers["codex"].run
+
+                def renew(job, seconds):
+                    if not failed and (fail_initial_renewal or provider_started.is_set()):
+                        failed.append(True)
+                        raise sqlite3.OperationalError("database is locked")
+                    if failed:
+                        recovered.set()
+                    return True
+
+                def run(**kwargs):
+                    provider_started.set()
+                    self.assertTrue(recovered.wait(2), "heartbeat did not retry after contention")
+                    self.assertFalse(kwargs["is_superseded"]())
+                    return original_run(**kwargs)
+
+                daemon.state.renew_job_lease = renew
+                daemon.providers["codex"].run = run
+                job = replace(review_job(provider="codex"), leased_until=(
+                    datetime.now(timezone.utc) + timedelta(seconds=60)
+                ).isoformat())
+                with patch("scout.daemon._lease_renewal_interval", return_value=0.001):
+                    with self.assertLogs("scout.daemon", level="ERROR"):
+                        daemon.run_job(job)
+                self.assertEqual(len(daemon.providers["codex"].runs), 1)
+                self.assertEqual(daemon.state.successes, [("codex", "scout-codex-v1")])
+
+    def test_repeated_renewal_failures_cancel_at_confirmed_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = _related_run_job_daemon(tmp)
+            daemon._lease_seconds = lambda provider: 11
+            now = [100.0]
+            provider_started = threading.Event()
+            observations = []
+            finished = threading.Event()
+            callback = []
+
+            def renew(job, seconds):
+                if provider_started.is_set():
+                    now[0] += 5
+                    observations.append(callback[0]())
+                    if len(observations) == 2:
+                        finished.set()
+                    raise sqlite3.OperationalError("database is locked")
+                return True
+
+            def run(**kwargs):
+                callback.append(kwargs["is_superseded"])
+                provider_started.set()
+                self.assertTrue(finished.wait(2))
+                raise ProviderSuperseded("lease expired")
+
+            daemon.state.renew_job_lease = renew
+            daemon.providers["codex"].run = run
+            with patch("scout.daemon.time.monotonic", side_effect=lambda: now[0]):
+                with patch("scout.daemon._lease_renewal_interval", return_value=0.001):
+                    with self.assertLogs("scout.daemon", level="ERROR"):
+                        daemon.run_job(review_job(provider="codex"))
+            self.assertEqual(observations, [False, True])
+            self.assertEqual(daemon.state.successes, [])
+
+    def test_provider_observes_expiry_while_renewal_is_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = _related_run_job_daemon(tmp)
+            daemon._lease_seconds = lambda provider: 11
+            now = [100.0]
+            provider_started = threading.Event()
+            renewing = threading.Event()
+            release = threading.Event()
+            expired = []
+
+            def renew(job, seconds):
+                if provider_started.is_set():
+                    now[0] = 110.0
+                    renewing.set()
+                    release.wait(2)
+                    raise sqlite3.OperationalError("database is locked")
+                return True
+
+            def run(**kwargs):
+                provider_started.set()
+                try:
+                    self.assertTrue(renewing.wait(2))
+                    expired.append(kwargs["is_superseded"]())
+                    raise ProviderSuperseded("lease expired")
+                finally:
+                    release.set()
+
+            daemon.state.renew_job_lease = renew
+            daemon.providers["codex"].run = run
+            with patch("scout.daemon.time.monotonic", side_effect=lambda: now[0]):
+                with patch("scout.daemon._lease_renewal_interval", return_value=0.001):
+                    with self.assertLogs("scout.daemon", level="ERROR"):
+                        daemon.run_job(review_job(provider="codex"))
+            self.assertEqual(expired, [True])
+            self.assertEqual(daemon.state.successes, [])
+
+    def test_slow_successful_renewal_uses_attempt_start_and_rounding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            daemon = _related_run_job_daemon(tmp)
+            daemon._lease_seconds = lambda provider: 11
+            now = [100.0]
+            started = []
+
+            def renew(job, seconds):
+                now[0] = 110.0
+                return True
+
+            daemon.state.renew_job_lease = renew
+            daemon._run_job = lambda *args: started.append(True)
+            with patch("scout.daemon.time.monotonic", side_effect=lambda: now[0]):
+                daemon.run_job(review_job(provider="codex"))
+            self.assertEqual(started, [])
+
+    def test_initial_renewal_failure_respects_claim_expiry(self):
+        for expires_in in (None, -1, 5):
+            with self.subTest(expires_in=expires_in), tempfile.TemporaryDirectory() as tmp:
+                daemon = _related_run_job_daemon(tmp)
+                now = [100.0]
+                started = []
+                lease = None if expires_in is None else (
+                    datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+                ).isoformat()
+
+                def renew(job, seconds):
+                    # Even a still-valid claim expires while this SQL attempt waits.
+                    now[0] += 6
+                    raise sqlite3.OperationalError("database is locked")
+
+                daemon.state.renew_job_lease = renew
+                daemon._run_job = lambda *args: started.append(True)
+                with patch("scout.daemon.time.monotonic", side_effect=lambda: now[0]):
+                    with self.assertLogs("scout.daemon", level="ERROR"):
+                        daemon.run_job(replace(review_job(provider="codex"), leased_until=lease))
+                self.assertEqual(started, [])
 
     def test_schedule_does_not_reclaim_job_with_an_active_worker(self):
         daemon = ScoutDaemon.__new__(ScoutDaemon)

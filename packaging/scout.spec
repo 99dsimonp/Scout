@@ -69,6 +69,7 @@ exit 0
 %changelog
 * Tue Sep 29 2026 Scout contributors <noreply@github.com> - 0.1.0-3
 - Renew active review leases and exclude active jobs from reclamation
+- Retry temporary lease renewal errors while the confirmed lease remains valid
 - Fix diff line tracking, stale Codex output, and Code Insights annotation limits
 - Migrate legacy review identities so upgrades preserve completed review history
 
