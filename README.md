@@ -141,16 +141,16 @@ providers = ["codex", "claude"]   # or the legacy single selector: strategy = "c
 
 [agents.codex]
 command = "codex"
-model = "gpt-5.5"
-reasoning_effort = "xhigh"
+model = "gpt-6.1-sol"
+reasoning_effort = "medium"
 fast_mode = true
 
 [agents.claude]
 enabled = true                    # Claude is disabled by default
 auth_mode = "logged_in"           # or "api" (uses the `claude` systemd credential)
 command = "claude"
-model = "claude-sonnet-4-6"       # empty = CLI default
-effort = "max"
+model = "claude-opus-5-5"       # empty = CLI default
+effort = "medium"
 ```
 
 Each provider runs as its own job, and Scout never swaps one provider for
@@ -177,8 +177,8 @@ by default and Claude allows 1. You can override any sizing key under
 ```toml
 [review.risk]
 provider = "codex"
-model = "gpt-5.4"
-effort = "low"
+model = "gpt-6.1-sol"
+effort = "medium"
 timeout_seconds = 120
 ```
 
@@ -204,8 +204,8 @@ output_mode = "inline_comments"
 
 [review.request_comments]   # interprets "@scout" requests; also runs deduplication
 provider = "codex"
-model = "gpt-5.4"
-effort = "low"
+model = "gpt-6.1-sol"
+effort = "medium"
 
 [review.deduplication]
 enabled = true

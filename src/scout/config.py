@@ -98,8 +98,8 @@ class ReviewConfig:
 class DeduplicationConfig:
     enabled: bool = True
     provider: str = "codex"
-    model: str = "gpt-5.4"
-    effort: str = "low"
+    model: str = "gpt-6.1-sol"
+    effort: str = "medium"
     timeout_seconds: int = 120
     max_input_findings: int = 200
     max_input_bytes: int = 200000
@@ -287,14 +287,14 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
     codex_auth_mode = str(codex.get("auth_mode", "logged_in"))
     if codex_auth_mode not in {"logged_in", "api"}:
         raise ConfigError("agents.codex.auth_mode must be logged_in or api")
-    codex_reasoning_effort = str(codex.get("reasoning_effort", "xhigh"))
+    codex_reasoning_effort = str(codex.get("reasoning_effort", "medium"))
     if codex_reasoning_effort not in {"low", "medium", "high", "xhigh"}:
         raise ConfigError("agents.codex.reasoning_effort must be low, medium, high, or xhigh")
 
     claude_auth_mode = str(claude.get("auth_mode", "logged_in"))
     if claude_auth_mode not in {"logged_in", "api"}:
         raise ConfigError("agents.claude.auth_mode must be logged_in or api")
-    claude_effort = str(claude.get("effort", "max"))
+    claude_effort = str(claude.get("effort", "medium"))
     if claude_effort and claude_effort not in {"low", "medium", "high", "xhigh", "max"}:
         raise ConfigError("agents.claude.effort must be empty or one of low, medium, high, xhigh, or max")
 
@@ -466,7 +466,7 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
                 max_parallel=_positive_int(codex.get("max_parallel", 2), "agents.codex.max_parallel"),
                 timeout_seconds=_positive_int(codex.get("timeout_seconds", 1800), "agents.codex.timeout_seconds"),
                 command=str(codex.get("command", "codex")),
-                model=str(codex.get("model", "gpt-5.5")),
+                model=str(codex.get("model", "gpt-6.1-sol")),
                 reasoning_effort=codex_reasoning_effort,
                 fast_mode=bool(codex.get("fast_mode", True)),
                 max_subagents=codex_max_subagents,
@@ -487,7 +487,7 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
                     "agents.claude.timeout_seconds",
                 ),
                 command=str(claude.get("command", "claude")),
-                model=str(claude.get("model", "claude-sonnet-4-6")),
+                model=str(claude.get("model", "claude-opus-5-5")),
                 effort=claude_effort,
                 max_subagents=claude_max_subagents,
                 subagent_max_per_lens=claude_subagent_max_per_lens,
@@ -636,8 +636,8 @@ def _parse_risk_config(
 
     if "codex" in risk or "claude" in risk:
         raise ConfigError("review.risk uses provider-agnostic model and effort keys")
-    model = str(risk.get("model", "claude-sonnet-4-6" if provider == "claude" else "gpt-5.4"))
-    effort = str(risk.get("effort", "low"))
+    model = str(risk.get("model", "claude-opus-5-5" if provider == "claude" else "gpt-6.1-sol"))
+    effort = str(risk.get("effort", "medium"))
     if provider == "codex" and effort not in {"low", "medium", "high", "xhigh"}:
         raise ConfigError("review.risk.effort must be low, medium, high, or xhigh for codex")
     if provider == "claude" and effort and effort not in {"low", "medium", "high", "xhigh", "max"}:
@@ -673,8 +673,8 @@ def _parse_request_comments_config(
 
     if "codex" in request_comments or "claude" in request_comments:
         raise ConfigError("review.request_comments uses provider-agnostic model and effort keys")
-    model = str(request_comments.get("model", "claude-sonnet-4-6" if provider == "claude" else "gpt-5.4"))
-    effort = str(request_comments.get("effort", "low"))
+    model = str(request_comments.get("model", "claude-opus-5-5" if provider == "claude" else "gpt-6.1-sol"))
+    effort = str(request_comments.get("effort", "medium"))
     if provider == "codex" and effort not in {"low", "medium", "high", "xhigh"}:
         raise ConfigError("review.request_comments.effort must be low, medium, high, or xhigh for codex")
     if provider == "claude" and effort and effort not in {"low", "medium", "high", "xhigh", "max"}:

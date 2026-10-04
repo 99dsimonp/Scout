@@ -101,16 +101,16 @@ subagent_max_per_lens = 4
 enabled = true
 # Must name an enabled configured agent provider when enabled.
 provider = "codex"
-model = "gpt-5.4"
+model = "gpt-6.1-sol"
 # For Codex this maps to model_reasoning_effort; for Claude this maps to --effort.
-effort = "low"
+effort = "medium"
 timeout_seconds = 120
 
 [review.request_comments]
 # Classifier used to detect @scout review requests in PR comments.
 provider = "codex"
-model = "gpt-5.4"
-effort = "low"
+model = "gpt-6.1-sol"
+effort = "medium"
 timeout_seconds = 120
 
 [review.deduplication]
@@ -118,8 +118,8 @@ timeout_seconds = 120
 # False retains every candidate; a selector that cannot recover also publishes every candidate.
 enabled = true
 # Runs on the review.request_comments provider; omitted model settings inherit it too.
-# model = "gpt-5.4"
-# effort = "low"
+# model = "gpt-6.1-sol"
+# effort = "medium"
 # timeout_seconds = 120
 max_input_findings = 200
 max_input_bytes = 200000
@@ -140,8 +140,8 @@ max_parallel = 2
 timeout_seconds = 1800
 # Set this to an absolute path if systemd cannot find the CLI on its PATH.
 command = "codex"
-model = "gpt-5.5"
-reasoning_effort = "xhigh"
+model = "gpt-6.1-sol"
+reasoning_effort = "medium"
 fast_mode = true
 max_subagents = 18
 # Optional provider review sizing overrides. Defaults come from [review].
@@ -164,9 +164,9 @@ timeout_seconds = 1800
 # Set this to an absolute path if systemd cannot find the CLI on its PATH.
 command = "claude"
 # Optional. Leave empty to use the Claude CLI default.
-model = "claude-sonnet-4-6"
+model = "claude-opus-5-5"
 # Optional. Allowed values: low, medium, high, xhigh, max. Leave empty to omit.
-effort = "max"
+effort = "medium"
 max_subagents = 20
 # Optional provider review sizing overrides. Claude defaults to one reviewer
 # subagent per category to keep subscription token use predictable.

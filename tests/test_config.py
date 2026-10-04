@@ -25,8 +25,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.service.retention_days, 7)
         self.assertEqual(config.agents.strategy, "codex")
         self.assertEqual(config.agents.providers, ["codex"])
-        self.assertEqual(config.agents.codex.model, "gpt-5.5")
-        self.assertEqual(config.agents.codex.reasoning_effort, "xhigh")
+        self.assertEqual(config.agents.codex.model, "gpt-6.1-sol")
+        self.assertEqual(config.agents.codex.reasoning_effort, "medium")
         self.assertTrue(config.agents.codex.fast_mode)
         self.assertEqual(config.agents.codex.timeout_seconds, 1800)
         self.assertEqual(config.agents.codex.max_subagents, 18)
@@ -38,8 +38,8 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config.agents.claude.enabled)
         self.assertEqual(config.agents.claude.command, "claude")
         self.assertEqual(config.agents.claude.timeout_seconds, 1800)
-        self.assertEqual(config.agents.claude.model, "claude-sonnet-4-6")
-        self.assertEqual(config.agents.claude.effort, "max")
+        self.assertEqual(config.agents.claude.model, "claude-opus-5-5")
+        self.assertEqual(config.agents.claude.effort, "medium")
         self.assertEqual(config.agents.claude.max_subagents, 20)
         self.assertEqual(config.agents.claude.subagent_max_per_lens, 1)
         self.assertEqual(config.agents.claude.subagent_small_loc_limit, 150)
@@ -59,12 +59,12 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(config.review.risk.enabled)
         self.assertEqual(config.review.risk.provider, "codex")
         self.assertEqual(config.review.risk.timeout_seconds, 120)
-        self.assertEqual(config.review.risk.model, "gpt-5.4")
-        self.assertEqual(config.review.risk.effort, "low")
+        self.assertEqual(config.review.risk.model, "gpt-6.1-sol")
+        self.assertEqual(config.review.risk.effort, "medium")
         self.assertEqual(config.review.request_comments.provider, "codex")
         self.assertEqual(config.review.request_comments.timeout_seconds, 120)
-        self.assertEqual(config.review.request_comments.model, "gpt-5.4")
-        self.assertEqual(config.review.request_comments.effort, "low")
+        self.assertEqual(config.review.request_comments.model, "gpt-6.1-sol")
+        self.assertEqual(config.review.request_comments.effort, "medium")
         self.assertTrue(config.comments.critical_enabled)
         self.assertEqual(config.comments.severities, ["CRITICAL"])
         self.assertEqual(config.bitbucket.ssh_key_credential, "bitbucket_ssh_key")
@@ -82,13 +82,13 @@ class ConfigTests(unittest.TestCase):
         raw = {
             "bitbucket": {"workspace": "ws", "repositories": [{"slug": "repo", "clone_url": "/tmp/repo"}]},
             "review": {"output_mode": "inline_comments", "request_comments": {
-                "model": "cheap-model", "effort": "medium", "timeout_seconds": 45,
+                "model": "cheap-model", "effort": "high", "timeout_seconds": 45,
             }},
         }
         config = parse_config(raw)
         self.assertTrue(config.review.deduplication.enabled)
         self.assertEqual(config.review.deduplication.model, "cheap-model")
-        self.assertEqual(config.review.deduplication.effort, "medium")
+        self.assertEqual(config.review.deduplication.effort, "high")
         self.assertEqual(config.review.deduplication.timeout_seconds, 45)
         self.assertEqual(config.review.deduplication.max_input_findings, 200)
         self.assertEqual(config.review.deduplication.max_input_bytes, 200000)
@@ -322,15 +322,15 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.agents.claude.max_parallel, 2)
         self.assertEqual(config.agents.claude.timeout_seconds, 1800)
         self.assertEqual(config.agents.claude.command, "claude")
-        self.assertEqual(config.agents.claude.model, "claude-sonnet-4-6")
-        self.assertEqual(config.agents.claude.effort, "max")
+        self.assertEqual(config.agents.claude.model, "claude-opus-5-5")
+        self.assertEqual(config.agents.claude.effort, "medium")
         self.assertEqual(config.agents.claude.max_subagents, 20)
         self.assertEqual(config.agents.claude.subagent_max_per_lens, 1)
         self.assertEqual(config.reports.report_id, "scout-claude-v1")
         self.assertEqual(config.reports.title, "Claude PR Review")
         self.assertEqual(config.review.risk.provider, "codex")
-        self.assertEqual(config.review.risk.model, "gpt-5.4")
-        self.assertEqual(config.review.risk.effort, "low")
+        self.assertEqual(config.review.risk.model, "gpt-6.1-sol")
+        self.assertEqual(config.review.risk.effort, "medium")
 
     def test_parse_multi_provider_selection_with_provider_report_defaults(self):
         config = parse_config(
@@ -404,10 +404,10 @@ class ConfigTests(unittest.TestCase):
                     "workspace": "ws",
                     "repositories": [{"slug": "repo", "clone_url": "git@bitbucket.org:ws/repo.git"}],
                 },
-                "agents": {"claude": {"effort": "medium"}},
+                "agents": {"claude": {"effort": "high"}},
             }
         )
-        self.assertEqual(config.agents.claude.effort, "medium")
+        self.assertEqual(config.agents.claude.effort, "high")
 
     def test_rejects_unknown_claude_effort(self):
         with self.assertRaises(ConfigError):

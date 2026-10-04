@@ -375,8 +375,8 @@ subagent_max_per_lens = 4
 [review.risk]
 enabled = true
 provider = "codex"
-model = "gpt-5.4"
-effort = "low"
+model = "gpt-6.1-sol"
+effort = "medium"
 timeout_seconds = 120
 
 [agents]
@@ -391,8 +391,8 @@ home_dir = "${STATE_DIR}/agents/codex/main"
 max_parallel = 2
 timeout_seconds = 1800
 command = "codex"
-model = "gpt-5.5"
-reasoning_effort = "xhigh"
+model = "gpt-6.1-sol"
+reasoning_effort = "medium"
 fast_mode = true
 max_subagents = 18
 subagent_small_loc_limit = 150
@@ -411,8 +411,8 @@ home_dir = "${STATE_DIR}/agents/claude/main"
 max_parallel = 2
 timeout_seconds = 1800
 command = "claude"
-model = "claude-sonnet-4-6"
-effort = "max"
+model = "claude-opus-5-5"
+effort = "medium"
 max_subagents = 20
 subagent_small_loc_limit = 150
 subagent_medium_loc_limit = 600

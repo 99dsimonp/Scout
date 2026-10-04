@@ -345,8 +345,8 @@ home_dir = "/var/lib/scout/agents/codex/main"
 max_parallel = 2
 timeout_seconds = 1800
 command = "codex"
-model = "gpt-5.5"
-reasoning_effort = "xhigh"
+model = "gpt-6.1-sol"
+reasoning_effort = "medium"
 fast_mode = true
 max_subagents = 18
 subagent_small_loc_limit = 150
@@ -363,8 +363,8 @@ home_dir = "/var/lib/scout/agents/claude/main"
 max_parallel = 2
 timeout_seconds = 1800
 command = "claude"
-model = "claude-sonnet-4-6"
-effort = "max"
+model = "claude-opus-5-5"
+effort = "medium"
 max_subagents = 20
 subagent_small_loc_limit = 150
 subagent_medium_loc_limit = 600
@@ -677,8 +677,8 @@ Representative command:
 ```bash
 codex exec \
   --enable fast_mode \
-  --model gpt-5.5 \
-  --config 'model_reasoning_effort="xhigh"' \
+  --model gpt-6.1-sol \
+  --config 'model_reasoning_effort="medium"' \
   --cd "$WORKTREE" \
   --sandbox read-only \
   --output-schema /etc/scout/review.schema.json \
