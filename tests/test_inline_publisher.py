@@ -151,6 +151,16 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.assertEqual(intent["payload"]["finding"]["source_commit"], "source")
         self.assertEqual(intent["payload"]["finding"]["merge_base"], "base")
 
+    def test_abbreviated_snapshot_hashes_match_full_saved_hashes(self):
+        source, destination = "bb34fefb6188" + "1" * 28, "7b3858338be0" + "2" * 28
+        self.pr = replace(self.pr, source_commit_hash=source, destination_commit_hash=destination)
+        record = self.ready_round()
+        current = replace(self.pr, source_commit_hash=source[:12], destination_commit_hash=destination[:12])
+        with patch.object(self.bitbucket, "publish_inline_pull_request_comment", wraps=self.bitbucket.publish_inline_pull_request_comment) as publish:
+            self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: current), "completed")
+        self.assertEqual(publish.call_count, 1)
+        self.assertNotIn("Original location:", self.bitbucket.posts[0])
+
     def test_push_between_posts_moves_remaining_findings_to_pr_comments(self):
         other = valid_review()
         other["annotations"][0].update(summary="Another finding", line=15, line_side="OLD")

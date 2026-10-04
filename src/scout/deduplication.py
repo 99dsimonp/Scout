@@ -11,12 +11,13 @@ class SelectionValidationError(ValueError):
 
 _SEVERITIES = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 _RELATIONSHIPS = ("equivalent", "representative_subsumes_candidate")
+# Structured output follows this order: the comparison is written before the verdict it justifies.
 _DECISION_PROPERTIES = {
     "candidate_id": {"type": "string"},
+    "reason": {"type": "string"},
     "decision": {"type": "string", "enum": ["retain", "covered", "uncertain"]},
     "covered_by": {"type": ["string", "null"]},
     "relationship": {"type": ["string", "null"], "enum": list(_RELATIONSHIPS) + [None]},
-    "reason": {"type": "string"},
 }
 SELECTION_SCHEMA = {
     "type": "object",
@@ -159,6 +160,8 @@ Candidate groups inherit their maximum reported severity. History may cover a ca
 published severity is at least as high as every candidate covered by that historical target.
 Better wording alone never justifies reposting an issue already fully covered by history.
 A CRITICAL or security candidate can only be covered by a representative on the same path.
+Write each reason before its decision, and make the decision follow from it: a reason that finds a
+retained candidate or eligible historical finding equivalent or subsuming requires covered.
 For retain/uncertain set covered_by and relationship to null; explain every decision concisely.
 Optionally list historical_supersessions when a retained candidate directly fully covers a historical
 finding at equal or higher severity; each entry requires candidate_id, history_id, and coverage reason.

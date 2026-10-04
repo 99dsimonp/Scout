@@ -54,10 +54,17 @@ def _marker(round_record: dict, key: str) -> str:
     return _MARKER_TEMPLATE.format(hashlib.sha256((round_record["id"] + ":" + key).encode()).hexdigest())
 
 
+def _same_commit(left: Optional[str], right: Optional[str]) -> bool:
+    # Bitbucket reports abbreviated hashes; the saved destination is a full rev-parse result.
+    if not left or not right:
+        return False
+    short, full = sorted((left.lower(), right.lower()), key=len)
+    return full.startswith(short)
+
+
 def _snapshot_moved(round_record: dict, current) -> bool:
-    destination = round_record.get("destination_commit_hash")
-    return (current.source_commit_hash != round_record["source_commit_hash"]
-            or not destination or current.destination_commit_hash != destination)
+    return not (_same_commit(current.source_commit_hash, round_record["source_commit_hash"])
+                and _same_commit(current.destination_commit_hash, round_record.get("destination_commit_hash")))
 
 
 def _finding_payload(finding: SelectionFinding) -> dict:

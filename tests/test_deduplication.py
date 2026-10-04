@@ -3,7 +3,7 @@ import unittest
 from dataclasses import replace
 
 from scout.deduplication import (
-    SelectionFinding, SelectionValidationError, exact_selection, extract_selection, prepare_selection,
+    SELECTION_SCHEMA, SelectionFinding, SelectionValidationError, exact_selection, extract_selection, prepare_selection,
 )
 
 
@@ -31,6 +31,11 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan.retained_ids, ["b"])
         self.assertEqual(plan.severities, {"b": "CRITICAL"})
         self.assertEqual(plan, exact_selection([second, first]))
+
+    def test_schema_asks_for_reason_before_decision(self):
+        item = SELECTION_SCHEMA["properties"]["decisions"]["items"]
+        for order in (list(item["properties"]), item["required"]):
+            self.assertLess(order.index("reason"), order.index("decision"))
 
     def test_disabled_retains_exact_duplicates(self):
         self.assertEqual(exact_selection([finding("a"), finding("b")], enabled=False).retained_ids, ["a", "b"])
