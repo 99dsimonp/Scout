@@ -85,6 +85,100 @@ def terminate_process_group(proc: subprocess.Popen) -> None:
         proc.wait()
 
 
+POLL_INTERVAL_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class ProcessOutput:
+    returncode: int
+    stdout: str
+    stderr: str
+    final_message: str
+    cooldown_seconds: Optional[int]
+
+
+def run_provider_command(
+    provider: str,
+    label: str,
+    cmd: list,
+    prompt_file: Path,
+    stdout_file: Path,
+    stderr_file: Path,
+    env: dict,
+    timeout_seconds: float,
+    is_superseded: Callable[[], bool],
+    superseded_message: str,
+    cwd: Optional[str] = None,
+    output_file: Optional[Path] = None,
+) -> ProcessOutput:
+    """Run a provider CLI with the prompt on stdin, always reaping its process group.
+
+    Raises ProviderSuperseded when is_superseded() turns true and ProviderError when the
+    command cannot start or exceeds timeout_seconds. The final message is read from
+    output_file when given, otherwise from stdout.
+    """
+    timed_out = False
+    with prompt_file.open("r", encoding="utf-8") as prompt_input, \
+        stdout_file.open("w", encoding="utf-8") as stdout, \
+        stderr_file.open("w", encoding="utf-8") as stderr:
+        try:
+            proc = subprocess.Popen(
+                cmd, stdin=prompt_input, stdout=stdout, stderr=stderr,
+                cwd=cwd, text=True, env=env, start_new_session=True,
+            )
+        except OSError as exc:
+            raise ProviderError("{} could not start: {}".format(label, exc)) from exc
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            while proc.poll() is None:
+                if is_superseded():
+                    raise ProviderSuperseded(superseded_message)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                try:
+                    proc.wait(timeout=min(POLL_INTERVAL_SECONDS, remaining))
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            if proc.poll() is None:
+                terminate_process_group(proc)
+
+    stdout_text = read_text(stdout_file)
+    stderr_text = read_text(stderr_file)
+    final_message = read_text(output_file) if output_file is not None else stdout_text
+    texts = (stdout_text, stderr_text, final_message) if output_file is not None else (stdout_text, stderr_text)
+    cooldown_seconds = provider_quota_cooldown_seconds(provider, *texts)
+    if timed_out:
+        raise ProviderError(
+            "{} timed out after {} seconds".format(label, timeout_seconds),
+            cooldown_seconds=cooldown_seconds,
+            provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
+        )
+    return ProcessOutput(proc.returncode, stdout_text, stderr_text, final_message, cooldown_seconds)
+
+
+def require_provider_success(
+    output: ProcessOutput,
+    exit_label: str,
+    missing_message: str,
+    diagnostics: Optional[Any] = None,
+) -> None:
+    error = None
+    if output.returncode != 0:
+        error = "{} exited with status {}: {}".format(exit_label, output.returncode, output.stderr[:1000])
+    elif not output.final_message.strip():
+        error = missing_message
+    if error:
+        raise ProviderError(
+            error,
+            diagnostics=diagnostics,
+            cooldown_seconds=output.cooldown_seconds,
+            provider_status=PROVIDER_COOLDOWN_STATUS if output.cooldown_seconds else None,
+        )
+
+
 def run_selection_command(
     provider: str,
     cmd: list,
@@ -95,49 +189,16 @@ def run_selection_command(
     is_superseded: Callable[[], bool],
     output_file: Optional[Path] = None,
 ) -> str:
-    stdout_file = Path(run_dir) / "{}-selection-stdout.log".format(provider)
-    stderr_file = Path(run_dir) / "{}-selection-stderr.log".format(provider)
-    timed_out = False
-    with prompt_file.open("r", encoding="utf-8") as prompt_input, \
-        stdout_file.open("w", encoding="utf-8") as stdout, \
-        stderr_file.open("w", encoding="utf-8") as stderr:
-        try:
-            proc = subprocess.Popen(
-                cmd, stdin=prompt_input, stdout=stdout, stderr=stderr,
-                cwd=run_dir, text=True, env=env, start_new_session=True,
-            )
-        except OSError as exc:
-            raise ProviderError("{} selection could not start: {}".format(provider, exc)) from exc
-        started = time.monotonic()
-        try:
-            while proc.poll() is None:
-                if is_superseded():
-                    raise ProviderSuperseded("finding selection superseded")
-                if time.monotonic() - started > timeout_seconds:
-                    timed_out = True
-                    break
-                time.sleep(0.1)
-        finally:
-            if proc.poll() is None:
-                terminate_process_group(proc)
-
-    stdout_text = read_text(stdout_file)
-    stderr_text = read_text(stderr_file)
-    final_message = read_text(output_file) if output_file is not None else stdout_text
-    cooldown_seconds = provider_quota_cooldown_seconds(provider, stdout_text, stderr_text, final_message)
-    error = None
-    if timed_out:
-        error = "{} selection timed out after {} seconds".format(provider, timeout_seconds)
-    elif proc.returncode != 0:
-        error = "{} selection exited with status {}: {}".format(provider, proc.returncode, stderr_text[:1000])
-    elif not final_message.strip():
-        error = "{} selection did not write a final message".format(provider)
-    if error:
-        raise ProviderError(
-            error, cooldown_seconds=cooldown_seconds,
-            provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
-        )
-    return final_message
+    label = "{} selection".format(provider)
+    output = run_provider_command(
+        provider, label, cmd, prompt_file,
+        Path(run_dir) / "{}-selection-stdout.log".format(provider),
+        Path(run_dir) / "{}-selection-stderr.log".format(provider),
+        env, timeout_seconds, is_superseded, "finding selection superseded",
+        cwd=run_dir, output_file=output_file,
+    )
+    require_provider_success(output, label, "{} did not write a final message".format(label))
+    return output.final_message
 
 
 def read_text(path: Path) -> str:

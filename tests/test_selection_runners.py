@@ -132,8 +132,8 @@ class SelectionRunnerTests(unittest.TestCase):
                 with self.subTest(provider=provider, cancelled=cancelled), tempfile.TemporaryDirectory() as tmp:
                     runner = self.make_runner(provider, tmp, "time.sleep(60)\n")
                     error = ProviderSuperseded if cancelled else ProviderError
-                    kwargs = {"is_superseded": lambda: (Path(tmp) / "pid").exists()} if cancelled else {"timeout_seconds": 1}
-                    with self.assertRaises(error):
+                    kwargs = {"is_superseded": lambda: (Path(tmp) / "pid").exists()} if cancelled else {"timeout_seconds": 0.5}
+                    with patch("scout.provider.POLL_INTERVAL_SECONDS", 0.05), self.assertRaises(error):
                         self.classify(runner, tmp, **kwargs)
                     pid = int((Path(tmp) / "pid").read_text())
                     with self.assertRaises(ProcessLookupError):

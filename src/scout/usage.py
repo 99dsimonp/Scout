@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from .provider import read_text
+
 
 CODEX_TOTAL_TOKENS_RE = re.compile(
     r"(?:^|\n)\s*tokens used\s*\n\s*(?P<tokens>[0-9][0-9,]*)\b",
@@ -98,9 +100,9 @@ def parse_provider_usage(
 
 def parse_provider_usage_from_logs(provider: str, run_dir: str) -> Optional[Dict[str, Any]]:
     run_path = Path(run_dir)
-    stdout_text = _read_text(run_path / "{}-stdout.log".format(provider))
-    stderr_text = _read_text(run_path / "{}-stderr.log".format(provider))
-    final_message = _read_text(run_path / "codex-final-message.json") if provider == "codex" else ""
+    stdout_text = read_text(run_path / "{}-stdout.log".format(provider))
+    stderr_text = read_text(run_path / "{}-stderr.log".format(provider))
+    final_message = read_text(run_path / "codex-final-message.json") if provider == "codex" else ""
     return parse_provider_usage(provider, stdout_text, stderr_text, final_message)
 
 
@@ -172,12 +174,6 @@ def _read_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
         if isinstance(value, dict):
             rows.append(value)
     return rows
-
-
-def _read_text(path: Path) -> str:
-    if not path.exists():
-        return ""
-    return path.read_text(encoding="utf-8", errors="replace")
 
 
 def _token_total(values: Dict[str, Any]) -> int:

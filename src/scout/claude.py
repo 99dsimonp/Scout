@@ -5,8 +5,6 @@ import logging
 import os
 import re
 import shutil
-import subprocess
-import time
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -19,14 +17,14 @@ from .comment_request import (
 from .config import ClaudeConfig, CredentialStore
 from .provider import (
     PROVIDER_COOLDOWN_STATUS,
+    ProcessOutput,
     ProviderError,
     ProviderResult,
-    ProviderSuperseded,
     provider_quota_cooldown_seconds,
-    read_text as _read_text,
     redacted_cmd as _redacted_cmd,
+    require_provider_success,
+    run_provider_command,
     run_selection_command,
-    terminate_process_group as _terminate_process_group,
 )
 from .risk import build_risk_prompt, extract_risk, risk_schema_json
 from .usage import parse_claude_usage
@@ -59,79 +57,18 @@ class ClaudeRunner:
         is_superseded: Callable[[], bool],
         additional_dirs: Optional[List[str]] = None,
     ) -> ProviderResult:
-        Path(run_dir).mkdir(parents=True, exist_ok=True)
-        stdout_file = Path(run_dir) / "claude-stdout.log"
-        stderr_file = Path(run_dir) / "claude-stderr.log"
-        prompt_file = Path(run_dir) / "claude-prompt.txt"
-        prompt_file.write_text(prompt, encoding="utf-8")
-
         schema_content = self._read_schema(schema_path)
         cmd = self.build_command(prompt, schema_content, additional_dirs=additional_dirs)
-        LOG.info("starting Claude review command=%s prompt_file=%s", _redacted_cmd(cmd), prompt_file)
-        with prompt_file.open("r", encoding="utf-8") as prompt_input, \
-            stdout_file.open("w", encoding="utf-8") as stdout, \
-            stderr_file.open("w", encoding="utf-8") as stderr:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=prompt_input,
-                stdout=stdout,
-                stderr=stderr,
-                cwd=worktree,
-                text=True,
-                env=self._env(),
-                start_new_session=True,
-            )
-            started = time.monotonic()
-            while True:
-                if proc.poll() is not None:
-                    break
-                if is_superseded():
-                    _terminate_process_group(proc)
-                    raise ProviderSuperseded("review superseded by a newer PR commit")
-                if time.monotonic() - started > self.config.timeout_seconds:
-                    _terminate_process_group(proc)
-                    stdout.flush()
-                    stderr.flush()
-                    cooldown_seconds = provider_quota_cooldown_seconds(
-                        "claude",
-                        _read_text(stdout_file),
-                        _read_text(stderr_file),
-                    )
-                    raise ProviderError(
-                        "Claude review timed out after {} seconds".format(self.config.timeout_seconds),
-                        cooldown_seconds=cooldown_seconds,
-                        provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
-                    )
-                time.sleep(1)
-
-        stdout_text = _read_text(stdout_file)
-        stderr_text = _read_text(stderr_file)
-        cooldown_seconds = provider_quota_cooldown_seconds("claude", stdout_text, stderr_text)
-        LOG.info(
-            "Claude review completed returncode=%s stdout_file=%s stderr_file=%s stdout_present=%s",
-            proc.returncode,
-            stdout_file,
-            stderr_file,
-            bool(stdout_text.strip()),
+        output = self._run_command(
+            "review", "claude", "Claude review", cmd, prompt, run_dir, self.config.timeout_seconds,
+            is_superseded, "review superseded by a newer PR commit", cwd=worktree,
         )
-        if proc.returncode != 0:
-            raise ProviderError(
-                "Claude exited with status {}: {}".format(proc.returncode, stderr_text[:1000]),
-                cooldown_seconds=cooldown_seconds,
-                provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
-            )
-        if not stdout_text.strip():
-            raise ProviderError(
-                "Claude did not write final JSON to stdout",
-                cooldown_seconds=cooldown_seconds,
-                provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
-            )
-        final_message = _extract_final_message(stdout_text)
+        require_provider_success(output, "Claude", "Claude did not write final JSON to stdout")
         return ProviderResult(
-            stdout=stdout_text,
-            stderr=stderr_text,
-            final_message=final_message,
-            usage=parse_claude_usage(stdout_text),
+            stdout=output.stdout,
+            stderr=output.stderr,
+            final_message=_extract_final_message(output.stdout),
+            usage=parse_claude_usage(output.stdout),
         )
 
     def assess_risk(
@@ -143,73 +80,14 @@ class ClaudeRunner:
         run_dir: str,
         is_superseded: Callable[[], bool],
     ) -> str:
-        Path(run_dir).mkdir(parents=True, exist_ok=True)
-        stdout_file = Path(run_dir) / "claude-risk-stdout.log"
-        stderr_file = Path(run_dir) / "claude-risk-stderr.log"
-        prompt_file = Path(run_dir) / "claude-risk-prompt.txt"
-        prompt_file.write_text(build_risk_prompt(description), encoding="utf-8")
-
+        label = "Claude risk classification"
         cmd = self.build_risk_command(risk_schema_json(), model, effort)
-        LOG.info("starting Claude risk command=%s prompt_file=%s", _redacted_cmd(cmd), prompt_file)
-        with prompt_file.open("r", encoding="utf-8") as prompt_input, \
-            stdout_file.open("w", encoding="utf-8") as stdout, \
-            stderr_file.open("w", encoding="utf-8") as stderr:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=prompt_input,
-                stdout=stdout,
-                stderr=stderr,
-                cwd=run_dir,
-                text=True,
-                env=self._env(),
-                start_new_session=True,
-            )
-            started = time.monotonic()
-            while True:
-                if proc.poll() is not None:
-                    break
-                if is_superseded():
-                    _terminate_process_group(proc)
-                    raise ProviderSuperseded("review superseded by a newer PR commit")
-                if time.monotonic() - started > timeout_seconds:
-                    _terminate_process_group(proc)
-                    stdout.flush()
-                    stderr.flush()
-                    cooldown_seconds = provider_quota_cooldown_seconds(
-                        "claude",
-                        _read_text(stdout_file),
-                        _read_text(stderr_file),
-                    )
-                    raise ProviderError(
-                        "Claude risk classification timed out after {} seconds".format(timeout_seconds),
-                        cooldown_seconds=cooldown_seconds,
-                        provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
-                    )
-                time.sleep(1)
-
-        stdout_text = _read_text(stdout_file)
-        stderr_text = _read_text(stderr_file)
-        cooldown_seconds = provider_quota_cooldown_seconds("claude", stdout_text, stderr_text)
-        LOG.info(
-            "Claude risk completed returncode=%s stdout_file=%s stderr_file=%s stdout_present=%s",
-            proc.returncode,
-            stdout_file,
-            stderr_file,
-            bool(stdout_text.strip()),
+        output = self._run_command(
+            "risk", "claude-risk", label, cmd, build_risk_prompt(description), run_dir, timeout_seconds,
+            is_superseded, "review superseded by a newer PR commit",
         )
-        if proc.returncode != 0:
-            raise ProviderError(
-                "Claude risk classification exited with status {}: {}".format(proc.returncode, stderr_text[:1000]),
-                cooldown_seconds=cooldown_seconds,
-                provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
-            )
-        if not stdout_text.strip():
-            raise ProviderError(
-                "Claude risk classification did not write final JSON to stdout",
-                cooldown_seconds=cooldown_seconds,
-                provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
-            )
-        return extract_risk(stdout_text)
+        require_provider_success(output, label, "{} did not write final JSON to stdout".format(label))
+        return extract_risk(output.stdout)
 
     def classify_review_request(
         self,
@@ -220,76 +98,47 @@ class ClaudeRunner:
         run_dir: str,
         is_superseded: Callable[[], bool],
     ) -> CommentRequestClassification:
-        Path(run_dir).mkdir(parents=True, exist_ok=True)
-        stdout_file = Path(run_dir) / "claude-comment-request-stdout.log"
-        stderr_file = Path(run_dir) / "claude-comment-request-stderr.log"
-        prompt_file = Path(run_dir) / "claude-comment-request-prompt.txt"
-        prompt_file.write_text(build_comment_request_prompt(comment), encoding="utf-8")
-
+        label = "Claude review request classification"
         cmd = self.build_comment_request_command(comment_request_schema_json(), model, effort)
-        LOG.info("starting Claude comment request command=%s prompt_file=%s", _redacted_cmd(cmd), prompt_file)
-        with prompt_file.open("r", encoding="utf-8") as prompt_input, \
-            stdout_file.open("w", encoding="utf-8") as stdout, \
-            stderr_file.open("w", encoding="utf-8") as stderr:
-            proc = subprocess.Popen(
-                cmd,
-                stdin=prompt_input,
-                stdout=stdout,
-                stderr=stderr,
-                cwd=run_dir,
-                text=True,
-                env=self._env(),
-                start_new_session=True,
-            )
-            started = time.monotonic()
-            while True:
-                if proc.poll() is not None:
-                    break
-                if is_superseded():
-                    _terminate_process_group(proc)
-                    raise ProviderSuperseded("review request classification superseded by a newer PR comment")
-                if time.monotonic() - started > timeout_seconds:
-                    _terminate_process_group(proc)
-                    stdout.flush()
-                    stderr.flush()
-                    cooldown_seconds = provider_quota_cooldown_seconds(
-                        "claude",
-                        _read_text(stdout_file),
-                        _read_text(stderr_file),
-                    )
-                    raise ProviderError(
-                        "Claude review request classification timed out after {} seconds".format(timeout_seconds),
-                        cooldown_seconds=cooldown_seconds,
-                        provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
-                    )
-                time.sleep(1)
+        output = self._run_command(
+            "comment request", "claude-comment-request", label, cmd, build_comment_request_prompt(comment), run_dir, timeout_seconds,
+            is_superseded, "review request classification superseded by a newer PR comment",
+        )
+        require_provider_success(output, label, "{} did not write final JSON to stdout".format(label))
+        return extract_comment_request(output.stdout)
 
-        stdout_text = _read_text(stdout_file)
-        stderr_text = _read_text(stderr_file)
-        cooldown_seconds = provider_quota_cooldown_seconds("claude", stdout_text, stderr_text)
+    def _run_command(
+        self,
+        kind: str,
+        file_prefix: str,
+        label: str,
+        cmd: list,
+        prompt: str,
+        run_dir: str,
+        timeout_seconds: int,
+        is_superseded: Callable[[], bool],
+        superseded_message: str,
+        cwd: Optional[str] = None,
+    ) -> ProcessOutput:
+        Path(run_dir).mkdir(parents=True, exist_ok=True)
+        stdout_file = Path(run_dir) / "{}-stdout.log".format(file_prefix)
+        stderr_file = Path(run_dir) / "{}-stderr.log".format(file_prefix)
+        prompt_file = Path(run_dir) / "{}-prompt.txt".format(file_prefix)
+        prompt_file.write_text(prompt, encoding="utf-8")
+        LOG.info("starting Claude %s command=%s prompt_file=%s", kind, _redacted_cmd(cmd), prompt_file)
+        output = run_provider_command(
+            "claude", label, cmd, prompt_file, stdout_file, stderr_file, self._env(),
+            timeout_seconds, is_superseded, superseded_message, cwd=cwd or run_dir,
+        )
         LOG.info(
-            "Claude comment request completed returncode=%s stdout_file=%s stderr_file=%s stdout_present=%s",
-            proc.returncode,
+            "Claude %s completed returncode=%s stdout_file=%s stderr_file=%s stdout_present=%s",
+            kind,
+            output.returncode,
             stdout_file,
             stderr_file,
-            bool(stdout_text.strip()),
+            bool(output.stdout.strip()),
         )
-        if proc.returncode != 0:
-            raise ProviderError(
-                "Claude review request classification exited with status {}: {}".format(
-                    proc.returncode,
-                    stderr_text[:1000],
-                ),
-                cooldown_seconds=cooldown_seconds,
-                provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
-            )
-        if not stdout_text.strip():
-            raise ProviderError(
-                "Claude review request classification did not write final JSON to stdout",
-                cooldown_seconds=cooldown_seconds,
-                provider_status=PROVIDER_COOLDOWN_STATUS if cooldown_seconds else None,
-            )
-        return extract_comment_request(stdout_text)
+        return output
 
     def build_command(
         self,
