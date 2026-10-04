@@ -160,7 +160,9 @@ class InlineDispatch:
                         self.daemon._release_provider_slot(reserved)
                         reserved = None
                 else:
-                    selection = exact_selection(candidates, history, enabled=enabled)
+                    # A selector that cannot recover publishes every candidate rather than
+                    # guessing at duplicates from exact matches alone.
+                    selection = exact_selection(candidates, history, enabled=False)
                 check()
                 if not self.state.save_plan(round_id, token, selection.to_dict(), kind=mode):
                     self.state.release_round(round_id, token)

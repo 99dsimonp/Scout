@@ -206,7 +206,7 @@ class InlineDaemonTests(unittest.TestCase):
         self.assertEqual(self.round()["status"], "completed")
         self.assertEqual(len(daemon.bitbucket.posts), 2)
 
-    def test_selector_cooldown_expires_to_exact_fallback_without_slot(self):
+    def test_selector_cooldown_expires_to_publish_all_fallback_without_slot(self):
         daemon = self.daemon
         self.enable_selection()
         daemon.poll_once()
@@ -220,7 +220,8 @@ class InlineDaemonTests(unittest.TestCase):
             conn.execute("update inline_rounds set selection_recovery_deadline_at='2000-01-01T00:00:00+00:00'")
         daemon.run_pending_jobs()
         self.assertEqual(self.round()["status"], "completed")
-        self.assertEqual(len(daemon.bitbucket.posts), 1)
+        # Both providers reported the same finding; the fallback keeps exact duplicates.
+        self.assertEqual(len(daemon.bitbucket.posts), 2)
 
     def test_model_plan_selects_broader_original_comment(self):
         daemon = self.daemon
@@ -493,7 +494,7 @@ class InlineDaemonTests(unittest.TestCase):
         self.assertEqual(daemon.state.inline.get_plan(self.round()["id"]), plan)
         self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [1, 1])
 
-    def test_permanent_selector_error_falls_back_to_exact_plan(self):
+    def test_permanent_selector_error_falls_back_to_publishing_every_candidate(self):
         daemon = self.daemon
         self.enable_selection()
         daemon.providers["codex"].classify_findings = lambda **kwargs: (_ for _ in ()).throw(ProviderError("bad credentials", retryable=False))
@@ -503,7 +504,7 @@ class InlineDaemonTests(unittest.TestCase):
             conn.execute("update inline_rounds set retry_after=null")
         daemon.run_pending_jobs()
         self.assertEqual(self.round()["status"], "completed")
-        self.assertEqual(len(daemon.bitbucket.posts), 1)
+        self.assertEqual(len(daemon.bitbucket.posts), 2)
 
     def test_ready_publication_and_reviews_share_workers_fairly(self):
         daemon = self.daemon

@@ -14,6 +14,7 @@ from scout.schema import (
     to_critical_pr_comment,
     to_inline_pr_comments,
     to_no_findings_pr_comment,
+    to_outdated_pr_comment,
     to_pr_comment,
     to_pr_comments,
     to_bitbucket_report,
@@ -506,6 +507,26 @@ class SchemaTests(unittest.TestCase):
         self.assertIn("Smallest fix:", comments[0]["content"])
         self.assertNotIn("Suggested change:", report_annotations[0]["details"])
         self.assertNotIn("```suggestion", pr_comment)
+
+    def test_outdated_comment_preserves_original_location_without_applyable_suggestions(self):
+        annotation = valid_review()["annotations"][0]
+        annotation["line_side"] = "OLD"
+        annotation["suggested_change"] = {"replacement": "old_replacement()"}
+        annotation["details"] = "Evidence\n```suggestion\nembedded_replacement()\n```\n" + "Long explanation. " * 1000
+        marker = "<!-- scout-publication:{} -->".format("f" * 64)
+        content = to_outdated_pr_comment(annotation, "codex", "a" * 40, marker)
+        self.assertLessEqual(len(content), 8000)
+        self.assertTrue(content.endswith("\n" + marker))
+        self.assertIn("original commit `{}`".format("a" * 40), content)
+        self.assertIn("Original location: `src/app.py:12` (OLD)", content)
+        self.assertIn("The PR revision has changed", content)
+        self.assertNotIn("```suggestion", content)
+        self.assertNotIn("old_replacement()", content)
+        annotation["path"] = "long/" * 2000 + "end.py"
+        content = to_outdated_pr_comment(annotation, "codex", "a" * 40, marker)
+        self.assertLessEqual(len(content), 8000)
+        self.assertIn("end.py:12` (OLD) [path shortened]", content)
+        self.assertTrue(content.endswith(marker))
 
     def test_suggested_change_replacement_validation(self):
         invalid_values = [

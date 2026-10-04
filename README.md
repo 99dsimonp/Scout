@@ -520,8 +520,8 @@ provider cannot recover, Scout publishes the successful providers' results and
 names the missing providers on the PR. If all providers fail, nothing is posted.
 Pending providers removed from configuration cannot count as available alternatives
 when deciding whether the remaining provider should wait out a cooldown.
-The selector also has a recovery deadline: if it fails, Scout uses exact matching
-and retains everything else, so duplicate comments are possible but successful
+The selector also has a recovery deadline: if it fails, Scout publishes every
+finding without deduplication, so duplicate comments are possible but successful
 reviews are not discarded.
 
 ```toml
@@ -542,9 +542,11 @@ timeouts. Native inline mode ignores `[comments].severities` and
 lines enter selection regardless of severity.
 
 A review finishes against its original source commit and merge base even if
-new commits arrive. Scout keeps the original finding locations, sends no
-source-change notice, and does not automatically rerun on pushes. A mid-review
-push can therefore leave comments pointing at changed code. Developers can
+new commits arrive. Scout sends no source-change notice and does not
+automatically rerun on pushes. If the source or destination commit has changed
+when a finding is sent, Scout posts it as a regular PR comment naming the
+original commit and location, because old line numbers cannot safely anchor
+comments in the new diff. Developers can
 request a fresh round by mentioning `@scout` or `@Scout` in a PR comment,
 interpreted by `review.request_comments`.
 

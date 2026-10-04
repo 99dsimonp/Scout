@@ -1207,8 +1207,8 @@ to be discarded instead of receiving its recovery window.
 A cheap structured selector picks original comments that fully cover overlapping
 findings and preserves uncertain or distinct issues. The selected severity cannot
 silently downgrade a covered finding. Historical matching requires a confirmed,
-open, current Scout comment. If selection cannot recover, exact-only matching
-preserves unmatched findings; disabling deduplication retains every candidate.
+open, current Scout comment. If selection cannot recover, or deduplication is
+disabled, every candidate is retained and published.
 The model/fallback plan is saved once before publication and cannot be replaced
 by a late model response or delivery retry.
 
@@ -1219,8 +1219,10 @@ barrier, cooldown, or recovery intent holds a worker.
 
 Source pushes do not replace inline rounds at any phase. Providers finish
 against the frozen source commit and merge base; selection and publication keep
-their results, text, and line locations even if the PR changes. Scout sends no
-source-change notice and does not automatically review each pushed commit.
+their results and text even if the PR changes. A finding sent after the source or
+destination commit moved is posted as a regular PR comment with its original
+commit and location instead of an inline comment. Scout sends no source-change
+notice and does not automatically review each pushed commit.
 A tagged review request creates a fresh round and records all its jobs atomically
 with the processed comment ID/version, fencing any unfinished previous round or
 pre-round inline job even if its provider or policy is no longer configured.

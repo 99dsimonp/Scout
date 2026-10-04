@@ -11,8 +11,12 @@ workspace = "my-workspace"
 api_base_url = "https://api.bitbucket.org/2.0"
 # Supported values: "basic" or "oauth_client_credentials".
 api_auth = "basic"
-# Immutable bot account ID or UUID; needed when GET /user cannot discover it.
-# bot_account_id = "{your-bot-uuid}"
+# The Bitbucket account that Scout posts comments as, given as its UUID
+# (with braces) or account_id. Scout uses it to recognise its own earlier
+# comments. Normally discovered via GET /user; set it if that call fails with
+# your credentials. To find it, open any comment Scout has posted through the
+# PR comments API and copy "user.uuid".
+# bot_account_id = "{01234567-89ab-cdef-0123-456789abcdef}"
 api_username_credential = "bitbucket_username"
 api_key_credential = "bitbucket_api_key"
 # When api_auth = "oauth_client_credentials", Scout reads these systemd
@@ -112,7 +116,7 @@ timeout_seconds = 120
 
 [review.deduplication]
 # Inline mode waits for all providers to succeed/fail before selecting comments.
-# False retains every candidate; selector failure falls back to exact matching.
+# False retains every candidate; a selector that cannot recover also publishes every candidate.
 enabled = true
 # Runs on the review.request_comments provider; omitted model settings inherit it too.
 # model = "gpt-5.4"

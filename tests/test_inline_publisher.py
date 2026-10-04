@@ -134,23 +134,24 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.bitbucket.posts), 1)
         self.assertEqual(self.store.inline.get_intent(intents[0]["id"])["status"], "published")
 
-    def test_revision_change_preserves_original_findings_and_dependents(self):
+    def test_revision_change_posts_pr_comment_with_original_location_and_dependents(self):
         record = self.ready_round()
         moved = replace(self.pr, source_commit_hash="new-source", destination_commit_hash="new-destination", merge_base_hash="new-base")
         with patch.object(self.bitbucket, "publish_inline_pull_request_comment", wraps=self.bitbucket.publish_inline_pull_request_comment) as publish:
             self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved), "completed")
-        self.assertEqual(len(self.bitbucket.posts), 1)
-        self.assertEqual(publish.call_args.args[2:4], ("src/app.py", 12))
-        self.assertEqual(publish.call_args.kwargs["line_side"], "NEW")
+        publish.assert_not_called()
         outcomes = self.store.inline.candidate_outcomes(record["id"])
         self.assertEqual(sorted(item["status"] for item in outcomes.values()), ["covered", "published"])
         intent = self.store.inline.list_intents()[0]
         self.assertEqual(intent["kind"], "finding")
-        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"]])
+        self.assertEqual(self.bitbucket.posts, [intent["payload"]["outdated_content"]])
+        self.assertIn("Original location: `src/app.py:12` (NEW)", self.bitbucket.posts[0])
+        self.assertIn("original commit `source`", self.bitbucket.posts[0])
+        self.assertTrue(self.bitbucket.posts[0].endswith(intent["marker"]))
         self.assertEqual(intent["payload"]["finding"]["source_commit"], "source")
         self.assertEqual(intent["payload"]["finding"]["merge_base"], "base")
 
-    def test_push_between_posts_keeps_remaining_original_locations_and_text(self):
+    def test_push_between_posts_moves_remaining_findings_to_pr_comments(self):
         other = valid_review()
         other["annotations"][0].update(summary="Another finding", line=15, line_side="OLD")
         record = self.ready_round({"codex": valid_review(), "claude": other})
@@ -162,11 +163,13 @@ class PublisherIntegrationTests(unittest.TestCase):
 
         with patch.object(self.bitbucket, "publish_inline_pull_request_comment", wraps=self.bitbucket.publish_inline_pull_request_comment) as publish:
             self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], snapshot), "completed")
-        self.assertEqual(sorted((call.args[2], call.args[3], call.kwargs["line_side"]) for call in publish.call_args_list),
-                         [("src/app.py", 12, "NEW"), ("src/app.py", 15, "OLD")])
-        intents = self.store.inline.list_intents()
+        self.assertEqual(publish.call_count, 1)
+        intents = sorted(self.store.inline.list_intents(), key=lambda item: item["id"])
         self.assertEqual({item["kind"] for item in intents}, {"finding"})
-        self.assertEqual(sorted(self.bitbucket.posts), sorted(item["payload"]["content"] for item in intents))
+        # The first finding posts inline before the push; the rest become PR comments.
+        self.assertEqual(self.bitbucket.posts, [intents[0]["payload"]["content"], intents[1]["payload"]["outdated_content"]])
+        self.assertIn("Original location: `src/app.py:{}` ({})".format(
+            intents[1]["payload"]["line"], intents[1]["payload"]["line_side"]), self.bitbucket.posts[1])
         self.assertEqual([item["status"] for item in intents], ["published", "published"])
 
     def test_partial_results_publish_coverage_notice_first(self):
@@ -235,11 +238,12 @@ class PublisherIntegrationTests(unittest.TestCase):
         moved = replace(self.pr, source_commit_hash="changed", merge_base_hash="new-base")
         with patch.object(self.bitbucket, "publish_inline_pull_request_comment", wraps=self.bitbucket.publish_inline_pull_request_comment) as publish:
             self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved), "completed")
+        publish.assert_not_called()
         intent = self.store.inline.list_intents()[0]
         self.assertEqual(intent["status"], "published")
-        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"]] * 2)
-        self.assertEqual(publish.call_args.args[2:4], ("src/app.py", 12))
-        self.assertEqual(publish.call_args.kwargs["line_side"], "NEW")
+        # The resend keeps the marker but no longer anchors the old line in the new diff.
+        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"], intent["payload"]["outdated_content"]])
+        self.assertTrue(all(post.endswith(intent["marker"]) for post in self.bitbucket.posts))
 
     def test_negative_lookup_must_start_after_settling_before_resend(self):
         record = self.ready_round()
@@ -276,7 +280,7 @@ class PublisherIntegrationTests(unittest.TestCase):
         intent = self.store.inline.list_intents()[0]
         self.assertEqual(intent["status"], "published")
         self.assertFalse(intent["uncertain"])
-        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"]] * 2)
+        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"], intent["payload"]["outdated_content"]])
 
     def test_closed_pr_blocks_even_unanchored_coverage_notice(self):
         record = self.ready_round({"codex": valid_review()}, failed=("claude",))
@@ -378,8 +382,7 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.bitbucket.comments.clear()
         moved = replace(self.pr, source_commit_hash="moved")
         self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved), "completed")
-        self.assertEqual(len(self.bitbucket.posts), 2)
-        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"]] * 2)
+        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"], intent["payload"]["outdated_content"]])
         self.assertEqual(self.store.inline.get_intent(intent["id"])["status"], "published")
 
     def test_author_aliases_from_discovery_are_accepted(self):

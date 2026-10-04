@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .bitbucket import BitbucketError
 from .config import ConfigError
 from .deduplication import SelectionFinding
-from .schema import _format_inline_comment, _provider_label, to_round_notice
+from .schema import _format_inline_comment, _provider_label, to_outdated_pr_comment, to_round_notice
 
 LOG = logging.getLogger(__name__)
 _MARKER_TEMPLATE = "<!-- scout-publication:{} -->"
@@ -48,6 +48,16 @@ def _seconds_since(value: Any, now: float) -> float:
     if isinstance(value, (int, float)):
         return now - value
     return now - datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+
+
+def _marker(round_record: dict, key: str) -> str:
+    return _MARKER_TEMPLATE.format(hashlib.sha256((round_record["id"] + ":" + key).encode()).hexdigest())
+
+
+def _snapshot_moved(round_record: dict, current) -> bool:
+    destination = round_record.get("destination_commit_hash")
+    return (current.source_commit_hash != round_record["source_commit_hash"]
+            or not destination or current.destination_commit_hash != destination)
 
 
 def _finding_payload(finding: SelectionFinding) -> dict:
@@ -238,7 +248,7 @@ class InlinePublisher:
         return all_settled
 
     def _reserve(self, round_record: dict, key: str, payload: dict, kind: str) -> dict:
-        marker = _MARKER_TEMPLATE.format(hashlib.sha256((round_record["id"] + ":" + key).encode()).hexdigest())
+        marker = _marker(round_record, key)
         payload = dict(payload, marker=marker, content=payload["content"] + "\n" + marker)
         return self.state.reserve_intent(round_record["id"], key, payload, kind=kind)
 
@@ -293,8 +303,10 @@ class InlinePublisher:
             annotation = dict(finding.annotation, severity=plan.get("severities", {}).get(candidate_id, finding.annotation["severity"]))
             footer = _format_inline_comment(annotation, _provider_label(finding.provider), "", "").rsplit("\n\nScout:", 1)[1]
             published = SelectionFinding(**dict(_finding_payload(finding), annotation=annotation))
+            outdated = to_outdated_pr_comment(annotation, finding.provider, record["source_commit_hash"],
+                                              _marker(record, candidate_id))
             self._reserve(record, candidate_id, {"content": finding.rendered_content + "\n\nScout:" + footer,
-                          "path": annotation["path"], "line": annotation["line"], "line_side": annotation["line_side"],
+                          "outdated_content": outdated, "path": annotation["path"], "line": annotation["line"], "line_side": annotation["line_side"],
                           "candidate_id": candidate_id, "finding": _finding_payload(published), "covers": covers.get(candidate_id, []),
                           "supersedes": plan.get("superseded_history", {}).get(candidate_id, [])}, "finding")
         if not candidates:
@@ -344,7 +356,10 @@ class InlinePublisher:
                     if self.halted:
                         raise PublicationHalted("publication halted after a POST author mismatch")
                 check_send()
-                if intent["kind"] == "finding":
+                if intent["kind"] == "finding" and _snapshot_moved(record, snapshot) and payload.get("outdated_content"):
+                    # Old line numbers cannot safely anchor comments in the new diff.
+                    response = self.bitbucket.publish_pull_request_comment(record["repo_slug"], record["pr_id"], payload["outdated_content"], before_request=check_send)
+                elif intent["kind"] == "finding":
                     response = self.bitbucket.publish_inline_pull_request_comment(record["repo_slug"], record["pr_id"], payload["path"], payload["line"], payload["content"], line_side=payload["line_side"], before_request=check_send)
                 else:
                     response = self.bitbucket.publish_pull_request_comment(record["repo_slug"], record["pr_id"], payload["content"], before_request=check_send)
