@@ -278,7 +278,6 @@ Example:
 
 ```toml
 [service]
-worker_id = "reviewer-1"
 retention_days = 7
 state_db = "/var/lib/scout/state.db"
 state_dir = "/var/lib/scout"

@@ -253,8 +253,7 @@ Deliver in phases, each shippable on its own:
 **Implementation verification.** The final suite ran 470 tests on Python 3.14.5
 and Python 3.9.25. All host tests passed; the container skipped one existing
 non-root setup-script test and passed the rest. Both example-config checks
-passed. Independent review findings were fixed and rechecked. See
-[the implementation record](multi-provider-implementation-plan.md) for details.
+passed. Independent review findings were fixed and rechecked.
 
 **Bitbucket contracts to verify before enabling the publisher**, recording response fixtures:
 

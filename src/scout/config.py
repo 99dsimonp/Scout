@@ -37,7 +37,6 @@ class RepositoryConfig:
 
 @dataclass(frozen=True)
 class ServiceConfig:
-    worker_id: str
     state_db: str
     state_dir: str
     log_level: str
@@ -394,7 +393,6 @@ def parse_config(raw: Dict[str, Any]) -> AppConfig:
 
     return AppConfig(
         service=ServiceConfig(
-            worker_id=str(service.get("worker_id", "reviewer-1")),
             state_db=str(service.get("state_db", os.path.join(state_dir, "state.db"))),
             state_dir=state_dir,
             log_level=str(service.get("log_level", "INFO")),

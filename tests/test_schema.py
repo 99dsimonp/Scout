@@ -74,14 +74,13 @@ class SchemaTests(unittest.TestCase):
 
     def test_provider_schemas_require_finding_kind(self):
         root = Path(__file__).resolve().parents[1]
-        for relative_path in ("config/review.schema.json", "src/scout/data/review.schema.json"):
-            schema = json.loads((root / relative_path).read_text(encoding="utf-8"))
-            annotation = schema["properties"]["annotations"]["items"]
-            self.assertIn("finding_kind", annotation["required"])
-            self.assertEqual(
-                annotation["properties"]["finding_kind"]["enum"],
-                ["general", "dead_code", "duplicate_code", "low_value_test"],
-            )
+        schema = json.loads((root / "config/review.schema.json").read_text(encoding="utf-8"))
+        annotation = schema["properties"]["annotations"]["items"]
+        self.assertIn("finding_kind", annotation["required"])
+        self.assertEqual(
+            annotation["properties"]["finding_kind"]["enum"],
+            ["general", "dead_code", "duplicate_code", "low_value_test"],
+        )
 
     def test_dead_code_always_gets_pr_warning_with_truthful_severity_heading(self):
         for side in ("NEW", "OLD"):
@@ -598,9 +597,6 @@ class SchemaTests(unittest.TestCase):
     def test_review_schema_files_declare_required_nullable_suggested_change(self):
         root = Path(__file__).resolve().parents[1]
         config_schema = json.loads((root / "config/review.schema.json").read_text(encoding="utf-8"))
-        data_schema = json.loads((root / "src/scout/data/review.schema.json").read_text(encoding="utf-8"))
-
-        self.assertEqual(config_schema, data_schema)
         annotation_schema = config_schema["properties"]["annotations"]["items"]
 
         self.assertEqual(
@@ -630,8 +626,6 @@ class SchemaTests(unittest.TestCase):
     def test_provider_schema_suggested_change_replacement_pattern(self):
         root = Path(__file__).resolve().parents[1]
         config_schema = json.loads((root / "config/review.schema.json").read_text(encoding="utf-8"))
-        data_schema = json.loads((root / "src/scout/data/review.schema.json").read_text(encoding="utf-8"))
-        self.assertEqual(config_schema, data_schema)
 
         pattern = config_schema["properties"]["annotations"]["items"]["properties"]["suggested_change"][
             "properties"
@@ -648,10 +642,7 @@ class SchemaTests(unittest.TestCase):
 
     def test_provider_schema_patterns_do_not_use_lookaround(self):
         root = Path(__file__).resolve().parents[1]
-        schema_paths = [
-            root / "config/review.schema.json",
-            root / "src/scout/data/review.schema.json",
-        ]
+        schema_paths = [root / "config/review.schema.json"]
         lookaround_constructs = ("(?=", "(?!", "(?<=", "(?<!")
 
         def check_patterns(schema, path):

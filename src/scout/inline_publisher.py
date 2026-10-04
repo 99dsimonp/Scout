@@ -6,7 +6,7 @@ import logging
 import re
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, List, Optional
 
 from .bitbucket import BitbucketError
 from .config import ConfigError

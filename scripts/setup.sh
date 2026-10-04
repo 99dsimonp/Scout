@@ -329,7 +329,6 @@ write_initial_config_for_bitbucket_url() {
   tmp="$(mktemp)"
   cat >"${tmp}" <<CONFIG
 [service]
-worker_id = "reviewer-1"
 state_db = "${STATE_DIR}/state.db"
 state_dir = "${STATE_DIR}"
 log_level = "INFO"

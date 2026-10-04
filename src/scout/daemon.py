@@ -252,7 +252,7 @@ class ScoutDaemon:
             if repo.pr_ids:
                 wanted = set(repo.pr_ids)
                 prs = [pr for pr in prs if pr.pr_id in wanted]
-            elif prs is not None:
+            else:
                 if output_mode == "inline_comments":
                     all_open_pr_ids = self._inline_dispatch().close_missing_prs(
                         self.config.bitbucket.workspace, repo.slug, all_open_pr_ids,
@@ -282,8 +282,7 @@ class ScoutDaemon:
                     continue
                 for provider in self.provider_names:
                     if (
-                        output_mode == "reports"
-                        and not self.state.has_review_for_key(
+                        not self.state.has_review_for_key(
                             pr, policy_version, schema_version, provider, output_mode=output_mode
                         )
                         and self.state.should_bootstrap_report(
@@ -313,8 +312,6 @@ class ScoutDaemon:
                             pr.pr_id,
                             pr.source_commit_hash,
                         )
-                if output_mode == "inline_comments":
-                    self._process_review_request_comments(pr, policy_version, schema_version, output_mode)
 
     def _process_review_request_comments(
         self,
@@ -1406,14 +1403,6 @@ def _format_provider_model_metadata(model: str, effort: str) -> str:
     return "{} / {}".format(model_label, effort_label)
 
 
-def _selected_provider_config(config: AppConfig):
-    return _provider_config(config, config.agents.strategy)
-
-
-def _selected_provider_runner(config: AppConfig, credentials: CredentialStore):
-    return _provider_runner(config, credentials, config.agents.strategy)
-
-
 def _lease_renewal_interval(lease_seconds: int) -> float:
     return min(30.0, lease_seconds / 3)
 
@@ -1522,12 +1511,6 @@ def _future_job_id(metadata) -> object:
     if isinstance(metadata, dict):
         return metadata.get("id")
     return metadata
-
-
-def _future_provider(metadata) -> str:
-    if isinstance(metadata, dict):
-        return metadata.get("provider", "")
-    return ""
 
 
 def _review_log_entry(

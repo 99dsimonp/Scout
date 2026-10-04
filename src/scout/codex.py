@@ -62,7 +62,6 @@ class CodexRunner:
             raise ProviderError("Codex command not found: {}".format(self.config.command), retryable=False)
         if self.config.auth_mode == "api":
             Path(self.config.home_dir).mkdir(parents=True, exist_ok=True)
-        if self.config.auth_mode == "api":
             self.credentials.read(self.config.credential)
 
     def run(
