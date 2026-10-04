@@ -1,6 +1,6 @@
 Name:           scout
 Version:        0.1.0
-Release:        4%{?dist}
+Release:        5%{?dist}
 Summary:        Scout Bitbucket Cloud PR AI review service
 License:        Apache-2.0
 BuildArch:      noarch
@@ -67,6 +67,9 @@ exit 0
 %{_unitdir}/scout.service
 
 %changelog
+* Sun Oct 04 2026 Scout contributors <noreply@github.com> - 0.1.0-5
+- Add optional private-network read-only MCP diagnostics and isolated runtime setup
+
 * Wed Sep 30 2026 Scout contributors <noreply@github.com> - 0.1.0-4
 - Review PR-caused dead code, duplicate implementations, and low-value tests
 - Include PR discussion threads and respect explicit out-of-scope replies

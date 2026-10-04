@@ -16,6 +16,7 @@ SERVICE_USER_SET=0
 SERVICE_GROUP_SET=0
 ENABLE_NOW=0
 PRINT_UNIT=0
+APPLY_MCP=0
 BITBUCKET_USERNAME_FILE=""
 BITBUCKET_API_KEY_FILE=""
 BITBUCKET_OAUTH_CLIENT_ID_FILE=""
@@ -61,6 +62,7 @@ Options:
   --bitbucket-oauth-client-id-file PATH
   --bitbucket-oauth-client-secret-file PATH
   --bitbucket-ssh-key-file PATH Optional SSH key credential source.
+  --apply-mcp                   Apply only the optional MCP service and firewall.
   --enable-now                  Enable and start the service after setup.
   --print-unit                  Print the generated unit and exit.
   -h, --help                    Show this help.
@@ -674,6 +676,10 @@ while (($#)); do
       LOAD_SSH_CREDENTIAL=1
       shift 2
       ;;
+    --apply-mcp)
+      APPLY_MCP=1
+      shift
+      ;;
     --enable-now)
       ENABLE_NOW=1
       shift
@@ -691,6 +697,14 @@ while (($#)); do
       ;;
   esac
 done
+
+if [[ "${APPLY_MCP}" -eq 1 ]]; then
+  if [[ "${PRINT_UNIT}" -eq 1 || "${ENABLE_NOW}" -eq 1 ]]; then
+    die "--apply-mcp cannot be combined with --print-unit or --enable-now"
+  fi
+  require_absolute_path "--config" "${CONFIG_PATH}"
+  exec python3 -m scout.mcp_setup --config "${CONFIG_PATH}"
+fi
 
 if [[ "${USE_CURRENT_USER}" -eq 1 ]]; then
   if [[ "${SERVICE_USER_SET}" -eq 1 || "${SERVICE_GROUP_SET}" -eq 1 ]]; then

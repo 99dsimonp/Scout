@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -12,6 +13,9 @@ from typing import Dict, Iterator, List, Optional, Sequence
 
 from .models import PullRequest, legacy_report_review_key, review_key
 from .inline_state import InlineState
+from .diagnostic_access import diagnostic_reader, grant_diagnostic_file, grant_diagnostic_traversal
+
+LOG = logging.getLogger(__name__)
 
 
 def utcnow() -> str:
@@ -56,6 +60,37 @@ class StateStore:
     def __init__(self, path: str):
         self.path = path
         self.inline = InlineState(self)
+        self._diagnostic_connection = None
+
+    def open_diagnostic_reader(self) -> None:
+        if not diagnostic_reader() or self._diagnostic_connection is not None:
+            return
+        conn = None
+        try:
+            conn = sqlite3.connect(
+                Path(self.path).absolute().as_uri() + "?mode=rw", uri=True, isolation_level=None,
+            )
+            conn.execute("pragma query_only=ON")
+            # Opening SQLite alone is lazy. Touch the schema, then finish the
+            # read so WAL/SHM survive per-operation closes without a transaction
+            # preventing later writes or checkpoints.
+            conn.execute("select name from sqlite_master limit 1").fetchall()
+            self._diagnostic_connection = conn
+            grant_diagnostic_traversal(Path(self.path).parent)
+            for path in (self.path, self.path + "-wal", self.path + "-shm"):
+                grant_diagnostic_file(Path(path))
+        except sqlite3.Error as exc:
+            if conn is not None:
+                conn.close()
+            LOG.warning("cannot keep diagnostic database reader available: %s", exc)
+
+    def close_diagnostic_reader(self) -> None:
+        conn, self._diagnostic_connection = self._diagnostic_connection, None
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error as exc:
+                LOG.warning("cannot close diagnostic database reader: %s", exc)
 
     def initialize(self) -> None:
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)

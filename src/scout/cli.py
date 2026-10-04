@@ -8,12 +8,26 @@ from pathlib import Path
 
 from .config import CredentialStore, load_config
 from .daemon import ScoutDaemon
+from .diagnostic_logging import configure_diagnostic_logging
 from .runtime_lock import RuntimeLock, RuntimeLockError
 from .state import StateStore
 from .usage import summarize_usage_log
 
 
 def main(argv=None) -> int:
+    handler = configure_diagnostic_logging()
+    try:
+        return _main(argv)
+    except Exception:
+        logging.getLogger(__name__).exception("Scout command failed")
+        raise
+    finally:
+        if handler is not None:
+            logging.getLogger().removeHandler(handler)
+            handler.close()
+
+
+def _main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Scout Bitbucket PR review daemon")
     parser.add_argument("--config", default="/etc/scout/config.toml", help="Path to config.toml")
     parser.add_argument("--once", action="store_true", help="Run one poll/review pass and exit")
@@ -70,6 +84,7 @@ def main(argv=None) -> int:
         parser.error("--repo and --pr are only valid with --usage-summary")
 
     config = load_config(args.config)
+    logging.getLogger().setLevel(getattr(logging, config.service.log_level.upper(), logging.INFO))
     if publication_command:
         state = StateStore(config.service.state_db)
         state.initialize()
@@ -94,7 +109,10 @@ def main(argv=None) -> int:
     if args.check_startup:
         with RuntimeLock(config.service.state_dir):
             daemon = ScoutDaemon(config, CredentialStore())
-            daemon.initialize()
+            try:
+                daemon.initialize()
+            finally:
+                daemon.close()
         print("startup checks OK")
         return 0
     if args.recover_abandoned_jobs:
@@ -110,19 +128,18 @@ def main(argv=None) -> int:
             return 0
         print("recovered abandoned jobs: {}".format(recovered))
         return 0
-    logging.basicConfig(
-        level=getattr(logging, config.service.log_level.upper(), logging.INFO),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
     if args.reset_state_db:
         try:
             with RuntimeLock(config.service.state_dir):
                 _reset_state_db(config.service.state_db)
                 daemon = ScoutDaemon(config, CredentialStore())
-                daemon.initialize()
-                daemon.poll_once()
-                daemon.run_pending_jobs()
-                daemon.cleanup_old_artifacts()
+                try:
+                    daemon.initialize()
+                    daemon.poll_once()
+                    daemon.run_pending_jobs()
+                    daemon.cleanup_old_artifacts()
+                finally:
+                    daemon.close()
         except RuntimeLockError as exc:
             print("reset-state-db refused: {}".format(exc), file=sys.stderr)
             return 1

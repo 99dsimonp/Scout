@@ -25,6 +25,7 @@ Behavior, invariants, and rationale live in [DESIGN.md](DESIGN.md).
 - [Configuration](#configuration)
 - [Output modes](#output-modes)
 - [Operations](#operations)
+- [Private MCP diagnostics](#private-mcp-diagnostics)
 - [Development](#development)
 
 ---
@@ -283,6 +284,97 @@ review snapshots stay in SQLite until their job is removed, which lets delayed
 publication retries reuse the original review. Scout prunes state for closed PRs
 on later polls.
 
+## Private MCP diagnostics
+
+The optional `scout-mcp.service` exposes read-only diagnostics to Codex and
+Claude Code running on company laptops. Users add one internal HTTP URL; there
+are no Scout accounts, tokens, certificates, or browser sign-in steps.
+
+The company VPN and configured source networks control access. Every permitted
+client can read retained logs, including private source-code excerpts. HTTP on
+the internal segment between the VPN gateway and Scout is unencrypted. The
+endpoint must remain inside this company-network boundary.
+
+### Operator setup
+
+Install the matching `scout` and `scout-mcp-runtime` RPMs on Rocky Linux 10
+(x86_64). The optional runtime contains the pinned MCP dependencies; the ordinary Scout
+daemon does not need them. Install `firewalld` and run it before applying MCP
+configuration.
+
+Set the following in `/etc/scout/config.toml`, replacing these example values:
+
+```toml
+[mcp]
+enabled = true
+bind_address = "10.20.30.40"
+port = 8765
+hostname = "scout.company.internal"
+allowed_networks = ["10.100.0.0/16"]
+```
+
+The bind address must belong to the host's private IPv4 interface. The hostname
+must resolve to it from company laptops. Use the client source ranges Scout
+actually sees after any VPN gateway or NAT translation. IPv6 listening is not
+enabled. See the example config for bounded-read limits and the diagnostic log
+location; database and run-output locations come from `[service]`.
+Diagnostic paths must be outside `/home`, `/root`, and `/run/user` so the MCP
+service can keep its home-directory sandbox in place. Use a dedicated directory
+for `mcp.log_path`.
+
+```bash
+sudo scout-setup --apply-mcp --config /etc/scout/config.toml
+# First enable only: activate Scout's diagnostic logging and reader access.
+sudo systemctl restart scout
+```
+
+Setup configures the dedicated MCP service account, file access, and its own
+firewall rules, and prints client setup commands. It does not restart Scout.
+The MCP service starts independently, so it remains available when Scout is
+stopped or its provider configuration is broken.
+
+### Connect a laptop
+
+Use the URL printed by setup. For the example above:
+
+```bash
+codex mcp add scout --url http://scout.company.internal:8765/mcp
+claude mcp add --transport http --scope user scout http://scout.company.internal:8765/mcp
+```
+
+Ask the agent to inspect Scout's service state, failed jobs, publication
+blockers, logs, retained provider output, or token usage. The six tools are
+`get_status`, `list_jobs`, `get_job`, `read_logs`, `read_run_output`, and
+`get_usage`. They cannot retry jobs, restart services, execute commands, or
+read arbitrary files.
+
+`read_logs(source="daemon")` returns the current file and lists available
+daily rotations. Pass a returned date as `rotation="YYYY-MM-DD"` to read that
+retained file. Rotations use UTC dates and are limited by Scout's retention
+setting, up to seven days. Review-audit and provider-usage logs use
+`source="review"` and `source="usage"`.
+
+Results report truncation and unavailable sources. Raw provider files are the
+latest retained artifacts for a job and can be overwritten by a retry. A
+validated review record does not prove that publication succeeded. When Scout
+stops, SQLite may remove the WAL files needed for read-only access; MCP then
+reports database state as unavailable while service status and retained logs
+remain accessible. Failures before Scout's Python entrypoint starts remain in
+the local system journal.
+
+`max_bytes` accepts 2048–65536 bytes. The HTTP service additionally limits the
+diagnostic JSON payload to 24 KiB so the complete MCP response stays below
+64 KiB after JSON escaping and protocol metadata. Follow returned cursors to
+read additional records; usage pages explicitly report partial subtotals.
+
+### Disable or change the endpoint
+
+Edit `[mcp]` and re-run `scout-setup --apply-mcp`. Setting `enabled = false`
+stops and disables MCP and removes its managed firewall rules without stopping
+Scout. Editing TOML alone does not reconfigure an already-running service.
+MCP is disabled by default; missing MCP dependencies or invalid MCP settings do
+not prevent the ordinary Scout daemon from running.
+
 ## Development
 
 ```bash
@@ -291,6 +383,30 @@ PYTHONPATH=src python3 -m scout --config config/config.toml.example --check-conf
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions.
+
+Validate the optional MCP runtime and build its Rocky 10 RPMs with Docker:
+
+```bash
+scripts/test-rocky10.sh
+docker build --target rpm-export \
+  --output type=local,dest=build/rocky10-rpms \
+  -f packaging/Dockerfile.rocky10 .
+```
+
+The build downloads hash-locked wheels in a dedicated image stage, then builds
+both RPMs without network access. The installed runtime uses those packaged
+dependencies; setup does not install Python packages on the host. The test
+container exercises HTTP, file permissions, and RPM installation. A real
+deployment still needs checks from allowed and denied network sources and on
+a Rocky 10 host with SELinux enforcing.
+
+Before rollout, use both client commands above from a VPN laptop and call
+`get_status` and `read_logs`. Confirm that a client outside the allowed source
+networks cannot connect. On the deployment host, check `systemctl status
+scout-mcp`, `journalctl -u scout-mcp`, and `getenforce`; review any SELinux
+denials without disabling enforcement. Stop MCP and confirm Scout continues
+reviewing, then start it again. Finally apply `enabled = false` and confirm the
+listener closes while Scout remains active.
 
 ## License
 

@@ -8,6 +8,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+from .diagnostic_access import grant_diagnostic_file
+
 LOG = logging.getLogger(__name__)
 
 
@@ -60,6 +62,7 @@ def _cleanup_review_log(path: Path, cutoff: datetime) -> None:
     tmp = path.with_name(path.name + ".tmp")
     try:
         tmp.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+        grant_diagnostic_file(tmp)
         os.replace(str(tmp), str(path))
     except OSError as exc:
         LOG.warning("failed to rewrite review log for retention path=%s error=%s", path, exc)

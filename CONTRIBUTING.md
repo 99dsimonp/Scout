@@ -9,6 +9,8 @@ conventions matter and there are no hidden ones encoded only in tribal memory.
 
 - Single Python daemon, no runtime dependencies outside the standard library
   except `tomli` on Python &lt; 3.11.
+- Optional private MCP diagnostics run in a separate Rocky 10 service with the
+  official MCP SDK. Keep its dependencies and imports out of the base daemon.
 - Source lives under `src/scout/`. Tests live under `tests/` and use the stdlib
   `unittest` runner.
 - `DESIGN.md` is the source of truth for behavior, invariants, and the
@@ -75,10 +77,22 @@ New behavior needs new tests. We prefer:
 If you are adding a feature gated by config, add a `tests/test_config.py` case
 that proves the new key is parsed and validated.
 
+MCP configuration has its own independent loader and tests so a broken provider
+configuration does not prevent remote diagnosis. Base Python tests must remain
+runnable without the optional SDK. Run `scripts/test-rocky10.sh` for the Rocky
+10 image with the pinned SDK, real HTTP tests, and packaging checks. Network is
+used to build the image; tests run without external network access.
+
+Container tests do not prove the deployed host's SELinux policy or VPN routing.
+Before enabling an installation, test it from an allowed company laptop and a
+denied source, and exercise the installed service with SELinux enforcing.
+
 ## Style
 
 - Standard-library Python. Do not add a runtime dependency without discussing
   it in an issue first; the dependency-free posture is deliberate.
+  The approved optional MCP runtime is the exception: pin its dependencies in
+  its separate build inputs, without adding them to the base Scout package.
 - No formatter is enforced yet, but follow the existing layout: four-space
   indents, double-quoted strings, type hints on public functions, snake_case
   module and function names.

@@ -1,0 +1,33 @@
+[Unit]
+Description=Scout read-only MCP diagnostics
+After=network-online.target firewalld.service
+Wants=network-online.target
+Requires=firewalld.service
+
+[Service]
+Type=simple
+User=scout-mcp
+Group=scout-mcp
+ExecStart=/usr/libexec/scout-mcp/bin/python -m scout.mcp_service --config /etc/scout/mcp.toml
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET
+InaccessiblePaths=-/etc/scout/secrets -/run/credentials -/var/lib/scout/.codex -/var/lib/scout/.claude -/var/lib/scout/repos -/var/lib/scout/worktrees -/var/lib/scout/agents -/var/lib/scout/.ssh
+
+[Install]
+WantedBy=multi-user.target

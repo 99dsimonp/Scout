@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from .diagnostic_access import grant_diagnostic_file
+
 
 DEFAULT_PROVIDER_COOLDOWN_SECONDS = 5 * 60 * 60
 PROVIDER_COOLDOWN_STATUS = "quota_exhausted"
@@ -121,6 +123,8 @@ def run_provider_command(
     with prompt_file.open("r", encoding="utf-8") as prompt_input, \
         stdout_file.open("w", encoding="utf-8") as stdout, \
         stderr_file.open("w", encoding="utf-8") as stderr:
+        grant_diagnostic_file(stdout_file)
+        grant_diagnostic_file(stderr_file)
         try:
             proc = subprocess.Popen(
                 cmd, stdin=prompt_input, stdout=stdout, stderr=stderr,
@@ -142,8 +146,14 @@ def run_provider_command(
                 except subprocess.TimeoutExpired:
                     pass
         finally:
-            if proc.poll() is None:
-                terminate_process_group(proc)
+            try:
+                if proc.poll() is None:
+                    terminate_process_group(proc)
+            finally:
+                # Providers can replace output using mode 0600, which masks an
+                # inherited reader ACL. Restore it even for cancelled/failed runs.
+                if output_file is not None:
+                    grant_diagnostic_file(output_file)
 
     stdout_text = read_text(stdout_file)
     stderr_text = read_text(stderr_file)

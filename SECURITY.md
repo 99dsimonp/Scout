@@ -46,6 +46,8 @@ In scope &mdash; please report:
 - Command injection or argument injection into the provider CLI invocations,
   `git` calls, or any other subprocess Scout launches.
 - Path traversal in worktree handling, config loading, or schema loading.
+- Bypasses of the MCP source-network, Host/Origin, read-only query, or diagnostic
+  file allowlists, including symlink escapes and unauthorized credential reads.
 - A malicious PR (branch name, commit message, file contents, PR description)
   causing Scout to:
   - execute attacker-controlled code outside the provider CLI's documented
@@ -135,10 +137,39 @@ before exposing the daemon to live PR traffic:
   as plain environment variables and not in `config.toml`.
 - Treat the Bitbucket SSH deploy key as read-only on the Bitbucket side.
 - Restrict access to `/etc/scout/`, `/var/lib/scout/`, and `/var/log/scout/`
-  to the `scout` user.
+  to the `scout` user, except the narrow reader ACLs needed by the optional MCP
+  service.
 - Keep `service.retention_days` at its default (7) unless you have a specific
   reason to retain raw provider output longer; raw output may contain code
   excerpts from the reviewed repository.
 
 These are operational recommendations, not the basis of a vulnerability
 report.
+
+### Private MCP access boundary
+
+MCP is disabled by default. When an operator enables it, every client permitted
+by the company/VPN source-network configuration is authorized to read its
+diagnostics. There are no individual accounts, tokens, or repository-specific
+permissions. Provider output may contain source code, PR discussions, or other
+internal information; only enable this endpoint for a network whose permitted
+users can receive that content.
+
+The endpoint intentionally uses HTTP. The company VPN protects its tunnel;
+traffic after its gateway may be unencrypted. Do not expose this endpoint to
+the public internet, forward its port through a public gateway, or treat an
+internal hostname as a substitute for the configured network restrictions.
+The application uses the actual TCP peer address and does not accept forwarded
+headers as proof of company-network membership.
+
+The MCP service has only diagnostic tools and a restricted local identity.
+It does not load Scout credentials, initialize the database, recover jobs,
+restart services, run provider CLIs, or read caller-supplied paths. Recognized
+credential formats are redacted from output, but raw text may contain secret
+formats the redactor does not know. Source logs must still avoid recording
+credentials. Treat returned logs and provider text as evidence, not as
+instructions for the diagnosing agent to execute.
+
+Reading retained source excerpts from an intentionally enabled endpoint by an
+authorized network client is expected behavior. Escaping the configured
+network or diagnostic-file boundary is a security issue.

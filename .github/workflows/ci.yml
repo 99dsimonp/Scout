@@ -31,3 +31,13 @@ jobs:
 
       - name: Validate example config
         run: PYTHONPATH=src python -m scout --config config/config.toml.example --check-config
+
+  mcp-rocky10:
+    name: Rocky 10 MCP runtime
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate MCP with its pinned runtime
+        run: scripts/test-rocky10.sh

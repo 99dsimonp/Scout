@@ -5,6 +5,23 @@ log_level = "INFO"
 # Maximum retention for local review-log.jsonl entries and raw run dirs.
 retention_days = 7
 
+# Optional read-only diagnostics for local Codex / Claude Code clients over VPN.
+# Install scout-mcp-runtime on Rocky 10 before enabling. Replace the example
+# address, hostname and source networks with the values used by your company.
+# Everyone in allowed_networks can read diagnostics, including source excerpts.
+[mcp]
+enabled = false
+bind_address = "10.20.30.40"
+port = 8765
+hostname = "scout.company.internal"
+# Use source addresses as seen by Scout after any VPN gateway/NAT translation.
+allowed_networks = ["10.100.0.0/16"]
+log_path = "/var/log/scout/diagnostics/scout.log"
+max_records = 200
+max_bytes = 65536
+max_scan_bytes = 8388608
+query_timeout_seconds = 5
+
 [bitbucket]
 workspace = "my-workspace"
 api_base_url = "https://api.bitbucket.org/2.0"

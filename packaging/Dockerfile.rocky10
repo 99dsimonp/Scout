@@ -1,0 +1,29 @@
+FROM rockylinux/rockylinux:10 AS build-tools
+RUN dnf -y install dnf-plugins-core && dnf config-manager --set-enabled crb && \
+    dnf -y install python3 python3-pip python3-devel python3-wheel python3-setuptools \
+    pyproject-rpm-macros systemd-rpm-macros rpm-build git acl firewalld systemd && dnf clean all
+
+FROM build-tools AS wheels
+COPY packaging/mcp/requirements.lock /requirements.lock
+RUN python3 -m pip download --only-binary=:all: --require-hashes -r /requirements.lock -d /wheelhouse
+
+FROM build-tools AS packages
+WORKDIR /source
+COPY . .
+COPY --from=wheels /wheelhouse /wheelhouse
+RUN mkdir -p /root/rpmbuild/SOURCES && \
+    tar --exclude=.git --exclude=build --exclude='__pycache__' --transform='s,^,scout-0.1.0/,' -czf /root/rpmbuild/SOURCES/scout-0.1.0.tar.gz . && \
+    tar -C /wheelhouse -czf /root/rpmbuild/SOURCES/scout-mcp-wheels.tar.gz .
+RUN --network=none rpmbuild -ba packaging/scout.spec && rpmbuild -ba packaging/scout-mcp-runtime.spec
+
+FROM packages AS validation
+RUN dnf -y install /root/rpmbuild/RPMS/noarch/scout-*.rpm /root/rpmbuild/RPMS/x86_64/scout-mcp-runtime-*.rpm && dnf clean all
+ENV PYTHONPATH=/source/src
+RUN --network=none python3 -c 'import importlib.util; assert importlib.util.find_spec("mcp") is None; import scout.mcp_setup' && \
+    systemd-analyze verify /usr/lib/systemd/system/scout-mcp.service
+RUN --network=none env -u PYTHONPATH /usr/libexec/scout-mcp/bin/python -c 'import importlib.metadata; assert importlib.metadata.version("mcp") == "2.3.0"; from scout.mcp_service import main'
+CMD ["/usr/libexec/scout-mcp/bin/python", "-m", "unittest", "discover", "-s", "tests"]
+
+FROM scratch AS rpm-export
+COPY --from=packages /root/rpmbuild/RPMS/ /RPMS/
+COPY --from=packages /root/rpmbuild/SRPMS/ /SRPMS/

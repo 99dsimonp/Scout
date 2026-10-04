@@ -92,6 +92,9 @@ clone_url = "git@bitbucket.org:ws/repo.git"
                 def cleanup_old_artifacts(self):
                     self.calls.append("cleanup_old_artifacts")
 
+                def close(self):
+                    self.state.close_diagnostic_reader()
+
             with patch("scout.cli.CredentialStore"), patch("scout.cli.ScoutDaemon", FakeDaemon):
                 exit_code = main(["--config", str(config_path), "--once", "--reset-state-db"])
 
@@ -311,6 +314,7 @@ clone_url = "git@bitbucket.org:ws/repo.git"
 
             self.assertEqual(exit_code, 0)
             daemon.initialize.assert_called_once_with()
+            daemon.close.assert_called_once_with()
             self.assertIn("startup checks OK", stdout.getvalue())
 
 if __name__ == "__main__":

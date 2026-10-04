@@ -1,0 +1,15 @@
+.git
+.claude
+.codex
+.venv
+venv
+build
+dist
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+state.db*
+client_id
+client_secret
+password
+username

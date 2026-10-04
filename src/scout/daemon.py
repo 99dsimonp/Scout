@@ -18,6 +18,7 @@ from .claude import ClaudeRunner
 from .codex import CodexRunner
 from .comment_request import CommentRequestValidationError, has_scout_mention
 from .config import AppConfig, ConfigError, CredentialStore
+from .diagnostic_access import diagnostic_reader, grant_diagnostic_file, prepare_diagnostic_directory
 from .gitops import GitError, GitManager
 from .models import PullRequest
 from .prompt import build_provider_prompt
@@ -109,6 +110,9 @@ class ScoutDaemon:
     def initialize(self) -> None:
         self.state.initialize()
         Path(self.config.service.state_dir).mkdir(parents=True, exist_ok=True)
+        if diagnostic_reader():
+            self.state.open_diagnostic_reader()
+            prepare_diagnostic_directory(Path(self.config.service.state_dir) / "runs")
         for repo in self.config.bitbucket.repositories:
             self.state.upsert_repository(
                 self.config.bitbucket.workspace,
@@ -141,32 +145,41 @@ class ScoutDaemon:
                 )
 
     def run_forever(self) -> None:
-        with RuntimeLock(self.config.service.state_dir):
-            self.initialize()
-            with ThreadPoolExecutor(max_workers=self.max_parallel_reviews) as pool:
-                futures = {}
-                next_poll_at = 0.0
-                while True:
-                    now = time.monotonic()
-                    if now >= next_poll_at:
-                        self.poll_once()
-                        next_poll_at = time.monotonic() + self.config.polling.interval_seconds
-                        if not futures:
-                            self.cleanup_old_artifacts()
-                    self._schedule(pool, futures)
-                    wait_timeout = min(5.0, _seconds_until_next_poll(next_poll_at, time.monotonic()))
-                    if futures:
-                        done, _ = wait(list(futures), timeout=wait_timeout, return_when=FIRST_COMPLETED)
-                        _reap_worker_futures(done, futures)
-                    elif wait_timeout > 0:
-                        time.sleep(wait_timeout)
+        try:
+            with RuntimeLock(self.config.service.state_dir):
+                self.initialize()
+                with ThreadPoolExecutor(max_workers=self.max_parallel_reviews) as pool:
+                    futures = {}
+                    next_poll_at = 0.0
+                    while True:
+                        now = time.monotonic()
+                        if now >= next_poll_at:
+                            self.poll_once()
+                            next_poll_at = time.monotonic() + self.config.polling.interval_seconds
+                            if not futures:
+                                self.cleanup_old_artifacts()
+                        self._schedule(pool, futures)
+                        wait_timeout = min(5.0, _seconds_until_next_poll(next_poll_at, time.monotonic()))
+                        if futures:
+                            done, _ = wait(list(futures), timeout=wait_timeout, return_when=FIRST_COMPLETED)
+                            _reap_worker_futures(done, futures)
+                        elif wait_timeout > 0:
+                            time.sleep(wait_timeout)
+        finally:
+            self.close()
 
     def run_once(self) -> None:
-        with RuntimeLock(self.config.service.state_dir):
-            self.initialize()
-            self.poll_once()
-            self.run_pending_jobs()
-            self.cleanup_old_artifacts()
+        try:
+            with RuntimeLock(self.config.service.state_dir):
+                self.initialize()
+                self.poll_once()
+                self.run_pending_jobs()
+                self.cleanup_old_artifacts()
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        self.state.close_diagnostic_reader()
 
     def run_pending_jobs(self) -> None:
         with ThreadPoolExecutor(max_workers=self.max_parallel_reviews) as pool:
@@ -1548,7 +1561,10 @@ def _append_review_log_entry(state_dir: str, entry: Dict[str, object]) -> Path:
     path = Path(state_dir) / "review-log.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with _REVIEW_LOG_LOCK:
+        created = not path.exists()
         with path.open("a", encoding="utf-8") as handle:
+            if created:
+                grant_diagnostic_file(path)
             handle.write(json.dumps(entry, sort_keys=True, separators=(",", ":")))
             handle.write("\n")
             handle.flush()
@@ -1609,7 +1625,10 @@ def _append_provider_usage_log_entry(state_dir: str, entry: Dict[str, object]) -
     path = Path(state_dir) / "provider-usage.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with _REVIEW_LOG_LOCK:
+        created = not path.exists()
         with path.open("a", encoding="utf-8") as handle:
+            if created:
+                grant_diagnostic_file(path)
             handle.write(json.dumps(entry, sort_keys=True, separators=(",", ":")))
             handle.write("\n")
             handle.flush()

@@ -9,8 +9,10 @@ changed PR commits locally, runs AI reviewers against readonly worktrees,
 validates strict JSON output, and publishes the results back to Bitbucket Cloud
 as provider-specific Code Insights reports and annotations.
 
-The v1 target is a Rocky Linux 9 compatible RPM installed with `dnf` or `yum`.
-Scout runs as a systemd service with no public HTTP endpoint. Webhook ingestion,
+The base daemon supports Rocky Linux 9 and 10 RPMs installed with `dnf` or `yum`.
+Scout runs as a systemd service with no public HTTP endpoint. Optional read-only
+MCP diagnostics run as a separate private-network service on Rocky Linux 10.
+Webhook ingestion,
 multi-node operation, provider credential pools, and account rotation are
 deferred.
 
@@ -38,7 +40,7 @@ The project name is Scout. The main daemon should use Scout naming consistently:
 ## Non-Goals for v1
 
 - Public webhook endpoint.
-- Web UI or API server.
+- Web UI or public API server.
 - Multi-node scheduling.
 - Credential/account rotation.
 - Quota bypassing through user account pools.
@@ -94,7 +96,67 @@ The daemon owns all privileged responsibilities:
 - Publish reports and annotations.
 - Apply retries, cooldowns, and timeouts.
 
-The daemon should not expose an HTTP listener in v1.
+The review daemon does not expose an HTTP listener. The optional diagnostics
+service below owns its private HTTP listener.
+
+## Private MCP diagnostics
+
+`scout-mcp.service` serves Streamable HTTP through the official Python MCP SDK.
+It provides service state, job and publication diagnostics, retained logs and
+run output, and usage summaries. It has no mutation tools, arbitrary SQL,
+arbitrary-path reader, or shell execution interface. A fixed read-only
+`systemctl show scout.service` request supplies process state; that state does
+not prove that polling or publication is progressing.
+
+The intended clients run on company laptops behind the existing always-on VPN.
+Everyone in the configured source networks is authorized to read Scout's
+diagnostics, including source excerpts. There is no per-user authentication or
+TLS. Operators accept that VPN encryption may end at the gateway. The listener
+binds to one private IPv4 address, setup limits ingress by source network, and
+the application checks the actual peer address without trusting forwarding
+headers. SDK Host and Origin checks remain enabled. Private DNS is convenient
+for clients but is not an access boundary.
+
+MCP configuration lives in `[mcp]` in the existing TOML file. A separate reader
+validates it without validating provider/repository configuration. Disabled MCP
+exits before importing the optional SDK or validating enabled-only settings.
+The base daemon does not depend on the optional runtime. Applying MCP settings
+never stops or restarts the daemon, and MCP has no systemd dependency that would
+stop it when Scout fails. The first enable requires a normal Scout restart to
+activate the generated diagnostic logging/access environment.
+
+The daemon remains the owner of all state changes. The MCP reader uses SQLite
+`mode=ro` and `query_only`, does not initialize or migrate the database, and
+never invokes recovery or the cooldown getter that removes expired rows.
+When diagnostics are configured, Scout keeps one idle connection open without
+a transaction: otherwise its short per-operation connections can remove the
+WAL/SHM files between operations, preventing a restricted reader from opening
+the database. Closing Scout closes this connection. If an offline database
+cannot be read safely, MCP reports it unavailable instead of opening it for
+writing or assuming it is immutable.
+
+The dedicated `scout-mcp` identity receives traverse permission on diagnostic
+ancestors and read permission on exact state files. Only the runs and dedicated
+diagnostic-log directories receive inheritable reader ACLs; the state root
+must not have a default reader ACL because it also contains provider homes.
+Producers preserve reader permission when WAL files are created, logs rotate,
+or retention replaces JSONL files. MCP also masks credentials, provider homes,
+repositories, and worktrees in its filesystem sandbox. It does not join the
+daemon user's group or the system journal group.
+
+Diagnostic file logging supplements stderr and starts before application
+configuration validation. Its failure must not stop Scout; failures before the
+Python entrypoint starts still require the local system journal. Log retention
+follows Scout's maximum seven-day retention. Reads have record, byte, scan, and
+time bounds. Missing, partially written, replaced, or pruned files produce
+explicit unavailable/truncated results rather than fabricated empty history.
+Credential-format redaction reduces accidental disclosure but cannot make raw
+provider content safe for an audience without source-code access.
+
+Run filenames are reused on retries, so MCP calls them the latest retained
+artifacts, not immutable attempt history. Review audit entries are written
+after validation and before delivery; publication state comes from the durable
+job/round/intent records rather than the existence of a review audit entry.
 
 ## Future Webhook Service
 
@@ -141,7 +203,8 @@ Build recommendations:
 
 - Build in an EL9 target environment, preferably with `mock`.
 - Publish an EL9 RPM first.
-- Treat Rocky/Enterprise Linux 10 as a separate future build target.
+- Build Rocky/Enterprise Linux 10 separately; the optional MCP runtime targets
+  this environment and bundles its pinned Python dependencies.
 - Do not build on EL10 and assume the resulting RPM is installable on EL9.
 
 Recommended installed layout:

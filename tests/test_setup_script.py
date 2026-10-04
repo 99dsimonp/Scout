@@ -28,6 +28,33 @@ def write_executable(path, content):
 
 
 class SetupScriptTests(unittest.TestCase):
+    def test_apply_mcp_dispatches_before_provider_and_user_setup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "invalid-provider.toml"
+            config.write_text('[mcp]\nenabled = false\n[agents.codex]\nmodel = 123\n')
+            write_executable(root / "python3", """
+                #!/usr/bin/env bash
+                printf '%s\\n' "$@"
+            """)
+            env = clean_env()
+            env["PATH"] = str(root) + os.pathsep + env["PATH"]
+            result = subprocess.run(
+                ["bash", str(SETUP), "--apply-mcp", "--config", str(config),
+                 "--logged-in-cli-current-user", "--service-user", "conflicting-user"],
+                env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["-m", "scout.mcp_setup", "--config", str(config)])
+
+    def test_apply_mcp_rejects_print_only_flag_instead_of_changing_services(self):
+        result = subprocess.run(
+            ["bash", str(SETUP), "--apply-mcp", "--print-unit"],
+            env=clean_env(), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot be combined", result.stderr)
+
     def test_print_unit_defaults_to_dedicated_user_and_loadcredential_files(self):
         if shutil.which("bash") is None:
             self.skipTest("bash is not available")
