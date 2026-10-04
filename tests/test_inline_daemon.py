@@ -429,6 +429,34 @@ class InlineDaemonTests(unittest.TestCase):
         self.assertEqual(daemon.state.inline.get_plan(self.round()["id"]), plan)
         self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [1, 1])
 
+    def test_inline_round_metadata_failure_retries_without_publishing_or_regeneration(self):
+        daemon = self.daemon
+        daemon.poll_once()
+        self.run_provider("codex")
+        self.run_provider("claude")
+        record = self.round()
+        with patch.object(daemon.bitbucket, "get_pull_request", side_effect=BitbucketError("metadata unavailable", retryable=True)):
+            daemon.run_pending_jobs()
+        self.assertEqual(daemon.bitbucket.posts, [])
+        self.assertEqual(self.round()["status"], "publishing")
+        self.assertIsNotNone(self.round()["retry_after"])
+        self.assertEqual(self.round()["outcomes"], record["outcomes"])
+        plan = daemon.state.inline.get_plan(record["id"])
+        self.assertIsNotNone(plan)
+        intents = daemon.state.inline.list_intents(round_id=record["id"])
+        self.assertEqual(len(intents), 2)
+        self.assertTrue(all(intent["status"] == "ready" and intent["attempts"] == 0 for intent in intents))
+        self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [1, 1])
+        with daemon.state.connect() as conn:
+            conn.execute("update inline_rounds set retry_after=null where id=?", (record["id"],))
+        daemon.run_pending_jobs()
+        daemon.run_pending_jobs()
+        self.assertEqual(self.round()["status"], "completed")
+        self.assertEqual(sorted(daemon.bitbucket.posts), sorted(intent["payload"]["content"] for intent in intents))
+        self.assertEqual(self.round()["outcomes"], record["outcomes"])
+        self.assertEqual(daemon.state.inline.get_plan(record["id"]), plan)
+        self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [1, 1])
+
     def test_exhausted_unknown_publication_fails_and_operator_can_recover(self):
         daemon = self.daemon
         daemon.poll_once()
@@ -642,6 +670,26 @@ class InlineDaemonTests(unittest.TestCase):
         daemon.run_pending_jobs()
         self.assertEqual(daemon.state.get_job(job.id).status, "succeeded")
         self.assertEqual(daemon.bitbucket.posts, ["Immutable saved comment"])
+        self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [0, 0])
+
+    def test_inline_replay_metadata_failure_retries_without_publishing_or_regeneration(self):
+        daemon = self.daemon
+        job = self.save_legacy_snapshot()
+        snapshot = daemon.state.load_review_snapshot(job)
+        self.assertIsNotNone(snapshot)
+        with patch.object(daemon.bitbucket, "get_pull_request", side_effect=BitbucketError("metadata unavailable", retryable=True)):
+            daemon.run_pending_jobs()
+        self.assertEqual(daemon.bitbucket.posts, [])
+        self.assertEqual(daemon.state.get_job(job.id).status, "failed_retryable")
+        self.assertEqual(daemon.state.load_review_snapshot(job), snapshot)
+        self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [0, 0])
+        with daemon.state.connect() as conn:
+            conn.execute("update review_jobs set leased_until=null where id=?", (job.id,))
+        daemon.run_pending_jobs()
+        daemon.run_pending_jobs()
+        self.assertEqual(daemon.state.get_job(job.id).status, "succeeded")
+        self.assertEqual(daemon.bitbucket.posts, ["Immutable saved comment"])
+        self.assertEqual(daemon.state.load_review_snapshot(job), snapshot)
         self.assertEqual([len(runner.runs) for runner in daemon.providers.values()], [0, 0])
 
     def test_old_inline_saved_snapshot_does_not_reserve_review_capacity(self):
