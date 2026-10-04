@@ -38,7 +38,6 @@ from .schema import (
     to_bitbucket_annotations,
     to_pr_comments,
     to_bitbucket_report,
-    to_no_findings_pr_comment,
     filter_annotation_locations,
     validate_review_output,
 )
@@ -407,19 +406,15 @@ class ScoutDaemon:
 
     def _queue_inline_round(self, pr: PullRequest, policy_version: str, schema_version: str) -> None:
         rounds = self.state.inline.list_rounds(workspace=pr.workspace, repo_slug=pr.repo_slug, pr_id=pr.pr_id)
-        reviewing = next((item for item in rounds if item["status"] == "reviewing"), None)
-        if reviewing is not None:
-            if reviewing["source_commit_hash"] != pr.source_commit_hash:
-                self.state.inline.create_round(
-                    self._resolve_inline_snapshot(pr), reviewing["providers"],
-                    reviewing["policy_version"], reviewing["schema_version"],
-                    trigger="replacement", replace_round_id=reviewing["id"],
-                    expected_version=reviewing["version"],
-                )
-            return
         if rounds or self.state.inline.has_pre_round_review(pr):
             return
         self.state.inline.create_round(self._resolve_inline_snapshot(pr), self.provider_names, policy_version, schema_version)
+
+    def _inline_pr_eligible(self, pr: PullRequest) -> bool:
+        repo = self.repository_configs[pr.repo_slug]
+        return (pr.state == "OPEN" and not pr.is_draft and getattr(repo, "review_enabled", True)
+                and not self._is_ignored_source_branch(repo, pr.source_branch)
+                and not self._is_ignored_target_branch(repo, pr.destination_branch))
 
     def _inline_dispatch(self):
         if not hasattr(self, "_inline_dispatcher"):
@@ -632,8 +627,6 @@ class ScoutDaemon:
             return is_lease_lost() or self.state.is_job_superseded(job.id, job.lease_token)
 
         LOG.info("starting review job id=%s repo=%s pr=%s commit=%s", job.id, job.repo_slug, job.pr_id, job.running_source_commit_hash)
-        provider_config = self.provider_configs[job.provider]
-        provider_runner = self.providers[job.provider]
         mirror = None
         worktree = None
         related_worktrees: List[Tuple[object, object]] = []
@@ -646,6 +639,8 @@ class ScoutDaemon:
         try:
             snapshot = self.state.load_review_snapshot(job)
             if snapshot is None:
+                provider_config = self.provider_configs[job.provider]
+                provider_runner = self.providers[job.provider]
                 cooldown_until = self.state.get_active_provider_cooldown(job.provider)
                 if cooldown_until is not None:
                     if self._record_inline_failure(job, ProviderError("provider cooldown"), cooldown=True):
@@ -1014,21 +1009,15 @@ class ScoutDaemon:
     ) -> str:
         report_id = publication["report_id"]
         if job.output_mode == "inline_comments":
-            outdated = False
             if replaying:
                 current_pr = self.bitbucket.get_pull_request(
                     job.repo_slug, job.pr_id,
                     before_request=lambda: self._renew_publish_or_superseded(job),
                 )
-                destination_commit = publication["destination_commit"]
-                outdated = (
-                    current_pr.source_commit_hash != source_commit
-                    or not destination_commit
-                    or current_pr.destination_commit_hash != destination_commit
-                )
+                if not self._inline_pr_eligible(current_pr):
+                    self.state.prune_ignored_pull_requests(job.workspace, job.repo_slug, [job.pr_id], "PR is no longer eligible")
+                    raise ProviderSuperseded("PR is no longer eligible")
             no_findings_comment = publication["no_findings_comment"]
-            if no_findings_comment and outdated:
-                no_findings_comment = publication["outdated_no_findings_comment"]
             if no_findings_comment and not self.state.inline_comment_published(
                 job,
                 _NO_FINDINGS_INLINE_COMMENT_ID,
@@ -1057,13 +1046,6 @@ class ScoutDaemon:
                     continue
                 if not self.state.renew_publishing_lease(job, self._lease_seconds(job.provider)):
                     raise ProviderSuperseded("review superseded before inline comment publish")
-                if outdated:
-                    self.bitbucket.publish_pull_request_comment(
-                        job.repo_slug, job.pr_id, comment["outdated_content"],
-                        before_request=lambda: self._renew_publish_or_superseded(job),
-                    )
-                    self.state.mark_inline_comment_published(job, external_id)
-                    continue
                 self.bitbucket.publish_inline_pull_request_comment(
                     job.repo_slug,
                     job.pr_id,
@@ -1317,9 +1299,15 @@ class ScoutDaemon:
         return normalized
 
     def _lease_seconds(self, provider: str) -> int:
+        provider_config = self.provider_configs.get(provider)
+        if provider_config is None:
+            # Frozen publication jobs can outlive their provider configuration.
+            # Keep the lease grace even when the queue timeout is only one second;
+            # renewal subtracts a second for SQLite timestamp truncation.
+            return _lease_seconds(self.config.queue.job_timeout_seconds, 0)
         return _lease_seconds(
             self.config.queue.job_timeout_seconds,
-            self.provider_configs[provider].timeout_seconds,
+            provider_config.timeout_seconds,
             self._risk_timeout_seconds(),
         )
 

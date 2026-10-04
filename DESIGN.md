@@ -474,7 +474,7 @@ growing indefinitely as repositories accumulate closed PRs. Cleanup is skipped
 for repository configs that use `pr_ids`, because the filtered list is not a
 complete view of the repository's open PRs.
 
-Primary queue update condition:
+Report-mode queue update condition:
 
 - Create or update the single active review job for a PR when the PR source
   commit differs from the last successfully reviewed source commit for the same
@@ -495,8 +495,9 @@ Report existence should not be checked on every poll. Report APIs are used for:
 
 ## Review Identity
 
-Scout must avoid duplicate work while still rerunning reviews when review inputs
-change.
+Report mode reruns reviews when review inputs change. Inline mode finishes the
+snapshot frozen for its initial or explicitly requested round; pushes alone do
+not create another review.
 
 The v1 queue identity is one active job per PR, provider, policy, and schema:
 
@@ -509,8 +510,8 @@ schema_version
 provider
 ```
 
-The job row stores the newest source commit, target branch, destination commit,
-merge base, and PR description as mutable target data. This allows multiple
+In report mode, the job row stores the newest source commit, target branch,
+destination commit, merge base, and PR description as mutable target data. This allows multiple
 commits on the same PR to collapse into one queue entry while still ensuring
 Scout reviews the newest known PR state.
 
@@ -1199,6 +1200,9 @@ independently of worker leases. A provider error or cooldown starts one fixed
 recovery deadline; healthy queueing starts no deadline. A failed provider does
 not discard another provider's successful results. A PR-level notice reports
 partial provider coverage, including when all new findings were already reported.
+Pending disabled providers must be failed before cooldown decisions consider
+alternatives; otherwise a disabled provider can cause the last enabled reviewer
+to be discarded instead of receiving its recovery window.
 
 A cheap structured selector picks original comments that fully cover overlapping
 findings and preserves uncertain or distinct issues. The selected severity cannot
@@ -1213,24 +1217,30 @@ Capacity limits account for review and classifier calls together. Review and
 selection/publication dispatch alternate when both are runnable. No waiting
 barrier, cooldown, or recovery intent holds a worker.
 
-Source pushes replace rounds only while their persisted phase is `reviewing`.
-After `ready_for_selection`, freshness checks prevent sending comments whose
-source or merge-base locations changed. Such findings produce a snapshot-specific
-stale notice; Scout does not remap their line numbers. Completed inline rounds
-rerun only after explicit requests. A tagged review request and all jobs in its
-new round are recorded atomically with the processed comment ID/version.
+Source pushes do not replace inline rounds at any phase. Providers finish
+against the frozen source commit and merge base; selection and publication keep
+their results, text, and line locations even if the PR changes. Scout sends no
+source-change notice and does not automatically review each pushed commit.
+A tagged review request creates a fresh round and records all its jobs atomically
+with the processed comment ID/version, fencing any unfinished previous round or
+pre-round inline job even if its provider or policy is no longer configured.
 
 The publisher owns stable marker-bearing intents and returned comment IDs.
 An ambiguous POST becomes unknown and must be reconciled before new comments on
-that PR. Complete negative lookups can permit a best-effort resend after settling,
-with the documented risk of a late duplicate. Publication retries reuse saved
+that PR. A complete negative lookup permits a best-effort resend only if it began
+after the settling deadline; finishing after the deadline cannot establish that
+its earlier pages were current. The documented risk of a late duplicate remains.
+Exhausted POST retries put the round in `publication_failed` while retaining the
+unknown intents for operator resolution. Publication retries reuse saved
 results and the exact selected payload. Operator commands resolve known outcomes
 or retry delivery without rerunning the reviews. Supersession and draft/ignored
 filters preserve unknown intents and canonical history. Closure pruning uses the
 complete open-PR inventory before eligibility filtering.
 
 `line_side = "NEW"` uses Bitbucket's `inline.to`; `line_side = "OLD"` uses
-`inline.from`, including deletion-only changes. Invalid locations are discarded
+`inline.from`, including deletion-only changes. Historical comments use the
+non-null anchor value: an explicit `inline.to = null` does not invalidate a
+populated `inline.from`. Invalid locations are discarded
 before selection. Bitbucket publication failures use the independent publication
 budget; they never rerun an expensive provider review. Inline mode publishes no
 Code Insights report and ignores the report-mode comment severity filter.
@@ -1266,11 +1276,11 @@ Provider concurrency:
 max_parallel = 2
 ```
 
-The queue should collapse multiple source commits for the same PR into one
-active queue entry. If a PR receives several commits while Scout is behind, only
+In report mode, the queue collapses multiple source commits for the same PR into
+one active queue entry. If a PR receives several commits while Scout is behind, only
 the newest commit needs review.
 
-Queue semantics:
+Queue semantics (source-commit replacement applies only in report mode):
 
 - At most one active job exists for a given workspace, repository, PR, policy,
   schema, and provider.
@@ -1339,20 +1349,23 @@ changed, so findings cannot acquire new wording or a newer commit label halfway
 through publication. Invalid saved data fails the job instead of regenerating
 output that could duplicate comments already posted. Snapshots are retained
 until the job is removed, cancelled, or moves to a new review run; ordinary
-artifact retention does not remove them. Provider cooldown and queue scheduling
-still apply to publication retries.
+artifact retention does not remove them. Publication retry backoff and queue
+scheduling still apply, but provider cooldown does not block saved payload
+delivery. Replaying a snapshot needs no provider runner or configuration, so
+removing the provider does not strand findings that have already been reviewed.
 
-Pre-existing saved inline publication snapshots finish the legacy immutable
-replay path, including its old-coordinate regular-comment fallback, without
-calling a provider again. New inline reviews always use rounds.
+Pre-existing saved inline publication snapshots finish their original payloads
+and inline locations without calling a provider again or substituting an
+outdated-location comment. New inline reviews always use rounds.
 
 Inline round results and selection plans use their separate durable records.
-Before sending their inline findings, Scout checks the current source and merge
-base. Stale locations remain unpublished and produce the snapshot-specific stale
-notice described above; they are not converted into full unanchored finding
-comments. Only a new requested review assesses the changed code after selection
-has started. Publication-only tasks do not require a provider slot or wait for a
-provider cooldown.
+Before sending, Scout checks whether the PR remains open, non-draft, and eligible
+under repository and branch rules. Source and destination movement do not alter
+publication or trigger a new review. The Bitbucket adapter sends path, line, and
+side without binding a comment to the reviewed commit, so a mid-review push can
+leave a comment pointing at changed code. Only a new explicit request reviews
+that newer code. Publication-only tasks do not require a provider slot or wait
+for a provider cooldown.
 
 The snapshot also retains the audit entry. A crash after saving the snapshot but
 before appending the JSONL log can omit that file entry; the review remains in
@@ -1467,9 +1480,9 @@ create table provider_state (
 );
 ```
 
-This schema keeps one active job row per PR/provider/review configuration and
-updates `target_source_commit_hash` to the newest commit. If a worker starts a
-job, it copies `target_source_commit_hash` to `running_source_commit_hash` and
+This schema keeps one active job row per PR/provider/review configuration. In
+report mode, polling updates `target_source_commit_hash` to the newest commit.
+If a worker starts a job, it copies `target_source_commit_hash` to `running_source_commit_hash` and
 `target_review_key` to `running_review_key`. A poll that sees the same
 `target_review_key` updates mutable PR metadata and returns without requeueing.
 A poll that sees a newer review key while the job is running updates the target

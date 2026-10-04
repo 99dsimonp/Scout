@@ -518,6 +518,8 @@ cooldown is dropped from the round at once while another provider can still
 review it; only the last such provider waits for its recovery deadline. If a
 provider cannot recover, Scout publishes the successful providers' results and
 names the missing providers on the PR. If all providers fail, nothing is posted.
+Pending providers removed from configuration cannot count as available alternatives
+when deciding whether the remaining provider should wait out a cooldown.
 The selector also has a recovery deadline: if it fails, Scout uses exact matching
 and retains everything else, so duplicate comments are possible but successful
 reviews are not discarded.
@@ -539,19 +541,22 @@ timeouts. Native inline mode ignores `[comments].severities` and
 `[comments].critical_enabled`; validated findings on changed `NEW` or `OLD`
 lines enter selection regardless of severity.
 
-A source push replaces the entire round while reviewers are running. Once
-selection is ready, later pushes cannot restart it; Scout retains findings with
-obsolete locations and posts a stale notice. Completed rounds do not rerun on
-pushes. Developers can request a fresh round by mentioning `@scout` or `@Scout`
-in a PR comment, interpreted by `review.request_comments`.
+A review finishes against its original source commit and merge base even if
+new commits arrive. Scout keeps the original finding locations, sends no
+source-change notice, and does not automatically rerun on pushes. A mid-review
+push can therefore leave comments pointing at changed code. Developers can
+request a fresh round by mentioning `@scout` or `@Scout` in a PR comment,
+interpreted by `review.request_comments`.
 
 Scout saves provider results and the publication plan before sending comments.
 Delivery retries do not repeat reviews or choose new wording. Pre-upgrade inline
 snapshots finish through their existing saved-payload retry path, preserving
-already posted comments; new reviews use the round pipeline. Stable publication
-markers allow recovery of comments whose POST response was lost. After a complete
-negative lookup and a settle delay, a retry can still produce a duplicate if the
-original comment appears late; this is not exactly-once delivery.
+already posted comments; new reviews use the round pipeline. Saved inline and
+report snapshots can finish delivery even after their provider is removed from
+configuration. Stable publication markers allow recovery of comments whose POST
+response was lost. A negative lookup permits a retry only if the lookup started
+after the settle delay. A retry can still produce a duplicate if the original
+comment appears late; this is not exactly-once delivery.
 
 Multi-provider publication requires a trusted immutable Bitbucket account ID,
 discovered from the API or supplied explicitly:
@@ -565,6 +570,9 @@ A successful discovery that conflicts with this value fails startup. A
 single-provider install without an identity can start in compatibility mode,
 with deduplication and marker recovery disabled and possible duplicate retries.
 
+When POST attempts are exhausted, the round enters `publication_failed` and
+keeps any unknown outcomes for operator resolution before delivery can resume.
+
 Publication recovery commands do not rerun providers:
 
 ```bash
@@ -576,7 +584,7 @@ scout --config /etc/scout/config.toml --resolve-publication ID --expected-versio
 
 Use the listed intent version when recording a known outcome. An obsolete intent
 confirmed absent is settled without resending; a currently eligible intent can
-retry after fresh lifecycle and snapshot checks. State changes use version checks
+retry after fresh lifecycle and lease checks. State changes use version checks
 so the daemon and an operator cannot overwrite each other's decisions.
 
 See [the detailed design](docs/multi-provider-inline-review-design.md) for matching,

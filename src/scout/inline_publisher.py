@@ -30,23 +30,24 @@ def author_ids(comment: dict) -> set:
 def comment_eligible(comment: dict) -> bool:
     """Missing API state must never turn a possibly resolved issue into coverage."""
     inline = comment.get("inline") or {}
+    line = inline.get("to") if inline.get("to") is not None else inline.get("from")
     resolution_known = "resolution" in comment or "resolved" in comment
     resolved = bool(comment.get("resolution")) or comment.get("resolved") is True
     anchor_current = comment.get("outdated") is False or inline.get("outdated") is False
     return (
         comment.get("deleted") is False and resolution_known and not resolved
         and anchor_current and bool(inline.get("path"))
-        and isinstance(inline.get("to", inline.get("from")), int)
+        and isinstance(line, int)
         and not comment.get("parent")
     )
 
 
-def _seconds_since(value: Any) -> float:
+def _seconds_since(value: Any, now: float) -> float:
     if value is None:
         return 0
     if isinstance(value, (int, float)):
-        return time.time() - value
-    return time.time() - datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        return now - value
+    return now - datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
 
 
 def _finding_payload(finding: SelectionFinding) -> dict:
@@ -139,9 +140,10 @@ class InlinePublisher:
             if not match:
                 continue
             inline = comment["inline"]
+            new_side = inline.get("to") is not None
             body = raw[:match.start()]
-            annotation = {"path": inline["path"], "line": inline.get("to", inline.get("from")),
-                          "line_side": "NEW" if "to" in inline else "OLD", "severity": match.group(1).upper(),
+            annotation = {"path": inline["path"], "line": inline["to"] if new_side else inline["from"],
+                          "line_side": "NEW" if new_side else "OLD", "severity": match.group(1).upper(),
                           "summary": body.splitlines()[0] if body else "", "details": body, "smallest_fix": "",
                           "reviewer": "general", "confidence": "MEDIUM"}
             finding = SelectionFinding(id="history:{}".format(comment["id"]), annotation=annotation,
@@ -180,6 +182,7 @@ class InlinePublisher:
         if not intents:
             return True
         comments = None
+        lookup_started_at = time.time()
         if self.identity:
             try:
                 comments = self.bitbucket.list_pull_request_comments(round_record["repo_slug"], round_record["pr_id"], before_request=before_request)
@@ -207,11 +210,13 @@ class InlinePublisher:
             if not allow_resend:
                 all_settled = False
                 continue
-            if _seconds_since(intent.get("last_attempt_at")) < self.config.queue.publication_settle_seconds:
+            # Earlier pages can miss a POST even if pagination finishes after
+            # the settling deadline; only a lookup begun after it permits resend.
+            if _seconds_since(intent.get("last_attempt_at"), lookup_started_at) < self.config.queue.publication_settle_seconds:
                 all_settled = False
                 continue
             owner = self.state.get_round(intent["round_id"])
-            if not owner or owner["status"] in _INELIGIBLE or intent["stale"]:
+            if not owner or owner["status"] in _INELIGIBLE:
                 # Absence after a timeout does not prove a superseded POST cannot arrive.
                 all_settled = False
                 continue
@@ -220,9 +225,7 @@ class InlinePublisher:
                     all_settled = False
                     continue
                 snapshot = current_snapshot()
-                if snapshot.state != "OPEN" or snapshot.source_commit_hash != owner["source_commit_hash"] or snapshot.merge_base_hash != owner["merge_base_hash"]:
-                    self.state.transition_intent(intent["id"], intent["version"], "unknown",
-                                                 stale=True, error="unknown_post_stale_anchor")
+                if snapshot.state != "OPEN":
                     all_settled = False
                     continue
             if intent["attempts"] >= self.config.queue.publication_max_attempts:
@@ -301,19 +304,11 @@ class InlinePublisher:
             if snapshot_cache[0] is None or time.monotonic() - snapshot_cache[1] >= self.config.queue.publication_snapshot_cache_seconds:
                 snapshot_cache[:] = [current_snapshot(), time.monotonic()]
             return snapshot_cache[0]
-        status = self._deliver(record, lease_token, snapshot, before_request)
-        if status != "completed":
-            return status
-        stale = sum(item["status"] == "stale_unpublished" for item in self.state.candidate_outcomes(round_id).values())
-        if stale:
-            self._reserve(record, "stale_notice", {"content": to_round_notice(record, "stale_notice", stale)}, "stale_notice")
-            status = self._deliver(record, lease_token, snapshot, before_request)
-            return "completed_with_stale_findings" if status == "completed" else status
-        return "completed"
+        return self._deliver(record, lease_token, snapshot, before_request)
 
     def _deliver(self, record: dict, lease_token: str, current_snapshot: Callable, before_request=None) -> str:
         intents = self.state.list_intents(round_id=record["id"])
-        priority = {"coverage_notice": 0, "finding": 1, "clean_review": 2, "stale_notice": 3}
+        priority = {"coverage_notice": 0, "finding": 1, "clean_review": 2}
         for intent in sorted(intents, key=lambda item: (priority[item["kind"]], item["id"])):
             if self.halted:
                 return "publication_failed"
@@ -335,17 +330,6 @@ class InlinePublisher:
                 return "publication_failed"
             if snapshot.state != "OPEN":
                 return "cancelled"
-            fresh = snapshot.source_commit_hash == record["source_commit_hash"] and snapshot.merge_base_hash == record["merge_base_hash"]
-            if intent["kind"] == "finding" and not fresh:
-                if intent.get("uncertain"):
-                    self.state.transition_intent(intent["id"], intent["version"], "unknown",
-                                                 stale=True, error="unknown_post_stale_anchor")
-                    return "publishing"
-                cancelled = self.state.transition_intent(intent["id"], intent["version"], "cancelled", stale=True, error="stale_anchor", lease_token=lease_token)
-                if cancelled:
-                    for candidate_id in [payload["finding"]["id"]] + payload.get("covers", []):
-                        self.state.mark_candidate(record["id"], candidate_id, "stale_unpublished")
-                continue
             if intent["attempts"] >= self.config.queue.publication_max_attempts:
                 return "publication_failed"
             sending = self.state.transition_intent(intent["id"], intent["version"], "sending", lease_token=lease_token)

@@ -50,20 +50,24 @@ class InlineStateTests(unittest.TestCase):
         self.assertFalse(self.inline.save_result(job, {"findings": []}))
         self.assertEqual(self.inline.get_round(round_["id"])["outcomes"][0]["status"], "failed")
 
-    def test_atomic_explicit_request_and_replacement(self):
+    def test_atomic_explicit_request_supersedes_previous_run(self):
         round_ = self.create(request_comment=("1", "today"), trigger="request")
         self.assertTrue(self.store.processed_pull_request_comment_review_requested("ws", "repo", 1, "1", "today"))
         self.assertIsNone(self.create(request_comment=("1", "today"), trigger="request"))
         old_job = self.store.claim_next_pending_job({"codex": 120})
         changed = replace(self.pr, source_commit_hash="new")
-        newer = self.inline.create_round(changed, ("codex", "claude"), "v1", "v1", trigger="replacement", replace_round_id=round_["id"], expected_version=round_["version"])
+        newer = self.inline.create_round(changed, ("codex", "claude"), "v1", "v1", trigger="request", request_comment=("2", "today"))
         self.assertIsNotNone(newer)
         self.assertFalse(self.inline.save_result(old_job, {"findings": []}))
         self.assertEqual(self.inline.get_round(round_["id"])["status"], "superseded")
 
-    def test_ready_boundary_prevents_source_replacement(self):
+    def test_explicit_request_supersedes_ready_round(self):
         ready = self.ready()
-        self.assertIsNone(self.inline.create_round(replace(self.pr, source_commit_hash="new"), ("codex",), "v1", "v1", trigger="replacement", replace_round_id=ready["id"], expected_version=ready["version"]))
+        newer = self.inline.create_round(replace(self.pr, source_commit_hash="new"), ("codex",), "v1", "v1",
+                                        trigger="request", request_comment=("2", "today"))
+        self.assertEqual(newer["source_commit_hash"], "new")
+        self.assertEqual(self.inline.get_round(ready["id"])["status"], "superseded")
+        self.assertFalse(self.inline.save_plan(ready["id"], ready["lease_token"], {}))
 
     def test_initial_poll_does_not_create_another_round(self):
         self.create()
@@ -119,6 +123,10 @@ class InlineStateTests(unittest.TestCase):
         self.assertEqual(len(self.inline.history("ws", "repo", 1)), 1)
 
     def test_atomic_request_rollback_never_leaves_partial_provider_set(self):
+        self.store.enqueue_or_update_pr(self.pr, "old-policy", "v1", "codex", output_mode="inline_comments")
+        legacy = self.store.claim_next_pending_job({"codex": 120})
+        snapshot = {"publication": {"comments": ["original"]}}
+        self.assertTrue(self.store.save_review_snapshot(legacy, snapshot))
         with self.store.connect() as conn:
             conn.execute("""create trigger reject_second_provider before insert on inline_round_providers
                 when new.provider='claude' begin select raise(abort,'test interruption'); end""")
@@ -128,27 +136,8 @@ class InlineStateTests(unittest.TestCase):
         self.assertEqual(self.inline.list_rounds(), [])
         self.assertIsNone(self.store.processed_pull_request_comment_review_requested("ws", "repo", 1, "3", "today"))
         self.assertIsNone(self.store.claim_next_pending_job({"codex": 120, "claude": 120}))
-
-    def test_replacement_and_final_result_have_one_winner(self):
-        import concurrent.futures
-        import threading
-        round_ = self.create(("codex",))
-        job = self.store.claim_next_pending_job({"codex": 120})
-        barrier = threading.Barrier(2)
-
-        def complete():
-            barrier.wait()
-            return self.inline.save_result(job, {"annotations": []})
-
-        def replace_round():
-            barrier.wait()
-            return self.inline.create_round(replace(self.pr, source_commit_hash="new"), ("codex",), "v1", "v1",
-                                            trigger="replacement", replace_round_id=round_["id"], expected_version=round_["version"])
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            completion = pool.submit(complete)
-            replacement = pool.submit(replace_round)
-            self.assertNotEqual(bool(completion.result()), bool(replacement.result()))
-        self.assertIn(self.inline.get_round(round_["id"])["status"], ("ready_for_selection", "superseded"))
+        self.assertEqual(self.store.get_job(legacy.id), legacy)
+        self.assertEqual(self.store.load_review_snapshot(legacy), snapshot)
 
     def test_expired_lease_cannot_save_plan_or_send_on_new_lease(self):
         old = self.ready()
@@ -186,17 +175,18 @@ class InlineStateTests(unittest.TestCase):
         self.assertEqual(self.inline.get_intent(unknown["id"])["attempts"], 1)
         self.assertEqual(self.inline.get_plan(ready["id"]), {"retained_ids": ["a"]})
 
-    def test_stale_absence_settles_dependents_and_cannot_be_revived(self):
+    def test_operator_absence_preserves_finding_and_dependents_for_resend(self):
         ready = self.ready()
         self.inline.save_plan(ready["id"], ready["lease_token"], {})
         intent = self.inline.reserve_intent(ready["id"], "a", {"finding": {"id": "a"}, "covers": ["b"]})
         intent = self.inline.transition_intent(intent["id"], intent["version"], "sending")
-        intent = self.inline.transition_intent(intent["id"], intent["version"], "unknown", stale=True)
+        intent = self.inline.transition_intent(intent["id"], intent["version"], "unknown")
         self.assertTrue(self.inline.resolve_publication(intent["id"], intent["version"], "absent"))
-        self.inline.mark_candidate(ready["id"], "a", "published")
-        self.assertEqual(self.inline.candidate_outcomes(ready["id"])["a"]["status"], "stale_unpublished")
-        self.assertEqual(self.inline.candidate_outcomes(ready["id"])["b"]["status"], "stale_unpublished")
-        self.assertEqual(self.inline.get_intent(intent["id"])["status"], "cancelled")
+        current = self.inline.get_intent(intent["id"])
+        self.assertEqual(current["status"], "ready")
+        self.assertFalse(current["uncertain"])
+        self.assertEqual(current["payload"], intent["payload"])
+        self.assertEqual(self.inline.candidate_outcomes(ready["id"]), {})
 
     def test_shutdown_and_reopen_preserves_result_and_recovery_deadline(self):
         round_ = self.create()
@@ -246,6 +236,44 @@ class InlineStateTests(unittest.TestCase):
         self.assertEqual(self.store.load_review_snapshot(job), snapshot)
         self.assertTrue(self.store.inline_comment_published(job, "already-posted"))
         self.assertEqual(self.store.get_job(job.id).running_review_run_id, job.running_review_run_id)
+
+    def test_explicit_request_cancels_unfinished_legacy_identities_only(self):
+        protected = []
+        cancelled = []
+        for provider, policy, schema, mode, status in (
+            ("codex", "v1", "v1", "inline_comments", "failed_retryable"),
+            ("claude", "old-policy", "v1", "inline_comments", "running"),
+            ("claude", "v1", "old-schema", "inline_comments", "publishing"),
+            ("codex", "finished", "v1", "inline_comments", "succeeded"),
+            ("codex", "report", "v1", "reports", "running"),
+        ):
+            self.store.enqueue_or_update_pr(self.pr, policy, schema, provider, output_mode=mode)
+            job = self.store.claim_next_pending_job({provider: 120})
+            self.assertIsNotNone(job)
+            self.assertTrue(self.store.save_review_snapshot(job, {"publication": {"comments": ["original"]}}))
+            self.store.mark_inline_comment_published(job, "already-posted")
+            # Distinct identities let each legacy status coexist in the same PR.
+            with self.store.connect() as conn:
+                conn.execute("update review_jobs set status=? where id=?", (status, job.id))
+            (protected if status == "succeeded" or mode == "reports" else cancelled).append(job)
+        self.inline.upsert_history("ws", "repo", 1, "42", {"text": "published history"})
+        history = self.inline.history("ws", "repo", 1)
+        self.create(("claude",), trigger="request", request_comment=("new", "today"))
+        for job in cancelled:
+            with self.subTest(provider=job.provider, policy=job.reviewer_policy_version, schema=job.schema_version):
+                current = self.store.get_job(job.id)
+                self.assertEqual(current.status, "cancelled")
+                self.assertIsNone(current.lease_token)
+                self.assertIsNone(current.leased_until)
+                self.assertTrue(self.store.is_job_superseded(job.id, job.lease_token))
+                self.assertFalse(self.store.renew_job_lease(job, 120))
+                self.assertIsNone(self.store.load_review_snapshot(job))
+                self.assertTrue(self.store.inline_comment_published(job, "already-posted"))
+        for job in protected:
+            self.assertEqual(self.store.get_job(job.id).status, "succeeded" if job.output_mode == "inline_comments" else "running")
+            self.assertIsNotNone(self.store.load_review_snapshot(job))
+            self.assertTrue(self.store.inline_comment_published(job, "already-posted"))
+        self.assertEqual(self.inline.history("ws", "repo", 1), history)
 
     def test_saved_publication_claim_bypasses_cooldown_without_claiming_new_review(self):
         self.store.enqueue_or_update_pr(self.pr, "v1", "v1", "codex", output_mode="inline_comments")

@@ -61,6 +61,7 @@ class FakeBitbucket:
 class PublisherUnitTests(unittest.TestCase):
     def test_unknown_comment_state_does_not_suppress(self):
         self.assertTrue(comment_eligible(comment()))
+        self.assertTrue(comment_eligible(comment(inline={"path": "src/app.py", "from": 12, "to": None})))
         for key in ("resolved", "outdated", "deleted"):
             unknown = comment()
             del unknown[key]
@@ -133,14 +134,40 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.bitbucket.posts), 1)
         self.assertEqual(self.store.inline.get_intent(intents[0]["id"])["status"], "published")
 
-    def test_stale_findings_preserve_dependents_and_post_snapshot_notice(self):
+    def test_revision_change_preserves_original_findings_and_dependents(self):
         record = self.ready_round()
-        moved = replace(self.pr, source_commit_hash="new-source")
-        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved), "completed_with_stale_findings")
+        moved = replace(self.pr, source_commit_hash="new-source", destination_commit_hash="new-destination", merge_base_hash="new-base")
+        with patch.object(self.bitbucket, "publish_inline_pull_request_comment", wraps=self.bitbucket.publish_inline_pull_request_comment) as publish:
+            self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved), "completed")
         self.assertEqual(len(self.bitbucket.posts), 1)
-        self.assertIn("found 2 issues", self.bitbucket.posts[0])
-        self.assertIn("`source`", self.bitbucket.posts[0])
-        self.assertTrue(all(item["status"] == "stale_unpublished" for item in self.store.inline.candidate_outcomes(record["id"]).values()))
+        self.assertEqual(publish.call_args.args[2:4], ("src/app.py", 12))
+        self.assertEqual(publish.call_args.kwargs["line_side"], "NEW")
+        outcomes = self.store.inline.candidate_outcomes(record["id"])
+        self.assertEqual(sorted(item["status"] for item in outcomes.values()), ["covered", "published"])
+        intent = self.store.inline.list_intents()[0]
+        self.assertEqual(intent["kind"], "finding")
+        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"]])
+        self.assertEqual(intent["payload"]["finding"]["source_commit"], "source")
+        self.assertEqual(intent["payload"]["finding"]["merge_base"], "base")
+
+    def test_push_between_posts_keeps_remaining_original_locations_and_text(self):
+        other = valid_review()
+        other["annotations"][0].update(summary="Another finding", line=15, line_side="OLD")
+        record = self.ready_round({"codex": valid_review(), "claude": other})
+        self.publisher.config.queue.publication_snapshot_cache_seconds = 0
+        moved = replace(self.pr, source_commit_hash="new-source", merge_base_hash="new-base")
+
+        def snapshot():
+            return moved if self.bitbucket.posts else self.pr
+
+        with patch.object(self.bitbucket, "publish_inline_pull_request_comment", wraps=self.bitbucket.publish_inline_pull_request_comment) as publish:
+            self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], snapshot), "completed")
+        self.assertEqual(sorted((call.args[2], call.args[3], call.kwargs["line_side"]) for call in publish.call_args_list),
+                         [("src/app.py", 12, "NEW"), ("src/app.py", 15, "OLD")])
+        intents = self.store.inline.list_intents()
+        self.assertEqual({item["kind"] for item in intents}, {"finding"})
+        self.assertEqual(sorted(self.bitbucket.posts), sorted(item["payload"]["content"] for item in intents))
+        self.assertEqual([item["status"] for item in intents], ["published", "published"])
 
     def test_partial_results_publish_coverage_notice_first(self):
         record = self.ready_round({"codex": valid_review()}, failed=("claude",))
@@ -197,7 +224,7 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr), "completed")
         self.assertEqual(self.bitbucket.posts, [original, original])
 
-    def test_negative_lookup_does_not_settle_unknown_when_anchor_changed(self):
+    def test_negative_lookup_resends_original_payload_after_revision_change(self):
         record = self.ready_round()
         self.bitbucket.fail = True
         self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
@@ -205,14 +232,38 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.bitbucket.fail = False
         with self.store.connect() as conn:
             conn.execute("update inline_publication_intents set last_attempt_at='2000-01-01T00:00:00+00:00'")
-        moved = replace(self.pr, source_commit_hash="changed")
-        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved), "publishing")
+        moved = replace(self.pr, source_commit_hash="changed", merge_base_hash="new-base")
+        with patch.object(self.bitbucket, "publish_inline_pull_request_comment", wraps=self.bitbucket.publish_inline_pull_request_comment) as publish:
+            self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved), "completed")
         intent = self.store.inline.list_intents()[0]
-        self.assertEqual(intent["status"], "unknown")
-        self.assertTrue(intent["stale"])
-        self.assertEqual(len(self.bitbucket.posts), 1)
+        self.assertEqual(intent["status"], "published")
+        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"]] * 2)
+        self.assertEqual(publish.call_args.args[2:4], ("src/app.py", 12))
+        self.assertEqual(publish.call_args.kwargs["line_side"], "NEW")
 
-    def test_push_after_negative_lookup_keeps_resend_uncertain(self):
+    def test_negative_lookup_must_start_after_settling_before_resend(self):
+        record = self.ready_round()
+        self.bitbucket.fail = True
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        intent = self.store.inline.list_intents()[0]
+        self.bitbucket.comments.clear()
+        self.bitbucket.fail = False
+        with self.store.connect() as conn:
+            conn.execute("update inline_publication_intents set last_attempt_at='1970-01-01T00:00:00+00:00'")
+        # A restarted worker starts pagination before the settling deadline;
+        # crossing the deadline during that lookup cannot prove remote absence.
+        with patch("scout.inline_publisher.time.time", return_value=59) as now:
+            def lookup(*args, **kwargs):
+                now.return_value = 61
+                return []
+            with patch.object(self.bitbucket, "list_pull_request_comments", side_effect=lookup):
+                self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr), "publishing")
+            self.assertEqual(len(self.bitbucket.posts), 1)
+            self.assertEqual(self.store.inline.get_intent(intent["id"])["status"], "unknown")
+            self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr), "completed")
+        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"]] * 2)
+
+    def test_push_after_negative_lookup_does_not_cancel_resend(self):
         record = self.ready_round()
         self.bitbucket.fail = True
         self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
@@ -221,12 +272,11 @@ class PublisherIntegrationTests(unittest.TestCase):
         with self.store.connect() as conn:
             conn.execute("update inline_publication_intents set last_attempt_at='2000-01-01T00:00:00+00:00'")
         snapshots = iter([self.pr, replace(self.pr, source_commit_hash="changed")])
-        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: next(snapshots)), "publishing")
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: next(snapshots)), "completed")
         intent = self.store.inline.list_intents()[0]
-        self.assertEqual(intent["status"], "unknown")
-        self.assertTrue(intent["uncertain"])
-        self.assertTrue(intent["stale"])
-        self.assertEqual(len(self.bitbucket.posts), 1)
+        self.assertEqual(intent["status"], "published")
+        self.assertFalse(intent["uncertain"])
+        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"]] * 2)
 
     def test_closed_pr_blocks_even_unanchored_coverage_notice(self):
         record = self.ready_round({"codex": valid_review()}, failed=("claude",))
@@ -288,7 +338,37 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.assertEqual(self.store.inline.get_plan(later["id"]), plan)
         self.assertNotIn("no material issues", self.bitbucket.posts[-1])
 
-    def test_unknown_operator_absence_cannot_resend_stale_anchor(self):
+    def test_old_side_history_with_null_to_suppresses_identical_rerun(self):
+        result = valid_review()
+        result["annotations"][0]["line_side"] = "OLD"
+        record = self.ready_round({"codex": result})
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr), "completed")
+        self.bitbucket.comments[0]["inline"] = {"path": "src/app.py", "from": 12, "to": None}
+        self.store.inline.release_round(record["id"], record["lease_token"], status="completed")
+        later = self.store.inline.create_round(self.pr, ("codex",), "v1", "v1", trigger="request")
+        job = self.store.claim_next_pending_job({"codex": 120})
+        self.store.inline.save_result(job, result)
+        later = self.store.inline.claim_round(later["id"], 120)
+        plan = exact_selection(make_candidates(later), self.publisher.history(later)).to_dict()
+        self.assertEqual(plan["retained_ids"], [])
+        self.store.inline.save_plan(later["id"], later["lease_token"], plan)
+        self.assertEqual(self.publisher.publish_round(later["id"], later["lease_token"], lambda: self.pr), "completed")
+        self.assertEqual(len(self.bitbucket.posts), 1)
+        self.assertEqual(self.store.inline.candidate_outcomes(later["id"])["codex:finding-001"]["status"], "covered")
+
+    def test_legacy_old_side_history_uses_non_null_anchor(self):
+        record = self.ready_round()
+        self.bitbucket.comments = [comment(
+            inline={"path": "src/app.py", "from": 12, "to": None},
+            content={"raw": "Deleted error check\n\nScout: High issue found by Codex."},
+        )]
+        history = self.publisher.history(record)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].annotation["line"], 12)
+        self.assertEqual(history[0].annotation["line_side"], "OLD")
+        self.assertEqual(self.publisher.history(record), history)
+
+    def test_operator_confirmed_absence_resends_original_finding_after_push(self):
         record = self.ready_round()
         self.bitbucket.fail = True
         self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
@@ -297,10 +377,10 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.bitbucket.fail = False
         self.bitbucket.comments.clear()
         moved = replace(self.pr, source_commit_hash="moved")
-        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved), "completed_with_stale_findings")
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved), "completed")
         self.assertEqual(len(self.bitbucket.posts), 2)
-        self.assertIn("not posted", self.bitbucket.posts[1])
-        self.assertEqual(self.store.inline.get_intent(intent["id"])["status"], "cancelled")
+        self.assertEqual(self.bitbucket.posts, [intent["payload"]["content"]] * 2)
+        self.assertEqual(self.store.inline.get_intent(intent["id"])["status"], "published")
 
     def test_author_aliases_from_discovery_are_accepted(self):
         with patch.object(self.bitbucket, "current_user", return_value={"account_id": "bot", "uuid": "{bot-uuid}"}):

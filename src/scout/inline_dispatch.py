@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,13 +53,16 @@ class InlineDispatch:
 
     def maintain(self):
         for round_ in self.state.list_rounds(statuses=["reviewing"]):
+            # A disabled member cannot rescue a cooled-down provider, even when
+            # it appears later in the round's frozen provider order.
             for outcome in round_["outcomes"]:
-                if outcome["status"] != "pending":
-                    continue
+                if outcome["status"] == "pending" and outcome["provider"] not in self.daemon.provider_names:
+                    self.state.fail_provider(round_["id"], outcome["provider"], "provider disabled")
+            for outcome in round_["outcomes"]:
                 provider = outcome["provider"]
-                if provider not in self.daemon.provider_names:
-                    self.state.fail_provider(round_["id"], provider, "provider disabled")
-                elif self.daemon.state.get_active_provider_cooldown(provider) is not None:
+                if outcome["status"] != "pending" or provider not in self.daemon.provider_names:
+                    continue
+                if self.daemon.state.get_active_provider_cooldown(provider) is not None:
                     self.state.fail_or_recover_for_cooldown(
                         round_["id"], provider, "provider cooldown", self.config.queue.max_provider_recovery_seconds,
                     )
@@ -136,11 +138,11 @@ class InlineDispatch:
         heartbeat_thread.start()
         try:
             check()
-            if not self.publisher.reconcile(round_, before_request=check, current_snapshot=lambda: self._snapshot(round_)):
-                self.state.release_round(round_id, token, backoff_seconds=self.config.queue.publication_settle_seconds)
-                return
             plan = self.state.get_plan(round_id)
             if plan is None:
+                if not self.publisher.reconcile(round_, before_request=check, current_snapshot=lambda: self._snapshot(round_)):
+                    self.state.release_round(round_id, token, backoff_seconds=self.config.queue.publication_settle_seconds)
+                    return
                 candidates = make_candidates(round_)
                 history = self.publisher.history(round_, before_request=check)
                 enabled = self.config.review.deduplication.enabled and bool(self.publisher.identity)
@@ -166,6 +168,8 @@ class InlineDispatch:
             if reserved:
                 self.daemon._release_provider_slot(reserved)
                 reserved = None
+            # Saved plans reconcile in the publisher, which also marks exhausted
+            # uncertain deliveries as publication_failed for operator recovery.
             status = self.publisher.publish_round(round_id, token, lambda: self._snapshot(round_), before_request=check)
             self.state.release_round(round_id, token, status=status,
                                      backoff_seconds=self.config.queue.publication_retry_backoff_seconds if status == "publishing" else 0)
@@ -211,10 +215,7 @@ class InlineDispatch:
 
     def _snapshot(self, round_):
         pr = self.daemon.bitbucket.get_pull_request(round_["repo_slug"], round_["pr_id"])
-        repo = self.daemon.repository_configs[round_["repo_slug"]]
-        if pr.state != "OPEN" or pr.is_draft or not getattr(repo, "review_enabled", True) or self.daemon._is_ignored_source_branch(repo, pr.source_branch) or self.daemon._is_ignored_target_branch(repo, pr.destination_branch):
+        if not self.daemon._inline_pr_eligible(pr):
             self.state.cancel_round(round_["id"], "PR is no longer eligible")
             raise ProviderSuperseded("PR is no longer eligible")
-        if pr.destination_commit_hash == round_["destination_commit_hash"]:
-            return replace(pr, merge_base_hash=round_["merge_base_hash"])
-        return self.daemon._resolve_inline_snapshot(pr)
+        return pr

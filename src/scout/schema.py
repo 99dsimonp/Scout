@@ -499,26 +499,6 @@ def to_inline_pr_comments(
     return comments
 
 
-def to_outdated_pr_comment(annotation: Dict[str, Any], provider: str, source_commit: str) -> str:
-    """Describe a saved finding without anchoring its old line to the current diff."""
-    path = annotation["path"]
-    path_note = ""
-    if len(path) > 2000:
-        path = path[:1000] + "..." + path[-1000:]
-        path_note = " [path shortened]"
-    header = (
-        "Scout saved this finding for original commit `{}`. The PR revision has changed; "
-        "this location refers to the original review.\n"
-        "Original location: `{}:{}` ({}){}\n\n"
-    ).format(source_commit, path, annotation["line"], annotation["line_side"], path_note)
-    # A saved replacement targets the old diff; it must not be offered as an
-    # applyable suggestion against the PR's newer source.
-    original = {key: value for key, value in annotation.items() if key != "suggested_change"}
-    body = _format_inline_comment(original, _provider_label(provider), source_commit, "")
-    body = re.sub(r"(?m)^([ \t]*)(`{3,}|~{3,})suggestion\b", r"\1\2text", body)
-    return header + _truncate(body, BITBUCKET_COMMENT_MAX_LENGTH - len(header))
-
-
 def summarize_findings(review: ValidatedReview) -> Dict[str, Any]:
     by_reviewer = {reviewer: 0 for reviewer in REVIEWER_ORDER}
     by_severity = {severity: 0 for severity in SEVERITY_ORDER}
@@ -743,12 +723,10 @@ def _format_inline_comment(
     return _format_inline_comment_parts(body, footer, limit=BITBUCKET_COMMENT_MAX_LENGTH)
 
 
-def to_round_notice(round_record: Dict[str, Any], kind: str, stale_count: int = 0) -> str:
+def to_round_notice(round_record: Dict[str, Any], kind: str) -> str:
     succeeded = [_provider_label(o["provider"]) for o in round_record["outcomes"] if o["status"] == "succeeded"]
     failed = [_provider_label(o["provider"]) for o in round_record["outcomes"] if o["status"] == "failed"]
     snapshot = "`{}` (base `{}`)".format(round_record["source_commit_hash"][:12], (round_record.get("merge_base_hash") or "unknown")[:12])
-    if kind == "stale_notice":
-        return "Scout found {} issues on {} that were not posted because the code changed before publication. Comment `@scout review` to review the current code.".format(stale_count, snapshot)
     if kind == "clean_review":
         content = "Scout: {} found no material issues on {}.".format(", ".join(succeeded), snapshot)
     else:

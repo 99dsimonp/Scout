@@ -62,7 +62,7 @@ class InlineState:
               status text not null default 'ready', version integer not null default 0,
               attempts integer not null default 0, last_attempt_at text,
               comment_ids text not null default '[]', author_id text, error text,
-              stale integer not null default 0, uncertain integer not null default 0, lease_token text,
+              uncertain integer not null default 0, lease_token text,
               created_at text not null, updated_at text not null,
               unique(round_id,intent_key)
             );
@@ -146,8 +146,7 @@ class InlineState:
             and pr_id=? and output_mode='inline_comments' and status='succeeded'""", scope).fetchone() is not None
 
     def create_round(self, pr: PullRequest, providers: Sequence[str], policy_version: str,
-                     schema_version: str, trigger: str = "initial", request_comment=None,
-                     replace_round_id=None, expected_version=None) -> Optional[dict]:
+                     schema_version: str, trigger: str = "initial", request_comment=None) -> Optional[dict]:
         providers = tuple(dict.fromkeys(providers))
         if not providers:
             raise ValueError("An inline round requires at least one provider")
@@ -164,15 +163,17 @@ class InlineState:
                 if conn.execute("""select 1 from processed_pr_comments where workspace=? and repo_slug=?
                     and pr_id=? and comment_id=? and updated_on=?""", (*scope, str(request_comment[0]), request_comment[1])).fetchone():
                     return None
-            if replace_round_id is not None:
-                old = next((r for r in previous if r["id"] == replace_round_id), None)
-                if old is None or old["status"] != "reviewing" or old["version"] != expected_version:
-                    return None
-                providers = tuple(json.loads(old["providers"]))
-                policy_version, schema_version = old["policy_version"], old["schema_version"]
             for old in previous:
                 if old["status"] in ACTIVE:
                     self._cancel(conn, old["id"], "Superseded by a new review round", "superseded", now)
+            if trigger == "request":
+                # Legacy jobs may have no round and belong to a removed provider
+                # or policy. An explicit request must fence those publishers too.
+                conn.execute("""update review_jobs set status='cancelled',superseded=1,
+                    lease_token=null,leased_until=null,error_message=?,updated_at=?
+                    where workspace=? and repo_slug=? and pr_id=? and output_mode='inline_comments'
+                    and status not in ('succeeded','cancelled')""",
+                    ("Superseded by a new review round", now, *scope))
             conn.execute("""insert into inline_rounds
                 (id,workspace,repo_slug,pr_id,snapshot,providers,policy_version,schema_version,trigger,status,created_at,updated_at)
                 values(?,?,?,?,?,?,?,?,?,'reviewing',?,?)""",
@@ -349,7 +350,7 @@ class InlineState:
                 retry_after=?,error=?,attempts=attempts+?,version=version+1,updated_at=?
                 where id=? and lease_token=? and leased_until>? and status in ('selecting','publishing')""",
                 (status, _after(now, backoff_seconds) if backoff_seconds else None, error, int(error is not None), now, round_id, lease_token, now)).rowcount
-            if changed and status in ("completed", "completed_with_stale_findings"):
+            if changed and status == "completed":
                 conn.execute("""update review_jobs set status='succeeded',updated_at=? where status='reviewed'
                     and target_review_run_id in (select run_id from inline_round_providers where round_id=?)""", (now, round_id))
             return changed == 1
@@ -408,7 +409,6 @@ class InlineState:
             return None
         item = dict(row)
         item["payload"], item["comment_ids"] = json.loads(item["payload"]), json.loads(item["comment_ids"])
-        item["stale"] = bool(item["stale"])
         item["uncertain"] = bool(item["uncertain"])
         return item
 
@@ -459,7 +459,7 @@ class InlineState:
                 return None
             if status in ("ready", "sending"):
                 round_ = conn.execute("select * from inline_rounds where id=?", (row["round_id"],)).fetchone()
-                if round_["status"] != "publishing" or row["stale"]:
+                if round_["status"] != "publishing":
                     return None
                 if status == "sending" and (not round_["lease_token"] or round_["leased_until"] <= now):
                     return None
@@ -467,7 +467,7 @@ class InlineState:
                     return None
             fields = {"status": status, "version": expected_version + 1, "updated_at": now}
             for key, value in changes.items():
-                if key not in ("comment_ids", "author_id", "error", "stale", "lease_token"):
+                if key not in ("comment_ids", "author_id", "error", "lease_token"):
                     raise ValueError("Unsupported intent field: " + key)
                 fields[key] = _json([str(i) for i in value]) if key == "comment_ids" else value
             if status == "sending":
@@ -481,7 +481,7 @@ class InlineState:
         with self.store.connect() as conn:
             conn.execute("""insert into inline_candidate_outcomes(round_id,candidate_id,status,target_id) values(?,?,?,?)
                 on conflict(round_id,candidate_id) do update set status=excluded.status,target_id=excluded.target_id
-                where inline_candidate_outcomes.status not in ('stale_unpublished','cancelled')""", (round_id, candidate_id, status, target_id))
+                where inline_candidate_outcomes.status != 'cancelled'""", (round_id, candidate_id, status, target_id))
 
     def candidate_outcomes(self, round_id: str) -> dict:
         with self.store.connect() as conn:
@@ -533,13 +533,6 @@ class InlineState:
                 status, ids = "published", sorted(set(ids + [str(comment_id)]))
             elif round_["status"] not in PUBLISHABLE + ("publication_failed",):
                 status, error = "cancelled", "operator_confirmed_absent_round_ineligible"
-            elif row["stale"]:
-                status, error = "cancelled", "operator_confirmed_absent_stale"
-                payload = json.loads(row["payload"])
-                for candidate_id in [payload.get("candidate_id") or payload.get("finding", {}).get("id")] + payload.get("covers", []):
-                    if candidate_id:
-                        conn.execute("""insert into inline_candidate_outcomes(round_id,candidate_id,status)
-                            values(?,?,'stale_unpublished') on conflict(round_id,candidate_id) do update set status='stale_unpublished'""", (row["round_id"], candidate_id))
             else:
                 status = "ready"
             conn.execute("""update inline_publication_intents set status=?,comment_ids=?,error=?,uncertain=0,version=version+1,
@@ -557,7 +550,7 @@ class InlineState:
                 where id=? and status='publication_failed'""", (utcnow(), round_id)).rowcount == 1
             if changed:
                 conn.execute("""update inline_publication_intents set attempts=0,version=version+1,updated_at=?
-                    where round_id=? and status='ready' and stale=0 and uncertain=0""", (utcnow(), round_id))
+                    where round_id=? and status='ready' and uncertain=0""", (utcnow(), round_id))
             return changed
 
     def finish_closed_pr(self, workspace: str, repo_slug: str, pr_id: int) -> None:
