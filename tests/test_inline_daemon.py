@@ -25,6 +25,9 @@ class InlineGit(_FakeGit):
     def validate_clone_url(self, clone):
         pass
 
+    def line_unchanged(self, *args):
+        return False
+
 
 class InlineBitbucket(FakeBitbucket):
     def __init__(self):

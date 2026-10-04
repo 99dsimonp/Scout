@@ -209,6 +209,8 @@ The coordination is simpler: one complete input set, one saved selection plan, a
    | Deleted, by anyone | Ineligible; publish the new finding |
    | State or anchor validity unknown | Ineligible; publish the new finding |
 
+   Bitbucket sends `resolution` only on resolved comments and never sends an outdated flag, so an absent `resolution` means open. Scout decides anchor currency itself: a comment's line is current when git shows it unedited between the revision Scout reviewed (source commit for NEW lines, merge base for OLD lines) and the round's revision. A missing commit, or a legacy comment with no recorded revision, leaves the anchor unknown.
+
    Rationale: resolving or deleting a comment does not establish that the finding was dismissed, and an unchanged anchor can become faulty when callers, dependencies, or configuration change. Persistent dismissal would need an explicit, scoped Scout action, which is out of scope. Resolution timestamps and deletion actors are therefore not needed.
 
    Accepted cost: a real finding that was resolved or deleted without being fixed is posted again when a subsequent round detects it. Initial reviews and explicit requests bound the repetition. Log these as `reposted_after_resolution` so their frequency can justify a dismissal feature later.
@@ -266,4 +268,4 @@ passed. Independent review findings were fixed and rechecked.
 | Comment locations after a source push | Record whether Bitbucket accepts the original locations. Comments are not bound to a reviewed commit by the current adapter, so a mid-review push can move the code beneath an accepted anchor. |
 | Root-comment POST returns created comment and immutable author IDs | Required to record successful publication and detect an identity mismatch without replaying a successful POST. Posting replies is not required by this design. |
 
-None of these have been checked against live Bitbucket yet. Resolution time and deletion actor are not prerequisites.
+Checked against live Bitbucket: open comments carry no `resolution` key and no comment carries `outdated` (PR 1514 and neighbours, October 2026). The other contracts are still unverified. Resolution time and deletion actor are not prerequisites.

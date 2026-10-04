@@ -11,6 +11,7 @@ from typing import Any, Callable, List, Optional
 from .bitbucket import BitbucketError
 from .config import ConfigError
 from .deduplication import SelectionFinding
+from .gitops import GitError
 from .schema import _format_inline_comment, _provider_label, to_outdated_pr_comment, to_round_notice
 
 LOG = logging.getLogger(__name__)
@@ -27,19 +28,29 @@ def author_ids(comment: dict) -> set:
     return {str(user[key]) for key in ("account_id", "uuid") if user.get(key)}
 
 
-def comment_eligible(comment: dict) -> bool:
-    """Missing API state must never turn a possibly resolved issue into coverage."""
+def comment_open(comment: dict) -> bool:
+    """An undeleted, unresolved root comment with a usable inline anchor.
+
+    Bitbucket includes `resolution` only on resolved comments, so its absence means open.
+    """
     inline = comment.get("inline") or {}
     line = inline.get("to") if inline.get("to") is not None else inline.get("from")
-    resolution_known = "resolution" in comment or "resolved" in comment
-    resolved = bool(comment.get("resolution")) or comment.get("resolved") is True
-    anchor_current = comment.get("outdated") is False or inline.get("outdated") is False
+    resolved = comment.get("resolution") is not None or comment.get("resolved") is True
     return (
-        comment.get("deleted") is False and resolution_known and not resolved
-        and anchor_current and bool(inline.get("path"))
+        comment.get("deleted") is False and not resolved
+        and bool(inline.get("path"))
         and isinstance(line, int)
         and not comment.get("parent")
     )
+
+
+def reported_anchor_state(comment: dict) -> Optional[bool]:
+    """Bitbucket's own outdated flag, when it sends one: True if current, False if outdated."""
+    inline = comment.get("inline") or {}
+    for flag in (comment.get("outdated"), inline.get("outdated")):
+        if isinstance(flag, bool):
+            return not flag
+    return None
 
 
 def _seconds_since(value: Any, now: float) -> float:
@@ -94,10 +105,11 @@ def make_candidates(round_record: dict) -> List[SelectionFinding]:
 
 
 class InlinePublisher:
-    def __init__(self, state, bitbucket, config):
+    def __init__(self, state, bitbucket, config, line_unchanged: Optional[Callable[..., bool]] = None):
         self.state = state.inline
         self.bitbucket = bitbucket
         self.config = config
+        self.line_unchanged = line_unchanged
         self.identity: Optional[str] = None
         self.current_identities = set()
         self.trusted_identities = set()
@@ -141,7 +153,7 @@ class InlinePublisher:
         known = {str(item["comment_id"]): item for item in self.state.history(round_record["workspace"], round_record["repo_slug"], round_record["pr_id"])}
         findings = []
         for comment in comments:
-            if not author_ids(comment) & self.trusted_identities or not comment_eligible(comment):
+            if not author_ids(comment) & self.trusted_identities or not comment_open(comment):
                 continue
             raw = (comment.get("content") or {}).get("raw", "")
             stored = known.get(str(comment["id"]))
@@ -151,7 +163,12 @@ class InlinePublisher:
                 expected = (stored.get("metadata") or {}).get("content")
                 if expected is not None and expected != raw:
                     continue
+                if not self._anchor_current(round_record, comment, payload):
+                    continue
                 findings.append(SelectionFinding(**dict(payload, id="history:{}".format(comment["id"]), historical=True)))
+                continue
+            # Legacy comments carry no reviewed revision, so only Bitbucket can vouch for their anchor.
+            if reported_anchor_state(comment) is not True:
                 continue
             match = re.search(r"\n\nScout: (Critical|High|Medium|Low) issue found by ([^.]+)\.", raw)
             if not match:
@@ -173,6 +190,29 @@ class InlinePublisher:
             if "history:" + comment_id in eligible:
                 superseded.update((stored.get("metadata") or {}).get("supersedes", []))
         return [finding for finding in findings if finding.id not in superseded]
+
+    def _anchor_current(self, round_record: dict, comment: dict, payload: dict) -> bool:
+        """Whether the commented line is unedited between its reviewed revision and this round's."""
+        reported = reported_anchor_state(comment)
+        if reported is not None:
+            return reported
+        inline = comment["inline"]
+        new_side = inline.get("to") is not None
+        # Bitbucket anchors NEW lines in the source and OLD lines in the merge base.
+        old = payload.get("source_commit") if new_side else payload.get("merge_base")
+        current = round_record["source_commit_hash"] if new_side else round_record.get("merge_base_hash")
+        if not old or not current:
+            return False
+        if _same_commit(old, current):
+            return True
+        if self.line_unchanged is None:
+            return False
+        try:
+            return self.line_unchanged(round_record["workspace"], round_record["repo_slug"], inline["path"],
+                                       inline["to"] if new_side else inline["from"], old, current)
+        except GitError as exc:
+            LOG.warning("Anchor of comment %s unverifiable; treating it as outdated: %s", comment["id"], exc)
+            return False
 
     def _record_marker_anomalies(self, record: dict, comments: list) -> None:
         intents = self.state.list_intents(workspace=record["workspace"], repo_slug=record["repo_slug"],

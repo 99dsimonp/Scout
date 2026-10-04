@@ -22,7 +22,8 @@ class InlineDispatch:
         self.daemon = daemon
         self.state = daemon.state.inline
         self.config = daemon.config
-        self.publisher = InlinePublisher(daemon.state, daemon.bitbucket, daemon.config)
+        self.publisher = InlinePublisher(daemon.state, daemon.bitbucket, daemon.config,
+                                         line_unchanged=daemon.git.line_unchanged)
         self.locks = {}
 
     def close_missing_prs(self, workspace, repo_slug, open_pr_ids):

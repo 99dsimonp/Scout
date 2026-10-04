@@ -234,6 +234,38 @@ class GitManagerTests(unittest.TestCase):
 
             self.run_git(["cat-file", "-e", "{}^{{commit}}".format(new_commit)], cwd=mirror)
 
+    def test_line_unchanged_reports_edits_to_the_anchored_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = GitManager(tmp)
+            repo = Path(tmp) / "repos" / "workspace" / "repo.git"
+            self.run_git(["init", str(repo)])
+            self.run_git(["config", "user.email", "scout@example.test"], cwd=repo)
+            self.run_git(["config", "user.name", "Scout Tests"], cwd=repo)
+
+            def commit(text):
+                if text is None:
+                    self.run_git(["rm", "-q", "app.py"], cwd=repo)
+                else:
+                    (repo / "app.py").write_text(text, encoding="utf-8")
+                    self.run_git(["add", "app.py"], cwd=repo)
+                self.run_git(["commit", "-qm", "change"], cwd=repo)
+                return self.git_output(["rev-parse", "HEAD"], cwd=repo)
+
+            first = commit("one\ntwo\nthree\nfour\n")
+            second = commit("zero\none\ntwo\nTHREE\nfour\n")
+            deleted = commit(None)
+
+            def unchanged(line, new):
+                return manager.line_unchanged("workspace", "repo", "app.py", line, first, new)
+
+            self.assertTrue(unchanged(2, second))
+            self.assertFalse(unchanged(3, second))
+            self.assertTrue(unchanged(4, second))
+            self.assertFalse(unchanged(5, second))
+            self.assertFalse(unchanged(2, deleted))
+            with self.assertRaises(GitError):
+                manager.line_unchanged("workspace", "repo", "app.py", 2, "f" * 40, second)
+
     def test_ensure_mirror_serializes_concurrent_first_clone(self):
         with tempfile.TemporaryDirectory() as tmp:
             manager = GitManager(tmp)

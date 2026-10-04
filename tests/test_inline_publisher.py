@@ -7,8 +7,9 @@ from unittest.mock import patch
 
 from scout.bitbucket import BitbucketError
 from scout.config import ConfigError
+from scout.gitops import GitError
 from scout.deduplication import exact_selection
-from scout.inline_publisher import InlinePublisher, comment_eligible, make_candidates
+from scout.inline_publisher import InlinePublisher, comment_open, make_candidates, reported_anchor_state
 from scout.models import PullRequest
 from scout.schema import BITBUCKET_COMMENT_MAX_LENGTH
 from scout.state import StateStore
@@ -59,15 +60,21 @@ class FakeBitbucket:
 
 
 class PublisherUnitTests(unittest.TestCase):
-    def test_unknown_comment_state_does_not_suppress(self):
-        self.assertTrue(comment_eligible(comment()))
-        self.assertTrue(comment_eligible(comment(inline={"path": "src/app.py", "from": 12, "to": None})))
-        for key in ("resolved", "outdated", "deleted"):
-            unknown = comment()
-            del unknown[key]
-            self.assertFalse(comment_eligible(unknown))
-        for changes in ({"resolved": True}, {"deleted": True}, {"outdated": True}, {"resolution": {"type": "resolution"}}, {"parent": {"id": 1}}):
-            self.assertFalse(comment_eligible(comment(**changes)))
+    def test_comment_state_follows_what_bitbucket_sends(self):
+        self.assertTrue(comment_open(comment()))
+        self.assertTrue(comment_open(comment(inline={"path": "src/app.py", "from": 12, "to": None})))
+        # Bitbucket omits resolution and outdated on an open comment; only the anchor is unknown.
+        live = comment()
+        del live["resolved"], live["outdated"]
+        self.assertTrue(comment_open(live))
+        self.assertIsNone(reported_anchor_state(live))
+        unknown = comment()
+        del unknown["deleted"]
+        self.assertFalse(comment_open(unknown))
+        for changes in ({"resolved": True}, {"deleted": True}, {"resolution": {}}, {"resolution": {"type": "resolution"}}, {"parent": {"id": 1}}):
+            self.assertFalse(comment_open(comment(**changes)))
+        self.assertTrue(reported_anchor_state(comment()))
+        self.assertFalse(reported_anchor_state(comment(outdated=True)))
 
     def test_candidate_text_reserves_marker_and_max_severity_before_selection(self):
         result = valid_review()
@@ -332,6 +339,34 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
         self.assertEqual(len(self.publisher.history(record)), 1)
         self.bitbucket.comments[0]["resolved"] = True
+        self.assertEqual(self.publisher.history(record), [])
+
+    def test_open_history_without_bitbucket_state_checks_its_anchor_with_git(self):
+        record = self.ready_round()
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        # Bitbucket sends neither resolution nor outdated for an open comment.
+        del self.bitbucket.comments[0]["resolved"], self.bitbucket.comments[0]["outdated"]
+        self.assertEqual(len(self.publisher.history(record)), 1)
+        moved = dict(record, source_commit_hash="pushed")
+        calls = []
+        self.publisher.line_unchanged = lambda *args: calls.append(args) or True
+        self.assertEqual(len(self.publisher.history(moved)), 1)
+        self.assertEqual(calls, [("ws", "repo", "src/app.py", 12, "source", "pushed")])
+        self.publisher.line_unchanged = lambda *args: False
+        self.assertEqual(self.publisher.history(moved), [])
+
+        def unavailable(*args):
+            raise GitError("missing commit")
+        self.publisher.line_unchanged = unavailable
+        self.assertEqual(self.publisher.history(moved), [])
+        self.publisher.line_unchanged = None
+        self.assertEqual(self.publisher.history(moved), [])
+
+    def test_legacy_history_needs_bitbucket_anchor_state(self):
+        record = self.ready_round()
+        self.bitbucket.comments = [comment(content={"raw": "Socket leak\n\nScout: High issue found by Codex."})]
+        self.assertEqual(len(self.publisher.history(record)), 1)
+        del self.bitbucket.comments[0]["outdated"]
         self.assertEqual(self.publisher.history(record), [])
 
     def test_historical_target_disappearing_adds_original_comment_to_saved_plan(self):

@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -162,6 +163,26 @@ class GitManager:
             "-C", str(mirror), "merge-base", pr.source_commit_hash, destination,
         ]).strip()
         return replace(pr, destination_commit_hash=destination, merge_base_hash=merge_base)
+
+    def line_unchanged(self, workspace: str, repo_slug: str, path: str, line: int,
+                       old_commit: str, new_commit: str) -> bool:
+        """Whether line `line` of `path` at `old_commit` survives unedited at `new_commit`.
+
+        Reads the existing mirror without fetching; a missing commit or path raises GitError.
+        """
+        mirror = self.repos_dir / workspace / "{}.git".format(repo_slug)
+        lines = self._git_capture(["-C", str(mirror), "cat-file", "blob", "{}:{}".format(old_commit, path)])
+        if not 1 <= line <= len(lines.splitlines()):
+            return False
+        diff = self._git_capture([
+            "-C", str(mirror), "diff", "--no-ext-diff", "--no-color", "--no-renames", "-U0",
+            old_commit, new_commit, "--", path,
+        ])
+        for header in re.finditer(r"(?m)^@@ -(\d+)(?:,(\d+))? ", diff):
+            start, count = int(header.group(1)), int(header.group(2) or 1)
+            if start <= line < start + count:
+                return False
+        return True
 
     def prepare_context(
         self,
