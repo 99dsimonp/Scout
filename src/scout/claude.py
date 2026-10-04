@@ -240,12 +240,17 @@ class ClaudeRunner:
 
     def _read_schema(self, schema_path: str) -> str:
         try:
-            return Path(schema_path).read_text(encoding="utf-8")
-        except OSError as exc:
+            schema = json.loads(Path(schema_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
             raise ProviderError(
                 "Claude schema file is unreadable: {}".format(schema_path),
                 retryable=False,
             ) from exc
+        # The Claude CLI only knows draft-07 and rejects other declared dialects;
+        # the review schema uses no keywords that differ between them.
+        if isinstance(schema, dict):
+            schema.pop("$schema", None)
+        return json.dumps(schema, separators=(",", ":"))
 
 
 def _extract_selection_message(stdout_text: str) -> str:

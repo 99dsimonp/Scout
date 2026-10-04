@@ -53,6 +53,14 @@ class ClaudeRunnerTests(unittest.TestCase):
         self.assertIn("--effort", cmd)
         self.assertEqual(cmd[cmd.index("--effort") + 1], "max")
 
+    def test_read_schema_drops_dialect_unsupported_by_claude_cli(self):
+        runner = ClaudeRunner(claude_config(), CredentialStore("/tmp/unused"))
+        schema_path = Path(__file__).resolve().parents[1] / "config" / "review.schema.json"
+        self.assertIn("2020-12", schema_path.read_text(encoding="utf-8"))
+        schema = json.loads(runner._read_schema(str(schema_path)))
+        self.assertNotIn("$schema", schema)
+        self.assertEqual(schema["required"], ["recommendation", "report", "annotations"])
+
     def test_build_command_uses_bare_mode_for_api_auth_only(self):
         api_runner = ClaudeRunner(claude_config(auth_mode="api"), CredentialStore("/tmp/unused"))
         self.assertIn("--bare", api_runner.build_command("prompt", '{"type":"object"}'))
