@@ -78,6 +78,11 @@ def _snapshot_moved(round_record: dict, current) -> bool:
                 and _same_commit(current.destination_commit_hash, round_record.get("destination_commit_hash")))
 
 
+def _title(finding: SelectionFinding) -> str:
+    lines = finding.rendered_content.strip().splitlines()
+    return lines[0].strip().strip("*").strip() if lines else ""
+
+
 def _finding_payload(finding: SelectionFinding) -> dict:
     return {"id": finding.id, "annotation": finding.annotation, "rendered_content": finding.rendered_content,
             "source_commit": finding.source_commit, "merge_base": finding.merge_base,
@@ -328,7 +333,7 @@ class InlinePublisher:
         if plan is None:
             return "ready_for_selection"
         candidates = {finding.id: finding for finding in make_candidates(record)}
-        eligible_history = {finding.id for finding in self.history(record, before_request)}
+        eligible_history = {finding.id: finding for finding in self.history(record, before_request)}
         retained = set(plan["retained_ids"])
         covers = {}
         for decision in plan["decisions"]:
@@ -343,7 +348,14 @@ class InlinePublisher:
                     retained.add(decision["candidate_id"])
             else:
                 covers.setdefault(target, []).append(decision["candidate_id"])
-        if candidates and any(item["status"] == "failed" for item in record["outcomes"]):
+        if candidates and not retained:
+            # A re-review whose findings are all still open says so instead of staying silent.
+            targets = {decision["covered_by"] for decision in plan["decisions"] if decision["decision"] == "covered"}
+            covered = sorted(({"path": item.annotation["path"], "line": item.annotation["line"], "title": _title(item)}
+                              for key, item in eligible_history.items() if key in targets),
+                             key=lambda item: (item["path"], item["line"], item["title"]))
+            self._reserve(record, "covered_review", {"content": to_round_notice(record, "covered_review", covered)}, "covered_review")
+        elif candidates and any(item["status"] == "failed" for item in record["outcomes"]):
             self._reserve(record, "coverage_notice", {"content": to_round_notice(record, "coverage_notice")}, "coverage_notice")
         for candidate_id in sorted(retained):
             finding = candidates[candidate_id]
@@ -367,7 +379,7 @@ class InlinePublisher:
 
     def _deliver(self, record: dict, lease_token: str, current_snapshot: Callable, before_request=None) -> str:
         intents = self.state.list_intents(round_id=record["id"])
-        priority = {"coverage_notice": 0, "finding": 1, "clean_review": 2}
+        priority = {"coverage_notice": 0, "finding": 1, "clean_review": 2, "covered_review": 2}
         for intent in sorted(intents, key=lambda item: (priority[item["kind"]], item["id"])):
             if self.halted:
                 return "publication_failed"

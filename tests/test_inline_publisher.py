@@ -402,8 +402,41 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.assertEqual(plan["retained_ids"], [])
         self.store.inline.save_plan(later["id"], later["lease_token"], plan)
         self.assertEqual(self.publisher.publish_round(later["id"], later["lease_token"], lambda: self.pr), "completed")
-        self.assertEqual(len(self.bitbucket.posts), 1)
+        self.assertEqual(len(self.bitbucket.posts), 2)
+        self.assertIn("no new comments were posted", self.bitbucket.posts[1])
         self.assertEqual(self.store.inline.candidate_outcomes(later["id"])["codex:finding-001"]["status"], "covered")
+
+    def rerun(self, results, failed=()):
+        """Publish one round, then a second round of `results` whose findings history fully covers."""
+        record = self.ready_round()
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        self.store.inline.release_round(record["id"], record["lease_token"], status="completed")
+        later = self.store.inline.create_round(self.pr, tuple(results) + tuple(failed), "v1", "v1", trigger="request")
+        for provider, result in results.items():
+            job = self.store.claim_next_pending_job({provider: 120})
+            self.store.inline.save_result(job, result)
+        for provider in failed:
+            self.store.inline.fail_provider(later["id"], provider, "unavailable")
+        later = self.store.inline.claim_round(later["id"], 120)
+        plan = exact_selection(make_candidates(later), self.publisher.history(later)).to_dict()
+        self.assertEqual(plan["retained_ids"], [])
+        self.store.inline.save_plan(later["id"], later["lease_token"], plan)
+        self.assertEqual(self.publisher.publish_round(later["id"], later["lease_token"], lambda: self.pr), "completed")
+        return self.bitbucket.posts[1:]
+
+    def test_fully_covered_rerun_posts_one_notice_naming_open_comments(self):
+        posts = self.rerun({"codex": valid_review()})
+        self.assertEqual(len(posts), 1)
+        self.assertIn("Codex reviewed `source` (base `base`)", posts[0])
+        self.assertIn("no new comments were posted", posts[0])
+        self.assertIn("Still open:\n- `src/app.py:12` Missing error handling", posts[0])
+        self.assertIn("<!-- scout-publication:", posts[0])
+
+    def test_fully_covered_rerun_with_failed_provider_posts_only_the_covered_notice(self):
+        posts = self.rerun({"codex": valid_review()}, failed=("claude",))
+        self.assertEqual(len(posts), 1)
+        self.assertIn("no new comments were posted", posts[0])
+        self.assertIn("Claude did not complete", posts[0])
 
     def test_legacy_old_side_history_uses_non_null_anchor(self):
         record = self.ready_round()

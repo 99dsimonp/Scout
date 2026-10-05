@@ -4,7 +4,7 @@ import json
 import re
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 
 class ReviewValidationError(ValueError):
@@ -747,17 +747,24 @@ def _format_inline_comment(
     return _format_inline_comment_parts(body, footer, limit=BITBUCKET_COMMENT_MAX_LENGTH)
 
 
-def to_round_notice(round_record: Dict[str, Any], kind: str) -> str:
+def to_round_notice(round_record: Dict[str, Any], kind: str, covered: Sequence[Dict[str, Any]] = ()) -> str:
+    """`covered` lists the open comments (path, line, title) that cover a covered_review round."""
     succeeded = [_provider_label(o["provider"]) for o in round_record["outcomes"] if o["status"] == "succeeded"]
     failed = [_provider_label(o["provider"]) for o in round_record["outcomes"] if o["status"] == "failed"]
     snapshot = "`{}` (base `{}`)".format(round_record["source_commit_hash"][:12], (round_record.get("merge_base_hash") or "unknown")[:12])
     if kind == "clean_review":
         content = "Scout: {} found no material issues on {}.".format(", ".join(succeeded), snapshot)
+    elif kind == "covered_review":
+        content = ("Scout: {} reviewed {}. Every finding is already reported in an open Scout comment, "
+                   "so no new comments were posted.").format(", ".join(succeeded), snapshot)
     else:
         content = "Scout reviewed {} with {}. Findings reflect these providers' reviews only.".format(snapshot, ", ".join(succeeded))
     if failed:
         content += " {} did not complete this review (provider unavailable).".format(", ".join(failed))
-    return content
+    if covered:
+        content += "\n\nStill open:\n" + "\n".join(
+            "- `{}:{}` {}".format(item["path"], item["line"], item["title"]) for item in covered)
+    return _truncate(content, BITBUCKET_COMMENT_MAX_LENGTH - 200)
 
 
 def _format_inline_comment_parts(
