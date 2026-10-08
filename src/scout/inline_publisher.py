@@ -5,6 +5,7 @@ import hashlib
 import logging
 import re
 import time
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Callable, List, Optional
 
@@ -28,20 +29,21 @@ def author_ids(comment: dict) -> set:
     return {str(user[key]) for key in ("account_id", "uuid") if user.get(key)}
 
 
-def comment_open(comment: dict) -> bool:
-    """An undeleted, unresolved root comment with a usable inline anchor.
+def comment_resolved(comment: dict) -> bool:
+    """Bitbucket includes `resolution` only on resolved comments, so its absence means open."""
+    return comment.get("resolution") is not None or comment.get("resolved") is True
 
-    Bitbucket includes `resolution` only on resolved comments, so its absence means open.
-    """
+
+def comment_root(comment: dict) -> bool:
+    """An undeleted root comment; resolved or not, inline or not."""
+    return comment.get("deleted") is False and not comment.get("parent")
+
+
+def comment_open(comment: dict) -> bool:
+    """An undeleted, unresolved root comment with a usable inline anchor."""
     inline = comment.get("inline") or {}
     line = inline.get("to") if inline.get("to") is not None else inline.get("from")
-    resolved = comment.get("resolution") is not None or comment.get("resolved") is True
-    return (
-        comment.get("deleted") is False and not resolved
-        and bool(inline.get("path"))
-        and isinstance(line, int)
-        and not comment.get("parent")
-    )
+    return comment_root(comment) and not comment_resolved(comment) and bool(inline.get("path")) and isinstance(line, int)
 
 
 def reported_anchor_state(comment: dict) -> Optional[bool]:
@@ -74,8 +76,10 @@ def _same_commit(left: Optional[str], right: Optional[str]) -> bool:
 
 
 def _snapshot_moved(round_record: dict, current) -> bool:
+    # Anchors live in the source (NEW) and the merge base (OLD). The destination tip advancing
+    # moves neither, so only a source push or a retargeted PR invalidates them.
     return not (_same_commit(current.source_commit_hash, round_record["source_commit_hash"])
-                and _same_commit(current.destination_commit_hash, round_record.get("destination_commit_hash")))
+                and current.destination_branch == round_record.get("destination_branch"))
 
 
 def _title(finding: SelectionFinding) -> str:
@@ -158,37 +162,47 @@ class InlinePublisher:
         known = {str(item["comment_id"]): item for item in self.state.history(round_record["workspace"], round_record["repo_slug"], round_record["pr_id"])}
         findings = []
         for comment in comments:
-            if not author_ids(comment) & self.trusted_identities or not comment_open(comment):
+            if not author_ids(comment) & self.trusted_identities or not comment_root(comment):
                 continue
+            # A resolved thread is a reviewer's decision about that finding; Scout does not raise it again,
+            # even after the commented line changed.
+            resolved = comment_resolved(comment)
             raw = (comment.get("content") or {}).get("raw", "")
             stored = known.get(str(comment["id"]))
             if stored:
                 payload = stored["finding"]
+                metadata = stored.get("metadata") or {}
                 # A human edit removes the evidence used to establish coverage.
-                expected = (stored.get("metadata") or {}).get("content")
-                if expected is not None and expected != raw:
+                posted = {metadata[key] for key in ("content", "outdated_content") if metadata.get(key) is not None}
+                if posted and raw not in posted:
                     continue
-                if not self._anchor_current(round_record, comment, payload):
+                if not resolved and not self._anchor_current(round_record, comment, payload):
                     continue
-                findings.append(SelectionFinding(**dict(payload, id="history:{}".format(comment["id"]), historical=True)))
+                findings.append(SelectionFinding(**dict(payload, id="history:{}".format(comment["id"]), historical=True,
+                                                        resolved=resolved)))
+                continue
+            if not comment_open(comment) and not (resolved and (comment.get("inline") or {}).get("path")):
                 continue
             # Legacy comments carry no reviewed revision, so only Bitbucket can vouch for their anchor.
-            if reported_anchor_state(comment) is not True:
+            if not resolved and reported_anchor_state(comment) is not True:
                 continue
             match = re.search(r"\n\nScout: (Critical|High|Medium|Low) issue found by ([^.]+)\.", raw)
             if not match:
                 continue
             inline = comment["inline"]
             new_side = inline.get("to") is not None
+            line = inline["to"] if new_side else inline.get("from")
+            if not isinstance(line, int):
+                continue
             body = raw[:match.start()]
-            annotation = {"path": inline["path"], "line": inline["to"] if new_side else inline["from"],
+            annotation = {"path": inline["path"], "line": line,
                           "line_side": "NEW" if new_side else "OLD", "severity": match.group(1).upper(),
                           "summary": body.splitlines()[0] if body else "", "details": body, "smallest_fix": "",
                           "reviewer": "general", "confidence": "MEDIUM"}
             finding = SelectionFinding(id="history:{}".format(comment["id"]), annotation=annotation,
                                        rendered_content=body, historical=True, provider=match.group(2))
             self.state.upsert_history(round_record["workspace"], round_record["repo_slug"], round_record["pr_id"], comment["id"], _finding_payload(finding), content=raw, legacy=True)
-            findings.append(finding)
+            findings.append(replace(finding, resolved=resolved))
         eligible = {finding.id for finding in findings}
         superseded = set()
         for comment_id, stored in known.items():
@@ -201,7 +215,12 @@ class InlinePublisher:
         reported = reported_anchor_state(comment)
         if reported is not None:
             return reported
-        inline = comment["inline"]
+        inline = comment.get("inline") or {}
+        if not inline.get("path"):
+            # A PR-level comment for a moved revision keeps its location only in the saved finding.
+            annotation = payload["annotation"]
+            side = "to" if annotation.get("line_side", "NEW") == "NEW" else "from"
+            inline = {"path": annotation["path"], side: annotation["line"]}
         new_side = inline.get("to") is not None
         # Bitbucket anchors NEW lines in the source and OLD lines in the merge base.
         old = payload.get("source_commit") if new_side else payload.get("merge_base")
@@ -315,7 +334,8 @@ class InlinePublisher:
             self.state.mark_candidate(intent["round_id"], candidate_id, "covered", target_id=finding["id"])
         for comment_id in intent["comment_ids"]:
             self.state.upsert_history(owner["workspace"], owner["repo_slug"], owner["pr_id"], comment_id, finding,
-                                      content=payload["content"], round_id=owner["id"], author_id=intent.get("author_id"),
+                                      content=payload["content"], outdated_content=payload.get("outdated_content"),
+                                      round_id=owner["id"], author_id=intent.get("author_id"),
                                       supersedes=payload.get("supersedes", []))
 
     def publish_round(self, round_id: str, lease_token: str, current_snapshot: Callable, before_request=None) -> str:
@@ -349,9 +369,10 @@ class InlinePublisher:
             else:
                 covers.setdefault(target, []).append(decision["candidate_id"])
         if candidates and not retained:
-            # A re-review whose findings are all still open says so instead of staying silent.
+            # A re-review whose findings are all already reported says so instead of staying silent.
             targets = {decision["covered_by"] for decision in plan["decisions"] if decision["decision"] == "covered"}
-            covered = sorted(({"path": item.annotation["path"], "line": item.annotation["line"], "title": _title(item)}
+            covered = sorted(({"path": item.annotation["path"], "line": item.annotation["line"], "title": _title(item),
+                               "resolved": item.resolved}
                               for key, item in eligible_history.items() if key in targets),
                              key=lambda item: (item["path"], item["line"], item["title"]))
             self._reserve(record, "covered_review", {"content": to_round_notice(record, "covered_review", covered)}, "covered_review")

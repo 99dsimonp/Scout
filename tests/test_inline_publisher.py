@@ -334,12 +334,47 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.bitbucket.posts), 1)
         self.assertEqual(self.store.inline.list_intents()[0]["status"], "unknown")
 
-    def test_resolved_history_is_excluded_without_hiding_older_eligible_roots(self):
+    def test_resolved_history_stays_eligible_even_after_its_line_changes(self):
         record = self.ready_round()
         self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
-        self.assertEqual(len(self.publisher.history(record)), 1)
-        self.bitbucket.comments[0]["resolved"] = True
+        self.assertFalse(self.publisher.history(record)[0].resolved)
+        self.bitbucket.comments[0]["resolution"] = {"type": "resolution"}
+        del self.bitbucket.comments[0]["outdated"]
+        self.publisher.line_unchanged = lambda *args: False
+        history = self.publisher.history(dict(record, source_commit_hash="pushed"))
+        self.assertEqual([item.id for item in history], ["history:1"])
+        self.assertTrue(history[0].resolved)
+        self.bitbucket.comments[0]["deleted"] = True
         self.assertEqual(self.publisher.history(record), [])
+
+    def test_destination_advancing_alone_keeps_findings_inline(self):
+        record = self.ready_round()
+        advanced = replace(self.pr, destination_commit_hash="new-destination")
+        with patch.object(self.bitbucket, "publish_pull_request_comment", wraps=self.bitbucket.publish_pull_request_comment) as publish:
+            self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: advanced), "completed")
+        publish.assert_not_called()
+        self.assertNotIn("Original location:", self.bitbucket.posts[0])
+
+    def test_retargeted_pr_moves_findings_to_pr_comments(self):
+        record = self.ready_round()
+        retargeted = replace(self.pr, destination_branch="release")
+        self.assertEqual(self.publisher.publish_round(record["id"], record["lease_token"], lambda: retargeted), "completed")
+        self.assertIn("Original location:", self.bitbucket.posts[0])
+
+    def test_pr_level_comment_for_moved_revision_counts_as_history(self):
+        record = self.ready_round()
+        moved = replace(self.pr, source_commit_hash="new-source")
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: moved)
+        self.bitbucket.comments[0]["inline"] = None
+        del self.bitbucket.comments[0]["outdated"]
+        history = self.publisher.history(record)
+        self.assertEqual([item.id for item in history], ["history:1"])
+        calls = []
+        self.publisher.line_unchanged = lambda *args: calls.append(args) or False
+        self.assertEqual(self.publisher.history(dict(record, source_commit_hash="pushed")), [])
+        self.assertEqual(calls, [("ws", "repo", "src/app.py", 12, "source", "pushed")])
+        self.bitbucket.comments[0]["resolved"] = True
+        self.assertEqual(len(self.publisher.history(dict(record, source_commit_hash="pushed"))), 1)
 
     def test_open_history_without_bitbucket_state_checks_its_anchor_with_git(self):
         record = self.ready_round()
@@ -368,6 +403,8 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.publisher.history(record)), 1)
         del self.bitbucket.comments[0]["outdated"]
         self.assertEqual(self.publisher.history(record), [])
+        self.bitbucket.comments[0]["resolved"] = True
+        self.assertTrue(self.publisher.history(record)[0].resolved)
 
     def test_historical_target_disappearing_adds_original_comment_to_saved_plan(self):
         record = self.ready_round()
@@ -431,6 +468,24 @@ class PublisherIntegrationTests(unittest.TestCase):
         self.assertIn("no new comments were posted", posts[0])
         self.assertIn("Still open:\n- `src/app.py:12` Missing error handling", posts[0])
         self.assertIn("<!-- scout-publication:", posts[0])
+
+    def test_rerun_covered_by_resolved_comment_posts_no_finding(self):
+        record = self.ready_round()
+        self.publisher.publish_round(record["id"], record["lease_token"], lambda: self.pr)
+        self.bitbucket.comments[0]["resolved"] = True
+        self.store.inline.release_round(record["id"], record["lease_token"], status="completed")
+        later = self.store.inline.create_round(self.pr, ("codex",), "v1", "v1", trigger="request")
+        job = self.store.claim_next_pending_job({"codex": 120})
+        self.store.inline.save_result(job, valid_review())
+        later = self.store.inline.claim_round(later["id"], 120)
+        plan = exact_selection(make_candidates(later), self.publisher.history(later)).to_dict()
+        self.assertEqual(plan["retained_ids"], [])
+        self.store.inline.save_plan(later["id"], later["lease_token"], plan)
+        self.assertEqual(self.publisher.publish_round(later["id"], later["lease_token"], lambda: self.pr), "completed")
+        self.assertEqual(len(self.bitbucket.posts), 2)
+        self.assertIn("already reported in an earlier Scout comment", self.bitbucket.posts[1])
+        self.assertIn("Resolved earlier:\n- `src/app.py:12` Missing error handling", self.bitbucket.posts[1])
+        self.assertNotIn("Still open:", self.bitbucket.posts[1])
 
     def test_fully_covered_rerun_with_failed_provider_posts_only_the_covered_notice(self):
         posts = self.rerun({"codex": valid_review()}, failed=("claude",))

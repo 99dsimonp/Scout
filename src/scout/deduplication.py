@@ -46,6 +46,7 @@ class SelectionFinding:
     merge_base: str = ""
     provider: str = ""
     historical: bool = False
+    resolved: bool = False
 
 
 @dataclass(frozen=True)
